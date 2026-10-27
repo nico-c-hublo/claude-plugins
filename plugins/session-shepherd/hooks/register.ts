@@ -1,8 +1,10 @@
 import type { EngineInterface, Register } from 'claude-code'
+import { detectHost, type Host, type Live } from './hosts'
+import { forget, record } from './registry'
 
-// Keeps the herdr workspace readable: every session carries its topic as its name, a topic
-// already worked on can be picked up again instead of duplicated, and a single-tab workspace
-// is labelled `<directory> - <session name>`.
+// Keeps a multiplexer (herdr, tmux) readable: every session carries its topic as its name, a
+// topic already worked on can be picked up again instead of duplicated, and the tab or workspace
+// holding only this session is labelled after it. What differs per multiplexer is in hosts/.
 
 type $ = EngineInterface
 
@@ -11,7 +13,7 @@ type Match = {
   name: string
   cwd: string | undefined
   lastActive: number
-  livePane: string | null
+  live: Live | null
 }
 
 // Where the person ended up: this session under `name`, another session, or unnamed (null).
@@ -35,21 +37,9 @@ const ago = (ms: number) => {
   return `${Math.round(minutes / (24 * 60))}d ago`
 }
 
-const inHerdr = async ($: $) => (await $.env.get('HERDR_ENV')) === '1'
-
-const herdr = async ($: $, ...args: string[]): Promise<any> => {
-  const { exitCode, stdout } = await $.process.run(['herdr', ...args])
-  if (exitCode !== 0) return null
-  try {
-    return JSON.parse(stdout)
-  } catch {
-    return null
-  }
-}
-
 // The sessions whose name collides with `name`, newest first. A session's name is the last
 // custom-title in its transcript (what /rename, --name and a hook's sessionTitle write).
-const findSessions = async ($: $, name: string, selfId: string): Promise<Match[]> => {
+const findSessions = async ($: $, host: Host, name: string, selfId: string): Promise<Match[]> => {
   const projects = `${await $.env.get('HOME')}/.claude/projects`
   const { stdout } = await $.process.run(['grep', '-r', '--include=*.jsonl', '"type":"custom-title"', projects])
   const titles = new Map<string, { name: string; sessionId: string }>()
@@ -63,11 +53,6 @@ const findSessions = async ($: $, name: string, selfId: string): Promise<Match[]
   }
 
   const wanted = normalize(name)
-  const livePanes = new Map<string, string>(
-    ((await herdr($, 'agent', 'list'))?.result?.agents ?? [])
-      .filter((a: any) => a.agent_session?.value)
-      .map((a: any) => [a.agent_session.value, a.pane_id]),
-  )
   const matches: Match[] = []
   for (const [path, title] of titles) {
     if (title.sessionId === selfId || normalize(title.name) !== wanted) continue
@@ -76,7 +61,7 @@ const findSessions = async ($: $, name: string, selfId: string): Promise<Match[]
       ...title,
       cwd: cwd ? JSON.parse(`{${cwd}}`).cwd : undefined,
       lastActive: (await $.fs.stat(path)).mtimeMs,
-      livePane: livePanes.get(title.sessionId) ?? null,
+      live: await host.live(title.sessionId),
     })
   }
   return matches.sort((a, b) => b.lastActive - a.lastActive)
@@ -115,37 +100,26 @@ const askName = async ($: $, question: string, suggestion: string) => {
   }
 }
 
-const agentName = (name: string) =>
-  ('s-' + name.toLowerCase().replace(/[^a-z0-9_-]+/g, '-')).replace(/-+$/, '').slice(0, 32)
-
-const goTo = async ($: $, match: Match): Promise<Outcome> => {
-  if (match.livePane) {
-    await herdr($, 'agent', 'focus', match.livePane)
-    return { moved: `Moved to the live session "${match.name}". Re-send your message there; this tab can be closed.` }
-  }
-  const workspace = (await $.env.get('HERDR_WORKSPACE_ID')) ?? ''
-  const tab = await herdr($, 'tab', 'create', '--workspace', workspace, '--cwd', match.cwd ?? '.', '--focus')
-  const pane = tab?.result?.root_pane?.pane_id
-  if (!pane) return null
-  const base = agentName(match.name)
-  for (let i = 1; i <= 5; i++) {
-    const agent = i === 1 ? base : `${base.slice(0, 29)}-${i}`
-    if (await herdr($, 'agent', 'start', agent, '--kind', 'claude', '--pane', pane, '--', '--resume', match.sessionId)) {
-      return { moved: `Resumed "${match.name}" in a new tab. Re-send your message there; this tab can be closed.` }
+const goTo = async (host: Host, match: Match): Promise<Outcome> => {
+  if (match.live) {
+    if (await match.live.focus()) {
+      return { moved: `Moved to the live session "${match.name}". Re-send your message there; this tab can be closed.` }
     }
+    return { moved: `"${match.name}" is still open in ${match.live.where}. Re-send your message there; this tab can be closed.` }
   }
-  return null
+  if (!(await host.resume(match))) return null
+  return { moved: `Resumed "${match.name}" in a new tab. Re-send your message there; this tab can be closed.` }
 }
 
 // Settles a free name for this session, or moves the person to an existing session of that name.
-const settleName = async ($: $, first: string | null, selfId: string): Promise<Outcome> => {
+const settleName = async ($: $, host: Host, first: string | null, selfId: string): Promise<Outcome> => {
   let name = first
   while (name) {
-    const matches = (await findSessions($, name, selfId)).slice(0, 3)
+    const matches = (await findSessions($, host, name, selfId)).slice(0, 3)
     if (matches.length === 0) return { name }
     const labels = matches.map(
       (m, i) =>
-        `${m.livePane ? 'Go to live' : 'Resume'} "${m.name}" · ${basename(m.cwd)} · ${ago(m.lastActive)}` +
+        `${m.live ? 'Go to live' : 'Resume'} "${m.name}" · ${basename(m.cwd)} · ${ago(m.lastActive)}` +
         (i > 0 ? ` (${i + 1})` : ''),
     )
     let answer: string
@@ -158,7 +132,7 @@ const settleName = async ($: $, first: string | null, selfId: string): Promise<O
       return null
     }
     const picked = matches[labels.indexOf(answer)]
-    if (picked) return goTo($, picked)
+    if (picked) return goTo(host, picked)
     name =
       answer === STAY
         ? await askName($, `"${name}" is taken. What should this session be called instead?`, `${name} 2`)
@@ -167,21 +141,19 @@ const settleName = async ($: $, first: string | null, selfId: string): Promise<O
   return null
 }
 
-const labelWorkspace = async ($: $, name: string, cwd: string) => {
-  const workspace = await $.env.get('HERDR_WORKSPACE_ID')
-  if (!workspace) return
-  const info = await herdr($, 'workspace', 'get', workspace)
-  if (info?.result?.workspace?.tab_count !== 1) return
-  await herdr($, 'workspace', 'rename', workspace, `${basename(cwd)} - ${name}`)
-}
-
 export const register: Register = (on, options) => {
   // Set once this session was offered a name, so later prompts pass straight through.
   let isSettled = false
 
   on('classic.SessionStart', async ($, e, next) => {
     const result = await next(e)
-    if (options.askAt !== 'start' || e.source !== 'startup' || !(await inHerdr($))) return result
+    const host = await detectHost($)
+    if (!host) return result
+    // Every start, /clear and resume included: each runs under a session id of its own.
+    const location = await host.locate?.()
+    if (location) await record($, e.session_id, location)
+
+    if (options.askAt !== 'start' || e.source !== 'startup') return result
     isSettled = true
     const answer = await askName(
       $,
@@ -192,18 +164,20 @@ export const register: Register = (on, options) => {
       isSettled = false
       return result
     }
-    const outcome = await settleName($, answer, e.session_id)
+    const outcome = await settleName($, host, answer, e.session_id)
     if (outcome && 'moved' in outcome) $.ui.toast(outcome.moved)
     if (!outcome || !('name' in outcome)) return result
-    await labelWorkspace($, outcome.name, e.cwd)
+    await host.label(outcome.name, e.cwd)
     return { ...result, sessionTitle: outcome.name }
   }).catch(($, e, next) => next(e))
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
-    if (isSettled || !(await inHerdr($))) return next(e)
+    if (isSettled) return next(e)
+    const host = await detectHost($)
+    if (!host) return next(e)
     isSettled = true
     if (await hasTitle($, e.transcript_path)) return next(e)
-    const outcome = await settleName($, await askName(
+    const outcome = await settleName($, host, await askName(
       $,
       'What is the main topic of this session? It becomes the session name.',
       await suggestName($, e.prompt),
@@ -211,7 +185,12 @@ export const register: Register = (on, options) => {
     if (outcome && 'moved' in outcome) return { block: outcome.moved }
     const result = await next(e)
     if (!outcome) return result
-    await labelWorkspace($, outcome.name, e.cwd)
+    await host.label(outcome.name, e.cwd)
     return { ...result, sessionTitle: outcome.name }
+  }).catch(($, e, next) => next(e))
+
+  on('session.end', async ($, e, next) => {
+    if ((await detectHost($))?.locate) await forget($, e.sessionId)
+    return next(e)
   }).catch(($, e, next) => next(e))
 }
