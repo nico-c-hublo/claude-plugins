@@ -1,0 +1,5 @@
+{
+  "name": "herdr-organize",
+  "owner": { "name": "nico-c-hublo" },
+  "plugins": [{ "name": "herdr-organize", "source": "./" }]
+}

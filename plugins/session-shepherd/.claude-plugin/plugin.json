@@ -1,0 +1,14 @@
+{
+  "name": "herdr-organize",
+  "version": "0.1.0",
+  "description": "Names each session after its topic, offers to go back to a session of the same name, and labels the herdr workspace.",
+  "userConfig": {
+    "askAt": {
+      "type": "string",
+      "title": "Ask for the session name",
+      "description": "prompt: on your first message, with a suggested name. start: as soon as the session opens.",
+      "options": ["prompt", "start"],
+      "default": "prompt"
+    }
+  }
+}
