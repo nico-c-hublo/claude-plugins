@@ -11,7 +11,7 @@ export type Location = { host: string; server: string; pane: string; pid: number
 const isSafeId = (sessionId: string) => /^[\w-]+$/.test(sessionId)
 
 async function file($: $, sessionId: string) {
-  return `${await $.env.get('HOME')}/.claude/herdr-organize/live/${sessionId}.json`
+  return `${await $.env.get('HOME')}/.claude/session-shepherd/live/${sessionId}.json`
 }
 
 export async function record($: $, sessionId: string, location: Location) {

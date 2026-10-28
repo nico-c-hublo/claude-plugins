@@ -6,7 +6,7 @@ import type { On } from 'claude-code'
 
 const HOME = '/home/u'
 const SERVER = '/tmp/tmux-501/default'
-const RECORDS = `${HOME}/.claude/herdr-organize/live`
+const RECORDS = `${HOME}/.claude/session-shepherd/live`
 const TRANSCRIPT = `${HOME}/.claude/projects/app/abc.jsonl`
 
 type World = { runs: string[][]; files: Map<string, string>; deadPids: Set<string> }

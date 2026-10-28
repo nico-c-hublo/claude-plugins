@@ -1,5 +1,5 @@
 {
-  "name": "herdr-organize",
+  "name": "session-shepherd",
   "owner": { "name": "nico-c-hublo" },
-  "plugins": [{ "name": "herdr-organize", "source": "./" }]
+  "plugins": [{ "name": "session-shepherd", "source": "./" }]
 }

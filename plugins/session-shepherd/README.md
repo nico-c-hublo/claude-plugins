@@ -1,4 +1,4 @@
-# herdr-organize
+# session-shepherd
 
 A Claude Code mod that keeps a herdr workspace or a tmux session readable when you run several Claude Code sessions side by side:
 
@@ -20,7 +20,7 @@ It runs entirely in the mod: no skill, no tokens spent by the main conversation,
 At the prompt of a terminal session:
 
 ```
-/plugin install herdr-organize --marketplace nico-c-hublo/herdr-organize
+/plugin install session-shepherd --marketplace nico-c-hublo/claude-session-shepherd
 ```
 
 Answer `y` to add the marketplace, then pick a scope (user scope loads it in every session).
@@ -28,10 +28,10 @@ Answer `y` to add the marketplace, then pick a scope (user scope loads it in eve
 From a shell:
 
 ```
-claude plugin install herdr-organize --marketplace nico-c-hublo/herdr-organize
+claude plugin install session-shepherd --marketplace nico-c-hublo/claude-session-shepherd
 ```
 
-In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `nico-c-hublo/herdr-organize`, then Add plugin.
+In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `nico-c-hublo/claude-session-shepherd`, then Add plugin.
 
 ## Requirements
 
@@ -41,4 +41,4 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 ## How a live session is found
 
-herdr knows which Claude session runs in which pane. tmux does not, so under tmux each session writes where it runs (socket, pane, Claude's pid) to `~/.claude/herdr-organize/live/<session id>.json` when it starts, and removes it when it ends. A session counts as live while that pane exists and that process runs.
+herdr knows which Claude session runs in which pane. tmux does not, so under tmux each session writes where it runs (socket, pane, Claude's pid) to `~/.claude/session-shepherd/live/<session id>.json` when it starts, and removes it when it ends. A session counts as live while that pane exists and that process runs.
