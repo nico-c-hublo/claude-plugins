@@ -1,5 +1,0 @@
-{
-  "name": "session-shepherd",
-  "owner": { "name": "nico-c-hublo" },
-  "plugins": [{ "name": "session-shepherd", "source": "./" }]
-}

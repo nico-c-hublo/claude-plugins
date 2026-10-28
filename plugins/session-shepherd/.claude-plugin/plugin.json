@@ -1,6 +1,7 @@
 {
   "name": "session-shepherd",
   "version": "0.1.0",
+  "author": { "name": "nico-c-hublo" },
   "description": "Names each session after its topic, offers to go back to a session of the same name, and labels the herdr workspace or tmux window.",
   "userConfig": {
     "askAt": {

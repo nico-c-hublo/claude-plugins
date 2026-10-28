@@ -20,7 +20,7 @@ It runs entirely in the mod: no skill, no tokens spent by the main conversation,
 At the prompt of a terminal session:
 
 ```
-/plugin install session-shepherd --marketplace nico-c-hublo/claude-session-shepherd
+/plugin install session-shepherd --marketplace nico-c-hublo/claude-plugins
 ```
 
 Answer `y` to add the marketplace, then pick a scope (user scope loads it in every session).
@@ -28,10 +28,10 @@ Answer `y` to add the marketplace, then pick a scope (user scope loads it in eve
 From a shell:
 
 ```
-claude plugin install session-shepherd --marketplace nico-c-hublo/claude-session-shepherd
+claude plugin install session-shepherd --marketplace nico-c-hublo/claude-plugins
 ```
 
-In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `nico-c-hublo/claude-session-shepherd`, then Add plugin.
+In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `nico-c-hublo/claude-plugins`, then Add plugin.
 
 ## Requirements
 

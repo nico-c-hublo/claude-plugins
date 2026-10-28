@@ -1,0 +1,12 @@
+{
+  "name": "nico-c",
+  "owner": { "name": "nico-c-hublo" },
+  "description": "Claude Code plugins (mods and skills) by nico-c-hublo.",
+  "plugins": [
+    {
+      "name": "session-shepherd",
+      "source": "./plugins/session-shepherd",
+      "description": "Names each session after its topic, offers to go back to a session of the same name, and labels the herdr workspace or tmux window."
+    }
+  ]
+}
