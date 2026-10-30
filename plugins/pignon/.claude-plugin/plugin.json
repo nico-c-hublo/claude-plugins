@@ -1,0 +1,22 @@
+{
+  "name": "pignon",
+  "version": "0.1.0",
+  "author": {
+    "name": "nico-c-hublo"
+  },
+  "description": "Routes each prompt to the right Claude model and effort level (Haiku, Sonnet or Opus), with a cache-aware switching policy.",
+  "types": "./types/index.d.ts",
+  "license": "MIT",
+  "userConfig": {
+    "decider": {
+      "type": "string",
+      "title": "Who judges each prompt",
+      "description": "haiku: ask Haiku about each prompt (default). laya: a model on this Mac, nothing sent anywhere; run /pignon setup once. Falls back to Haiku whenever it is unavailable.",
+      "options": [
+        "haiku",
+        "laya"
+      ],
+      "default": "haiku"
+    }
+  }
+}

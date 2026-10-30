@@ -1,0 +1,76 @@
+# pignon
+
+A Claude Code mod that shifts to the right model for each prompt, the way a bike changes sprocket (*pignon*), so you don't spend all day on Opus at high effort. The routing policy descends from [pi-pignon](https://github.com/nico-c-hublo/pi-pignon).
+
+- **A small decider judges each prompt.** On the first model request of a turn, Haiku (low effort) answers how hard the task is, whether it needs exploring the codebase, and how sure it is. Bare acknowledgements ("yes", "go ahead", "vas-y") keep the current tier without asking anyone. Or the judge is [a model on your Mac](#a-local-decider): then the prompt goes to Claude only.
+- **Your session runs on the tier's model and effort.** Every main-loop request of the turn is sent with that tier's model and effort, tool steps included. Subagents keep their own settings.
+- **Switching is cache-aware.** Upgrades need confidence ≥ 0.5; downgrades need ≥ 0.85 (≥ 0.7 for the local model, whose probabilities are lower and calibrated) and a 2-prompt cooldown. A model switch drops the prompt cache, so past 60k tokens of context only effort changes go through.
+
+| Tier | Model / effort | For |
+| --- | --- | --- |
+| trivial | haiku / low | mechanical edits, renames, single lookups (moves up to standard when it must explore) |
+| standard | sonnet / medium | localized changes, routine features and tests, explaining code |
+| hard | opus / high | multi-step investigations, unclear bugs, cross-cutting design |
+
+The table and thresholds live in [`hooks/policy.ts`](hooks/policy.ts).
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `/pignon` | Mode, decider (and whether the local model runs), tier in force, context size and the routing table |
+| `/pignon shadow` | Decide and show, without switching (the default) |
+| `/pignon live` | Apply the decisions |
+| `/pignon off` | Stop routing |
+| `/pignon unpin` | Route again after you picked a model with `/model` or `/effort` |
+| `/pignon log` | The last decisions: who decided (`haiku`, `laya` or `rule`), confidence, latency and reason |
+| `/pignon setup` | Build the local decider (see below) |
+
+Each routed prompt leaves a dim line in the transcript, e.g. `pignon trivial p=0.95 · 412 ms  👁 would switch to trivial · haiku/low (downgrade opus -> trivial)`, and the status line shows the tier in force. The mode is kept across sessions.
+
+Picking a model or effort by hand (`/model`, `/effort`) pins it: pignon pauses until `/pignon unpin`.
+
+## Install
+
+At the prompt of a terminal session:
+
+```
+/plugin install pignon --marketplace nico-c-hublo/claude-plugins
+```
+
+Then watch a few decisions in shadow mode and run `/pignon live` when they look right.
+
+## A local decider
+
+For work where a prompt must not go anywhere but to Claude, a small classifier ([laya-conductor](https://huggingface.co/mvilacad/laya-conductor), 421M parameters, Apache 2.0) can judge the prompts instead of Haiku. It runs on your Mac with MLX; about 10 ms per prompt, about 930 MiB of memory per session.
+
+1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
+2. Run `/pignon setup` once. It builds a Python 3.13 environment from [`daemon/requirements.lock`](daemon/requirements.lock) (every file hash-checked) and downloads the pinned model (about 850 MB, SHA-256 checked) into `$CLAUDE_CONFIG_DIR/pignon/` (`~/.claude/pignon/` by default). These are the only steps that use the network, and no prompt is involved.
+3. Pick `laya` for *Who judges each prompt*: in `/config` (the pignon row), or in `settings.json`:
+
+   ```json
+   { "pluginConfigs": { "pignon": { "options": { "decider": "laya" } } } }
+   ```
+
+   The key is `pignon`, or `pignon@inline` under `--plugin-dir`. Then run `/pignon`: it should say `decider: laya (running)`. If it does not, restart the session. Run setup and the session under the same `CLAUDE_CONFIG_DIR`, since the environment and model live there.
+
+What happens then: at session start the mod launches a small daemon (`daemon/pignon_decider/`) as a child process, bound to a Unix socket in a private (`0700`) directory; the mod reaches it over that socket, so there is no TCP port and no proxy in the path. The daemon runs offline (it drops Hub tokens and proxy variables and sets `HF_HUB_OFFLINE=1`), loads only the model whose hashes are pinned in [`checkpoint.py`](daemon/pignon_decider/checkpoint.py), and exits with the session. When it announces itself the mod runs `lsof` on it and stops it if it holds any network socket, or if that cannot be checked. Whenever the daemon is missing, slow (1.5 s), failing or stopped, Haiku decides.
+
+What this does not do: no operating-system rule blocks the daemon's network access (`sandbox-exec` is deprecated), so the guarantee rests on the audit of `laya-mlx` 0.6.0, the stripped environment and the socket check. The compiled dependencies (`mlx`, `tokenizers`, `numpy`) were not audited.
+
+## Limits
+
+- Each new prompt waits for one decision before the turn starts: a Haiku call (5 s timeout) or the local model (about 10 ms, 1.5 s timeout). On failure the current model stays.
+- Haiku's confidence is its own estimate. The local model's is a probability, but it is soft (top probabilities of 0.5 to 0.85 on clear prompts), the 0.7 downgrade bar is provisional, and the claimed 87% routing accuracy could not be reproduced: the training data is private. Compare the two in shadow mode on your own prompts.
+- The local model cannot say whether a task needs exploring the codebase, so a trivial prompt that does is not moved up to standard.
+- One local daemon runs per session, about 930 MiB each.
+- `/model` keeps showing the session's model; the routed one is in the status line and the log.
+
+## Requirements
+
+- Claude Code with function-hook mods (built and tested on 2.1.314).
+- For the local decider: an Apple silicon Mac on macOS 14 or later, and `uv`.
+
+## Tests
+
+`claude plugin test plugins/pignon` runs the mod's tests against a mocked engine. The daemon's own tests are standard-library `unittest` (`cd daemon && python3 -m unittest discover -s tests -t .`); the opt-in smoke test against the real model is described at the top of `daemon/tests/test_smoke_mlx.py`. The mod has not yet been run in a live session.

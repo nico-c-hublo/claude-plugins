@@ -5,6 +5,7 @@ Claude Code plugins (mods and skills) by nico-c-hublo, published as one marketpl
 | Plugin | What it does |
 | --- | --- |
 | [session-shepherd](plugins/session-shepherd) | Names each session after its topic, offers to go back to a session of the same name, and labels the herdr workspace or tmux window. |
+| [pignon](plugins/pignon) | Routes each prompt to the right Claude model and effort level (Haiku, Sonnet or Opus), with a cache-aware switching policy. |
 
 ## Install
 
