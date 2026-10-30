@@ -68,7 +68,7 @@ The cost is one small Haiku call per decided prompt, in shadow mode only. Live m
 For work where a prompt must not go anywhere but to Claude, a small classifier ([laya-conductor](https://huggingface.co/mvilacad/laya-conductor), 421M parameters, Apache 2.0) can judge the prompts instead of Haiku. It runs on your Mac with MLX; about 10 ms per prompt. A copy of the model takes about 930 MiB resident, and macOS charges about 1.3 to 1.5 GB for it (Activity Monitor's figure). By default each session runs its own copy; [a shared daemon](#one-daemon-for-all-sessions) serves every session from one.
 
 1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
-2. Run `/pignon setup` once. It builds a Python 3.13 environment from [`daemon/requirements.lock`](daemon/requirements.lock) (every file hash-checked) and downloads the pinned model (about 850 MB, SHA-256 checked) into `$CLAUDE_CONFIG_DIR/pignon/` (`~/.claude/pignon/` by default). These are the only steps that use the network, and no prompt is involved.
+2. Run `/pignon setup` once. It builds a Python 3.13 environment from [`daemon/requirements.lock`](daemon/requirements.lock) (every file hash-checked) and downloads the pinned model (about 850 MB, SHA-256 checked) into `$CLAUDE_CONFIG_DIR/pignon/` (`~/.claude/pignon/` by default). These are the only steps that use the network, and no prompt is involved. Running it again rebuilds the environment only when the lock changed (or the environment no longer runs); otherwise it keeps it, so a running decider is not pulled out from under the session.
 3. Pick `laya` for *Who judges each prompt*: in `/config` (the pignon row), or in `settings.json`:
 
    ```json

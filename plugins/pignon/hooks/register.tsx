@@ -292,23 +292,40 @@ async function runSetup($: EngineInterface): Promise<string> {
 
   const home = await dataHome($)
   const daemon = `${$.plugin.root}/daemon`
-  const steps = [
-    ['mkdir', '-p', home],
-    ['uv', 'venv', '--clear', '--python', '3.13', `${home}/venv`],
-    ['uv', 'pip', 'install', '--python', `${home}/venv/bin/python`, '--require-hashes', '--no-deps', '-r', `${daemon}/requirements.lock`],
-    [`${home}/venv/bin/python`, '-m', 'pignon_decider.setup', '--dest', `${home}/model`],
-  ]
-  for (const argv of steps) {
+  const python = `${home}/venv/bin/python`
+  const run = async (argv: string[]): Promise<string | null> => {
     const step = await $.process.run(argv, { cwd: daemon, timeoutMs: 600_000 }).catch(error => ({
       exitCode: 1,
       stderr: error instanceof Error ? error.message : String(error),
     }))
-    if (step.exitCode !== 0) {
-      const reason = step.stderr.trim().split('\n').slice(-5).join('\n')
+    if (step.exitCode === 0) return null
+    const reason = step.stderr.trim().split('\n').slice(-5).join('\n')
 
-      return `pignon setup failed at \`${argv.slice(0, 3).join(' ')}\`:\n${reason}\nFix that, then run /pignon setup again.`
-    }
+    return `pignon setup failed at \`${argv.slice(0, 3).join(' ')}\`:\n${reason}\nFix that, then run /pignon setup again.`
   }
+
+  const made = await run(['mkdir', '-p', home])
+  if (made !== null) return made
+
+  // The lock the venv was built from. Rebuilding for nothing, or under a running daemon, is what it avoids.
+  const lock = (await $.fs.read(`${daemon}/requirements.lock`).catch(() => '')) as string
+  const built = `${home}/venv.lock`
+  const isCurrent =
+    lock !== '' &&
+    ((await $.fs.read(built).catch(() => '')) as string) === lock &&
+    (await $.process.run([python, '--version']).catch(() => null))?.exitCode === 0
+  if (!isCurrent) {
+    // Emptied first, so a rebuild that stops halfway is redone next time.
+    await $.fs.write(built, '')
+    const failure =
+      (await run(['uv', 'venv', '--clear', '--python', '3.13', `${home}/venv`])) ??
+      (await run(['uv', 'pip', 'install', '--python', python, '--require-hashes', '--no-deps', '-r', `${daemon}/requirements.lock`]))
+    if (failure !== null) return failure
+    await $.fs.write(built, lock)
+  }
+
+  const downloaded = await run([python, '-m', 'pignon_decider.setup', '--dest', `${home}/model`])
+  if (downloaded !== null) return downloaded
 
   return 'pignon: the local model is ready. Pick laya for "Who judges each prompt" in /config (the pignon row), then run /pignon: it should say "decider: laya (running)".'
 }
