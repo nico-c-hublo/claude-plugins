@@ -586,7 +586,7 @@ describe('/pignon setup', () => {
     expect(runs.map(r => r.argv.join(' '))).toEqual([
       'uv --version',
       'mkdir -p /cfg/pignon',
-      'uv venv --python 3.13 /cfg/pignon/venv',
+      'uv venv --clear --python 3.13 /cfg/pignon/venv',
       `uv pip install --python /cfg/pignon/venv/bin/python --require-hashes --no-deps -r ${root}/daemon/requirements.lock`,
       '/cfg/pignon/venv/bin/python -m pignon_decider.setup --dest /cfg/pignon/model',
     ])
