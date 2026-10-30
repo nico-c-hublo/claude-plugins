@@ -41,6 +41,8 @@ const CONNECTION_FAILED = 'the connection failed'
 const LAUNCH_TIMEOUT_MS = 130_000
 // A daemon is looked at again this often: a process that was clean at its start may not stay so.
 const AUDIT_EVERY_MS = 5 * 60_000
+// lsof takes tens of milliseconds; one that hangs would stall every prompt, and counts as a failed check.
+const LSOF_TIMEOUT_MS = 2_000
 
 // Shadow until the person has watched a few decisions and says `/pignon live`.
 async function modeOf($: EngineInterface): Promise<Mode> {
@@ -306,6 +308,7 @@ async function dataHome($: EngineInterface): Promise<string> {
 }
 
 // Exits non-zero unless the interpreter runs and finds the packages the daemon imports, without importing them (that would start Metal).
+// Run with -I, so a folder in the working directory named like a package cannot stand in for it.
 const ENVIRONMENT_CHECK =
   'import importlib.util, sys; sys.exit(any(importlib.util.find_spec(name) is None for name in ("laya_mlx", "mlx", "numpy", "tokenizers")))'
 
@@ -339,7 +342,7 @@ async function runSetup($: EngineInterface): Promise<string> {
   const isCurrent =
     lock !== '' &&
     ((await $.fs.read(built).catch(() => '')) as string) === lock &&
-    (await $.process.run([python, '-c', ENVIRONMENT_CHECK]).catch(() => null))?.exitCode === 0
+    (await $.process.run([python, '-I', '-c', ENVIRONMENT_CHECK]).catch(() => null))?.exitCode === 0
   if (!isCurrent) {
     // Emptied first, so a rebuild that stops halfway is redone next time.
     await $.fs.write(built, '')
@@ -388,7 +391,7 @@ async function launchDaemon($: EngineInterface, daemon: LocalDaemon): Promise<vo
 // The daemon's code is audited and its environment stripped; this checks the
 // result on the running process. Unable to check counts as failing it.
 async function holdsNoNetworkSocket($: EngineInterface, pid: string): Promise<boolean> {
-  const sockets = await $.process.run(['/usr/sbin/lsof', '-a', '-p', pid, '-i', '-n', '-P']).catch(() => null)
+  const sockets = await $.process.run(['/usr/sbin/lsof', '-a', '-p', pid, '-i', '-n', '-P'], { timeoutMs: LSOF_TIMEOUT_MS }).catch(() => null)
 
   return sockets !== null && sockets.exitCode <= 1 && sockets.stdout.trim() === ''
 }

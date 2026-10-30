@@ -317,12 +317,14 @@ describe('the local decider: its daemon', () => {
   test('a daemon holding a network socket is killed and never asked', LOCAL, async ($, on) => {
     const sent: TurnStepInput[] = []
     const runs: (readonly string[])[] = []
+    let lsofTimeoutMs: number | undefined
     let fetched = 0
     let isKilled = false
     const calls = engine(on, TRIVIAL, sent, 'live')
     mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
     on('process.run', (_, e) => {
       runs.push(e.argv)
+      if (e.argv[0] === '/usr/sbin/lsof') lsofTimeoutMs = e.init?.timeoutMs
       const sockets = e.argv[0] === '/usr/sbin/lsof' ? 'Python 4242 me 3u IPv4 0x1 0t0 TCP 10.0.0.2:51234->93.184.216.34:443 (ESTABLISHED)\n' : ''
       return { value: { exitCode: 0, stdout: sockets, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
@@ -346,6 +348,7 @@ describe('the local decider: its daemon', () => {
     for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
 
     expect(runs.map(argv => argv.join(' '))).toContain('/usr/sbin/lsof -a -p 4242 -i -n -P')
+    expect(lsofTimeoutMs).toBeLessThanOrEqual(5_000)
     expect(isKilled).toBe(true)
     expect(fetched).toBe(0)
     expect(calls.model).toBe(1)
@@ -639,7 +642,7 @@ describe('/pignon setup', () => {
   test('keeps an environment built from this lock, and only fetches the model', async ($, on) => {
     const { runs, text, writes } = await setup($, on, () => ({}), LOCK)
 
-    expect(runs.map(r => (r.argv[1] === '-c' ? '<environment check>' : r.argv.join(' ')))).toEqual([
+    expect(runs.map(r => (r.argv[2] === '-c' ? '<environment check>' : r.argv.join(' ')))).toEqual([
       'uv --version',
       'mkdir -p /cfg/pignon',
       '<environment check>',
@@ -656,7 +659,7 @@ describe('/pignon setup', () => {
   })
 
   test('rebuilds when the environment no longer runs', async ($, on) => {
-    const { runs } = await setup($, on, argv => (argv[1] === '-c' ? { exitCode: 1 } : {}), LOCK)
+    const { runs } = await setup($, on, argv => (argv[2] === '-c' ? { exitCode: 1 } : {}), LOCK)
 
     expect(runs.map(r => r.argv.slice(0, 2).join(' '))).toContain('uv venv')
   })
@@ -664,8 +667,14 @@ describe('/pignon setup', () => {
   test('checks that the packages are there, not only that the interpreter runs', async ($, on) => {
     const { runs } = await setup($, on, () => ({}), LOCK)
 
-    const check = runs.find(r => r.argv[1] === '-c')?.argv[2] ?? ''
+    const check = runs.find(r => r.argv[2] === '-c')?.argv[3] ?? ''
     for (const name of ['laya_mlx', 'mlx', 'numpy', 'tokenizers']) expect(check).toContain(`"${name}"`)
+  })
+
+  test('runs the package check isolated, so the working directory cannot stand in for a package', async ($, on) => {
+    const { runs } = await setup($, on, () => ({}), LOCK)
+
+    expect(runs.find(r => r.argv[2] === '-c')?.argv[1]).toBe('-I')
   })
 
   test('a rebuild that fails leaves the environment marked as unbuilt', async ($, on) => {
