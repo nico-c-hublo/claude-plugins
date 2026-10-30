@@ -837,6 +837,31 @@ describe('the decisions pane', () => {
     }
   })
 
+  test('colours each line by who decided, the tier and the outcome', LOCAL, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    withDaemon(on, () => ({
+      status: 200,
+      ok: true,
+      headers: {},
+      text: JSON.stringify({ tiers: { trivial: 0.9, standard: 0.07, hard: 0.03 }, tier: 'trivial', latencyMs: 9 }),
+    }))
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await $.turn.start({ turnId: 't1', text: 'rename foo to bar in utils.ts' })
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
+
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, surface: 'terminal' })
+
+    expect((await ui.find({ type: 'Text', text: /laya +rename/ }))?.props.color).toBe('suggestion')
+    // The tier the local model leans to stands out; the others recede.
+    const trivial = (await ui.find({ type: 'Text', text: /^trivial/ }))?.props
+    const hard = (await ui.find({ type: 'Text', text: /^hard/ }))?.props
+    expect(trivial).toMatchObject({ color: 'success', dimColor: false })
+    expect(hard).toMatchObject({ color: 'error', dimColor: true })
+    expect((await ui.find({ type: 'Text', text: /daemon/ }))?.props.color).toBe('success')
+    await ui.unmount()
+  })
+
   test('says why the local model did not decide when Haiku did', LOCAL, async ($, on) => {
     engine(on, TRIVIAL, [], 'shadow')
     const failures = [

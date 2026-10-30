@@ -460,6 +460,23 @@ function compareReport(entries: readonly LogEntry[]): string {
   return [summary, 'Differences (laya → haiku):', ...lines].join('\n')
 }
 
+// The pane's colours are theme keys, so they follow the person's theme.
+const DECIDER_COLOR: Record<LogEntry['decider'], string> = { laya: 'suggestion', haiku: 'claude', rule: 'inactive' }
+const TIER_COLOR: Record<string, string> = { trivial: 'success', standard: 'warning', hard: 'error' }
+const ACTION_COLOR: Record<LogEntry['action'], string> = { switched: 'success', 'would switch': 'warning', kept: 'inactive' }
+
+// The tier the local model gave the most probability.
+function leadingTier(entry: LogEntry): string | undefined {
+  return Object.entries(entry.tiers ?? {}).sort((a, b) => b[1] - a[1])[0]?.[0]
+}
+
+// Green when Haiku agrees, yellow when it differs, dim while it has not answered.
+function secondColor(entry: LogEntry): string {
+  if (!entry.second?.decision) return 'inactive'
+
+  return agrees(entry) ? 'success' : 'warning'
+}
+
 function tierBar(entry: LogEntry, id: string): string {
   const probability = entry.tiers?.[id] ?? 0
 
@@ -710,23 +727,29 @@ export const register: Register = (on, options) => {
         {list.length < all.length && (
           <Text dimColor>{`${all.length - list.length} earlier decision${all.length - list.length === 1 ? '' : 's'} not shown`}</Text>
         )}
-        {list.map(entry => (
-          <Box flexDirection="column" marginBottom={1}>
-            <Text>{`${clockTime(entry.at)} ${entry.decider.padEnd(5)} ${entry.sent || entry.prompt}`}</Text>
-            {entry.fallback && <Text dimColor>{`laya unavailable: ${entry.fallback}`}</Text>}
-            {entry.tiers && (
-              <Box gap={2}>
-                {TIERS.map(tier => (
-                  <Text>{tierBar(entry, tier.id)}</Text>
-                ))}
-              </Box>
-            )}
-            {!entry.tiers && <Text>{verdictLine(entry)}</Text>}
-            {secondLine(entry) && <Text>{secondLine(entry)}</Text>}
-            <Text>{outcomeLine(entry)}</Text>
-            <Text dimColor>{entry.reason}</Text>
-          </Box>
-        ))}
+        {list.map(entry => {
+          const leading = leadingTier(entry)
+
+          return (
+            <Box flexDirection="column" marginBottom={1}>
+              <Text color={DECIDER_COLOR[entry.decider]} weight="semibold">{`${clockTime(entry.at)} ${entry.decider.padEnd(5)} ${entry.sent || entry.prompt}`}</Text>
+              {entry.fallback && <Text color="warning">{`laya unavailable: ${entry.fallback}`}</Text>}
+              {entry.tiers && (
+                <Box gap={2}>
+                  {TIERS.map(tier => (
+                    <Text color={TIER_COLOR[tier.id]} dimColor={tier.id !== leading} weight={tier.id === leading ? 'semibold' : 'regular'}>
+                      {tierBar(entry, tier.id)}
+                    </Text>
+                  ))}
+                </Box>
+              )}
+              {!entry.tiers && <Text color={TIER_COLOR[effectiveTier(entry.decision) ?? '']}>{verdictLine(entry)}</Text>}
+              {secondLine(entry) && <Text color={secondColor(entry)}>{secondLine(entry)}</Text>}
+              <Text color={ACTION_COLOR[entry.action]}>{outcomeLine(entry)}</Text>
+              <Text dimColor>{entry.reason}</Text>
+            </Box>
+          )
+        })}
       </Box>
     )
   })

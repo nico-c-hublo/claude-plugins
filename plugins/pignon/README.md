@@ -47,6 +47,8 @@ Then watch a few decisions in shadow mode and run `/pignon live` when they look 
 
 `/pignon watch` opens a pane beside the chat that draws each decision the moment it is made: the time, who decided (`laya`, `haiku` or `rule`), the start of the prompt as the decider read it (the local model reads the first 400 characters), the local model's probability for each tier, how long it took (the mod's clock and the daemon's own), what was done about it, and why. When the local model was chosen but Haiku decided, the pane says why: not running, timed out, an HTTP error, a dropped connection, or an unusable answer.
 
+Colour carries the same information at a glance: the first line takes the decider's colour, each tier is green (trivial), yellow (standard) or red (hard) with the tier the local model leans to in bold and the others dimmed, Haiku's second opinion is green when it agrees and yellow when it differs, and the outcome is green for a switch, yellow for a would-switch in shadow mode, and dim for a kept tier. The colours are theme keys, so they follow your theme.
+
 The pane keeps the last 50 decisions in the session's memory (nothing is written to disk unless you turn on [the decision log](#keeping-a-decision-log)) and shows the newest ones that fit, noting how many older ones are hidden. It shows prompt text on your screen, no more than the transcript does, so mind it when sharing your screen. A pane opened by a command is placed at any width; if the surface cannot draw it, the command says why.
 
 ## Comparing the two judges
