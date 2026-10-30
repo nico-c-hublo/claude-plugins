@@ -500,11 +500,21 @@ describe('the local decider: its daemon', () => {
 type Run = { argv: readonly string[]; cwd?: string; timeoutMs?: number }
 const OK = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 
-// Plays `/pignon setup` against a host whose commands `answer` as given.
-async function setup($: Engine, on: On, answer: (argv: readonly string[]) => Partial<typeof OK>) {
+const LOCK = 'numpy==2.0.0 --hash=sha256:aa\n'
+
+// Plays `/pignon setup` against a host whose commands `answer` as given and whose disk holds `stamp`
+// (the lock the environment was built from) next to the plugin's own lock.
+async function setup($: Engine, on: On, answer: (argv: readonly string[]) => Partial<typeof OK>, stamp = '') {
   const runs: Run[] = []
+  const writes: { path: string; text: string }[] = []
   engine(on, TRIVIAL, [], 'shadow')
   mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+  on('fs.read', (_, e) => ({ value: String(e.path).endsWith('/requirements.lock') ? LOCK : String(e.path).endsWith('/venv.lock') ? stamp : '' }))
+  on('fs.write', (_, e) => {
+    writes.push({ path: String(e.path), text: String(e.text) })
+
+    return { value: undefined }
+  })
   on('process.run', (_, e) => {
     runs.push({ argv: e.argv, cwd: e.init?.cwd, timeoutMs: e.init?.timeoutMs })
     return { value: { ...OK, ...answer(e.argv) } }
@@ -516,7 +526,7 @@ async function setup($: Engine, on: On, answer: (argv: readonly string[]) => Par
     presentation: { isFullscreen: false, columns: 80 },
   })
 
-  return { runs, text }
+  return { runs, text, writes }
 }
 
 describe('/pignon status shows the decider', () => {
@@ -580,7 +590,7 @@ describe('/pignon setup', () => {
   })
 
   test('builds the hash-locked environment, then downloads the pinned model', async ($, on) => {
-    const { runs, text } = await setup($, on, () => ({}))
+    const { runs, text, writes } = await setup($, on, () => ({}))
 
     const root = (runs[4]?.cwd ?? '').replace(/\/daemon$/, '')
     expect(runs.map(r => r.argv.join(' '))).toEqual([
@@ -592,7 +602,39 @@ describe('/pignon setup', () => {
     ])
     expect(runs[4]?.cwd).toBe(`${root}/daemon`)
     expect(runs.slice(2).every(r => (r.timeoutMs ?? 0) >= 300_000)).toBe(true)
+    expect(writes.map(w => w.text)).toEqual(['', LOCK])
     expect(text).toContain('ready')
+  })
+
+  test('keeps an environment built from this lock, and only fetches the model', async ($, on) => {
+    const { runs, text, writes } = await setup($, on, () => ({}), LOCK)
+
+    expect(runs.map(r => r.argv.join(' '))).toEqual([
+      'uv --version',
+      'mkdir -p /cfg/pignon',
+      '/cfg/pignon/venv/bin/python --version',
+      '/cfg/pignon/venv/bin/python -m pignon_decider.setup --dest /cfg/pignon/model',
+    ])
+    expect(writes).toEqual([])
+    expect(text).toContain('ready')
+  })
+
+  test('rebuilds when the lock changed since the environment was built', async ($, on) => {
+    const { runs } = await setup($, on, () => ({}), 'numpy==1.0.0\n')
+
+    expect(runs.map(r => r.argv.slice(0, 2).join(' '))).toContain('uv venv')
+  })
+
+  test('rebuilds when the environment no longer runs', async ($, on) => {
+    const { runs } = await setup($, on, argv => (argv.at(-1) === '--version' && argv[0] !== 'uv' ? { exitCode: 127 } : {}), LOCK)
+
+    expect(runs.map(r => r.argv.slice(0, 2).join(' '))).toContain('uv venv')
+  })
+
+  test('a rebuild that fails leaves the environment marked as unbuilt', async ($, on) => {
+    const { writes } = await setup($, on, argv => (argv[1] === 'pip' ? { exitCode: 1, stderr: 'boom' } : {}), 'numpy==1.0.0\n')
+
+    expect(writes.map(w => w.text)).toEqual([''])
   })
 
   test('stops at the first failing step and says which one and why', async ($, on) => {
