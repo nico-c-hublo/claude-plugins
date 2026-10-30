@@ -36,6 +36,9 @@ def _go_offline():
 
 def main(argv=None, load_scorer=None):
     """Runs until stopped. `load_scorer(model_dir)` is injectable for tests."""
+    # Read first: a parent that dies during the seconds the model takes to load
+    # must not leave us waiting on launchd, whose pid we would then take for the parent's.
+    parent = os.getppid()
     parser = argparse.ArgumentParser(prog="pignon_decider")
     parser.add_argument("--socket", required=True, help="path of the Unix socket to serve on")
     parser.add_argument("--model", required=True, help="directory of the converted checkpoint")
@@ -64,7 +67,6 @@ def main(argv=None, load_scorer=None):
     print(f"ready {os.getpid()}", flush=True)
     # The engine closes our stdin from the start, so the parent's death shows only
     # as a change of parent pid (we are adopted by launchd).
-    parent = os.getppid()
     while not stop.wait(PARENT_CHECK_SECONDS) and os.getppid() == parent:
         pass
     daemon.shutdown()
