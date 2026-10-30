@@ -2,7 +2,9 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { HttpInit, On, ProcessSpawnRequest, TurnStepInput } from 'claude-code'
 
+import type { DecisionRecord, LogEntry } from '../types'
 import { decide, decisionFromTiers, isFollowUp, parseDecision } from '../hooks/policy'
+import { parseRecords, recordOf, serialize, summarize } from '../hooks/record'
 
 const OPUS = 'claude-opus-5-5'
 const base = {
@@ -1159,5 +1161,279 @@ describe('the local decider: a shared daemon', () => {
 
     expect(spawned).toHaveLength(1)
     expect(spawned[0]?.argv).not.toContain('--shared')
+  })
+})
+
+// The decision log: metadata only, one file per session, summed by /pignon stats.
+const RECORDING = { options: { decider: 'laya', record: 'on' } }
+const SECRET = 'rename SECRETWORD to bar in utils.ts'
+
+function entry(over: Partial<LogEntry> = {}): LogEntry {
+  return {
+    id: 0,
+    at: Date.UTC(2026, 9, 30, 12, 0, 0),
+    prompt: SECRET.slice(0, 80),
+    sent: SECRET,
+    tiers: { trivial: 0.9, standard: 0.07, hard: 0.03 },
+    daemonMs: 9,
+    second: { decision: { tier: 'trivial', explore: false, confidence: 0.8 }, ms: 700 },
+    decider: 'laya',
+    decision: { tier: 'trivial', explore: false, confidence: 0.9 },
+    ms: 14,
+    action: 'would switch',
+    tier: 'trivial',
+    reason: 'downgrade trivial',
+    ...over,
+  }
+}
+
+const CONTEXT = {
+  session: 'ab12cd34',
+  project: '/work/api',
+  mode: 'shadow' as const,
+  chosen: 'laya' as const,
+  daemon: 'shared' as const,
+  promptChars: SECRET.length,
+  was: null,
+  model: OPUS,
+  contextTokens: 12_000,
+}
+
+describe('the decision log: a record', () => {
+  test('keeps no word of the prompt, only its length', async () => {
+    const line = serialize([recordOf(entry(), CONTEXT)])
+
+    expect(line).not.toContain('SECRETWORD')
+    expect(line).not.toContain('utils.ts')
+    expect(JSON.parse(line).promptChars).toBe(SECRET.length)
+  })
+
+  test('leaves out a second opinion still pending, and a long reason is cut', async () => {
+    const pending = recordOf(entry({ second: { decision: null, ms: 0, isPending: true }, reason: 'x'.repeat(500) }), CONTEXT)
+
+    expect(pending.second).toBeUndefined()
+    expect(pending.reason).toHaveLength(80)
+  })
+
+  test('reading skips a half-written line and a record of another version', async () => {
+    const good = serialize([recordOf(entry(), CONTEXT)])
+    const text = `${good}{"v":1,"at":\n{"v":2,"at":1}\nnot json\n${good}`
+
+    expect(parseRecords(text)).toHaveLength(2)
+  })
+})
+
+describe('the decision log: the summary', () => {
+  const at = (n: number) => Date.UTC(2026, 9, 30, 12, n, 0)
+  const rec = (n: number, laya: number, haiku: string | null, project = '/work/api'): DecisionRecord =>
+    recordOf(
+      entry({
+        id: n,
+        at: at(n),
+        decision: { tier: 'trivial', explore: false, confidence: laya },
+        second: { decision: haiku ? { tier: haiku, explore: false, confidence: 0.8 } : null, ms: 600 },
+      }),
+      { ...CONTEXT, project },
+    )
+
+  test('says what to do when nothing is recorded', async () => {
+    expect(summarize([], 0)).toContain('"record" to "on"')
+  })
+
+  test('counts agreement by confidence band, so the downgrade bar can be tuned', async () => {
+    const records = [
+      rec(1, 0.6, 'standard'),
+      rec(2, 0.6, 'trivial'),
+      rec(3, 0.75, 'trivial'),
+      rec(4, 0.9, 'trivial'),
+      rec(5, 0.9, 'trivial'),
+      rec(6, 0.9, null),
+    ]
+
+    const text = summarize(records, 2)
+
+    expect(text).toContain('6 decisions in 2 sessions, 2026-10-30 to 2026-10-30')
+    expect(text).toContain('5 compared · 4 agree (80%) · 1 differ · haiku gave no answer for 1')
+    expect(text).toMatch(/0\.50 to 0\.70\s+50% agree \(n=2\)/)
+    expect(text).toMatch(/0\.70 to 0\.85\s+100% agree \(n=1\)/)
+    expect(text).toMatch(/p ≥ 0\.85\s+100% agree \(n=2\)/)
+    expect(text).toContain('differences (laya → haiku): trivial → standard 1')
+  })
+
+  test('splits agreement by project, and reports latency and fallbacks', async () => {
+    const records = [
+      rec(1, 0.9, 'trivial', '/work/api'),
+      rec(2, 0.9, 'standard', '/work/web'),
+      recordOf(entry({ id: 3, at: at(3), decider: 'haiku', tiers: undefined, second: undefined, fallback: 'it is not running', daemonMs: undefined }), CONTEXT),
+    ]
+
+    const text = summarize(records, 1)
+
+    expect(text).toMatch(/work\/api\s+100% agree \(n=1\)/)
+    expect(text).toMatch(/work\/web\s+0% agree \(n=1\)/)
+    expect(text).toContain('latency: laya p50 14 ms')
+    expect(text).toContain('fell back to haiku: it is not running 1')
+  })
+})
+
+describe('the decision log: in a session', () => {
+  const HAIKU_SAYS_STANDARD = '{"tier":"standard","explore":false,"confidence":0.8}'
+  const LAYA = {
+    status: 200,
+    ok: true,
+    headers: {},
+    text: JSON.stringify({ tiers: { trivial: 0.9, standard: 0.07, hard: 0.03 }, latencyMs: 9 }),
+  }
+
+  // The engine below the mod: a daemon that answers, a disk that records what is written.
+  function disk(on: On, options: { failWrites?: boolean } = {}) {
+    const seen = { writes: [] as { path: string; text: string }[], runs: [] as (readonly string[])[] }
+    mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+    on('process.run', (_, e) => {
+      seen.runs.push(e.argv)
+
+      return { value: OK }
+    })
+    on('process.spawn', async function* () {
+      yield { stream: 'stdout' as const, text: 'ready 4242\n' }
+      await forever
+      return { value: { code: 0, signal: null } }
+    })
+    on('http.fetch', () => ({ value: LAYA }))
+    on('session.cwd', () => ({ value: '/work/api' }))
+    on('fs.write', (_, e) => {
+      if (options.failWrites) throw new Error('disk full')
+      seen.writes.push(e)
+
+      return { value: undefined }
+    })
+
+    return seen
+  }
+
+  const last = (seen: { writes: { text: string }[] }) => parseRecords(seen.writes.at(-1)?.text ?? '')
+
+  test('writes nothing unless it was asked to', LOCAL, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    const seen = disk(on)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', SECRET)
+    await settle()
+
+    expect(seen.writes).toEqual([])
+    expect(seen.runs.some(argv => argv.join(' ').includes('/decisions'))).toBe(false)
+  })
+
+  test('one line per decision, in a private folder, without the prompt', RECORDING, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    const seen = disk(on)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', SECRET)
+    await settle()
+    await prompt($, 't2', 'add a test for the parser')
+    await settle()
+
+    expect(seen.runs).toContainEqual(['mkdir', '-p', '-m', '700', '/cfg/pignon/decisions'])
+    const paths = new Set(seen.writes.map(w => w.path))
+    expect(paths.size).toBe(1) // one file for the session, rewritten as it grows
+    expect([...paths][0]).toMatch(/^\/cfg\/pignon\/decisions\/\d{8}T\d{6}-[0-9a-f]{8}\.jsonl$/)
+    const records = last(seen)
+    expect(records.map(r => r.n)).toEqual([0, 1])
+    expect(records[0]).toMatchObject({ decider: 'laya', chosen: 'laya', daemon: 'session', project: '/work/api', mode: 'shadow', promptChars: SECRET.length })
+    expect(seen.writes.every(w => !w.text.includes('SECRETWORD') && !w.text.includes('parser'))).toBe(true)
+  })
+
+  test("Haiku's opinion is added to the record once it has answered", RECORDING, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    const seen = disk(on)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', SECRET)
+    await settle()
+
+    expect(parseRecords(seen.writes[0]?.text ?? '')[0]?.second).toBeUndefined()
+    expect(last(seen)[0]?.second?.decision).toEqual({ tier: 'standard', explore: false, confidence: 0.8 })
+  })
+
+  test('says who was chosen and how the model ran', { options: { record: 'on' } }, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    const seen = disk(on)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', SECRET)
+    await settle()
+
+    expect(last(seen)[0]).toMatchObject({ chosen: 'haiku', daemon: null, decider: 'haiku', mode: 'live' })
+  })
+
+  test('removes logs older than 90 days when the session starts', RECORDING, async ($, on) => {
+    engine(on, TRIVIAL, [], 'shadow')
+    const seen = disk(on)
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    expect(seen.runs).toContainEqual(['find', '/cfg/pignon/decisions', '-name', '*.jsonl', '-mtime', '+90', '-delete'])
+  })
+
+  test('a disk that fails costs no prompt', RECORDING, async ($, on) => {
+    const sent: TurnStepInput[] = []
+    engine(on, HAIKU_SAYS_STANDARD, sent, 'live')
+    disk(on, { failWrites: true })
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', SECRET)
+    await prompt($, 't2', 'add a test')
+    await settle()
+
+    expect(sent).toHaveLength(2)
+  })
+
+  test('/pignon stats sums the session files', RECORDING, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    disk(on)
+    const files = {
+      '/cfg/pignon/decisions/a.jsonl': serialize([recordOf(entry(), CONTEXT)]),
+      '/cfg/pignon/decisions/b.jsonl': serialize([recordOf(entry({ id: 1, second: { decision: { tier: 'hard', explore: false, confidence: 0.7 }, ms: 500 } }), CONTEXT)]),
+    }
+    on('fs.list', () => ({
+      value: Object.keys(files).map((path, i) => ({ name: path.split('/').pop()!, kind: 'file' as const, size: 1, mtimeMs: i, isLink: false })),
+    }))
+    on('fs.read', (_, e) => ({ value: files[e.path as keyof typeof files] ?? '' }))
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    const { text = '' } = await $.command.run({
+      command: 'pignon',
+      args: 'stats',
+      origin: { kind: 'composer' },
+      presentation: { isFullscreen: false, columns: 80 },
+    })
+
+    expect(text).toContain('2 decisions in 2 sessions')
+    expect(text).toContain('2 compared · 1 agree (50%) · 1 differ')
+  })
+
+  test('/pignon stats says how to start when there is no folder yet', RECORDING, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    disk(on)
+    on('fs.list', () => {
+      throw new Error('ENOENT')
+    })
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    const { text = '' } = await $.command.run({
+      command: 'pignon',
+      args: 'stats',
+      origin: { kind: 'composer' },
+      presentation: { isFullscreen: false, columns: 80 },
+    })
+
+    expect(text).toContain('No decisions recorded yet')
   })
 })

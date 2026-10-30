@@ -24,6 +24,7 @@ The table and thresholds live in [`hooks/policy.ts`](hooks/policy.ts).
 | `/pignon off` | Stop routing |
 | `/pignon unpin` | Route again after you picked a model with `/model` or `/effort` |
 | `/pignon log` | The last decisions: who decided (`haiku`, `laya` or `rule`), confidence, latency and reason |
+| `/pignon stats [days]` | Totals from the [decision log](#keeping-a-decision-log) across sessions and projects: agreement by confidence band and by project, latency, fallbacks |
 | `/pignon compare` | How often the local model and Haiku would run the same tier, and the prompts where they differ (see below) |
 | `/pignon watch` | Open a pane that shows each decision as it is made (see below) |
 | `/pignon setup` | Build the local decider (see below) |
@@ -46,7 +47,7 @@ Then watch a few decisions in shadow mode and run `/pignon live` when they look 
 
 `/pignon watch` opens a pane beside the chat that draws each decision the moment it is made: the time, who decided (`laya`, `haiku` or `rule`), the start of the prompt as the decider read it (the local model reads the first 400 characters), the local model's probability for each tier, how long it took (the mod's clock and the daemon's own), what was done about it, and why. When the local model was chosen but Haiku decided, the pane says why: not running, timed out, an HTTP error, a dropped connection, or an unusable answer.
 
-The pane keeps the last 50 decisions in the session's memory (nothing is written to disk) and shows the newest ones that fit, noting how many older ones are hidden. It shows prompt text on your screen, no more than the transcript does, so mind it when sharing your screen. A pane opened by a command is placed at any width; if the surface cannot draw it, the command says why.
+The pane keeps the last 50 decisions in the session's memory (nothing is written to disk unless you turn on [the decision log](#keeping-a-decision-log)) and shows the newest ones that fit, noting how many older ones are hidden. It shows prompt text on your screen, no more than the transcript does, so mind it when sharing your screen. A pane opened by a command is placed at any width; if the surface cannot draw it, the command says why.
 
 ## Comparing the two judges
 
@@ -89,6 +90,39 @@ Set *How the local model runs* to `shared` (the `daemon` option, beside `decider
 - **Checked by every session.** The first time a session reaches a given process, the mod runs `lsof` on the pid the daemon reports and does not use a process that holds a network socket, or whose sockets cannot be checked.
 - **Idle means one slow prompt.** After the daemon has left, the next prompt finds no connection, Haiku decides that one, and the mod starts the daemon again in the background for the prompts after it.
 - **What it changes in the guarantees above.** Several sessions share one process, and it outlives the one that started it. Prompts still reach only that process over its Unix socket, and the daemon keeps nothing of them. `pkill -f pignon_decider` stops it by hand.
+
+## Keeping a decision log
+
+`/pignon compare` and the pane only see the current session, and forget it when it ends. To judge the local model over days and across projects, set *Keep a decision log* to `on` (the `record` option, in `/config` or `"record": "on"` in the same `pluginConfigs` block as `decider`). It is off by default.
+
+Each decision then adds one JSON line to a file for the session in `$CLAUDE_CONFIG_DIR/pignon/decisions/` (`~/.claude/pignon/decisions/` by default), a folder only you can enter. **No word of a prompt is kept**, only its length. A line holds:
+
+- when, and the session's working directory;
+- who was chosen in the settings and who answered (`laya`, `haiku` or `rule`), and how the local model ran (`session` or `shared`);
+- the local model's probability for each tier, its decision and confidence;
+- Haiku's opinion, in shadow mode, once it has answered;
+- how long each took, the fallback cause when the local model was chosen but Haiku decided;
+- what was done (kept, would switch, switched), the tier before and after, the policy's reason, the session's model and the context size.
+
+`/pignon stats` sums the newest 200 session files (`/pignon stats 7` keeps the last 7 days). The numbers below only show the format:
+
+```
+412 decisions in 9 sessions, 2026-10-30 to 2026-11-12
+decided by: laya 380 · haiku 20 · rule 12
+
+laya vs haiku: 301 compared · 268 agree (89%) · 33 differ · haiku gave no answer for 14
+  p < 0.50        52% agree (n=21)
+  0.50 to 0.70    61% agree (n=41)
+  0.70 to 0.85    88% agree (n=120)
+  p ≥ 0.85        97% agree (n=119)
+  differences (laya → haiku): trivial → standard 12 · standard → hard 9
+  by project:
+    work/api                        92% agree (n=120)
+```
+
+The confidence bands are what the 0.7 downgrade bar is tuned against: if agreement stays high below it, the bar is too strict. With no ground truth, "agree" means the two judges would run the same tier, and the disagreements are the data.
+
+Files are rewritten whole on each decision (the engine has no append, and two sessions sharing a file would lose lines), capped at 3,000 decisions each. A file older than 90 days is deleted when a session starts with the log on; delete the folder to clear everything. The file also holds your project paths, so mind it when sharing.
 
 ## Limits
 

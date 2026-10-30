@@ -1,8 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Decision, Effort, LogEntry } from '../types'
+import type { Decision, DecisionRecord, Effort, LogEntry } from '../types'
 import type { DeciderId } from './policy'
+import { KEEP_DAYS, MAX_RECORDS, parseRecords, recordOf, serialize, summarize } from './record'
 import {
   DECIDER_SYSTEM,
   THRESHOLDS,
@@ -60,12 +61,19 @@ async function ask($: EngineInterface, text: string, tier: string | null): Promi
 
 // Haiku's opinion on a prompt the local model decided, for comparison. Shadow
 // mode switches nothing, so no turn waits for it: it fills in the entry later.
-async function secondOpinion($: EngineInterface, id: number, text: string, tier: string | null): Promise<void> {
+async function secondOpinion(
+  $: EngineInterface,
+  id: number,
+  text: string,
+  tier: string | null,
+  isRecording: boolean,
+): Promise<void> {
   const startedAt = await $.clock.now()
   const decision = await ask($, text, tier).catch(() => null)
   const ms = Math.round((await $.clock.now()) - startedAt)
 
   await update($, log, list => list.map(entry => (entry.id === id ? { ...entry, second: { decision, ms } } : entry)))
+  if (isRecording) await recordSecond($, id, { decision, ms })
 }
 
 // What the local model's daemon answered, or why there is no answer.
@@ -180,6 +188,86 @@ async function connectShared($: EngineInterface, daemon: LocalDaemon): Promise<v
   } finally {
     daemon.isStarting = false
   }
+}
+
+// The decision log (see record.ts): one file per session, rewritten whole, since
+// the engine's fs has no append and two sessions on one file would lose lines.
+const kept: DecisionRecord[] = []
+let keptFile: string | null = null
+let session: string | null = null
+let flushing: Promise<void> = Promise.resolve()
+let hasFailedToWrite = false
+
+function sessionId(): string {
+  session ??= randomHex(4)
+
+  return session
+}
+
+async function decisionsDir($: EngineInterface): Promise<string> {
+  return `${await dataHome($)}/decisions`
+}
+
+// Never throws: a log that cannot be written must not cost a prompt.
+async function writeKept($: EngineInterface): Promise<void> {
+  try {
+    if (keptFile === null) {
+      const dir = await decisionsDir($)
+      await $.process.run(['mkdir', '-p', '-m', '700', dir])
+      const stamp = new Date(await $.clock.now()).toISOString().replace(/[-:]/g, '').slice(0, 15)
+      keptFile = `${dir}/${stamp}-${sessionId()}.jsonl`
+    }
+    await $.fs.write(keptFile, serialize(kept))
+  } catch {
+    if (!hasFailedToWrite) $.ui.toast('pignon: the decision log could not be written.')
+    hasFailedToWrite = true
+  }
+}
+
+function keep($: EngineInterface, change: (list: DecisionRecord[]) => void): Promise<void> {
+  change(kept)
+  if (kept.length > MAX_RECORDS) kept.splice(0, kept.length - MAX_RECORDS)
+  flushing = flushing.then(() => writeKept($))
+
+  return flushing
+}
+
+async function recordDecision($: EngineInterface, record: DecisionRecord): Promise<void> {
+  await keep($, list => {
+    list.push(record)
+  })
+}
+
+// Haiku's opinion lands after the decision: it fills in the record already kept.
+async function recordSecond($: EngineInterface, id: number, second: { decision: Decision | null; ms: number }): Promise<void> {
+  await keep($, list => {
+    const record = list.find(r => r.session === sessionId() && r.n === id)
+    if (record) record.second = second
+  })
+}
+
+async function pruneLog($: EngineInterface): Promise<void> {
+  const dir = await decisionsDir($)
+  await $.process.run(['find', dir, '-name', '*.jsonl', '-mtime', `+${KEEP_DAYS}`, '-delete']).catch(() => null)
+}
+
+// `/pignon stats [days]`: the newest 200 session files, summed.
+async function statsReport($: EngineInterface, daysArg: string): Promise<string> {
+  const days = Number.parseInt(daysArg, 10)
+  const dir = await decisionsDir($)
+  const entries = await $.fs.list(dir).catch(() => [])
+  const files = entries.filter(e => e.kind === 'file' && e.name.endsWith('.jsonl')).sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, 200)
+  const since = days > 0 ? (await $.clock.now()) - days * 86_400_000 : 0
+  const records: DecisionRecord[] = []
+  let sessions = 0
+  for (const file of files) {
+    const text = (await $.fs.read(`${dir}/${file.name}`).catch(() => '')) as string
+    const mine = parseRecords(text).filter(r => r.at >= since)
+    if (mine.length > 0) sessions++
+    records.push(...mine)
+  }
+
+  return summarize(records, sessions)
 }
 
 function randomHex(bytes: number): string {
@@ -387,6 +475,7 @@ async function route(
   wantsLocal: boolean,
   daemon: LocalDaemon,
   isShared: boolean,
+  isRecording: boolean,
 ) {
   const was = await read($, current)
   const startedAt = await $.clock.now()
@@ -459,7 +548,21 @@ async function route(
     reason,
   }
   await update($, log, list => [...list, entry].slice(-50))
-  if (mode === 'shadow' && local) void secondOpinion($, id, text, was)
+  if (isRecording) {
+    const context = {
+      session: sessionId(),
+      project: await $.session.cwd(),
+      mode: mode === 'live' ? ('live' as const) : ('shadow' as const),
+      chosen: wantsLocal ? ('laya' as const) : ('haiku' as const),
+      daemon: wantsLocal ? (isShared ? ('shared' as const) : ('session' as const)) : null,
+      promptChars: text.length,
+      was,
+      model,
+      contextTokens: contextSize,
+    }
+    void recordDecision($, recordOf(entry, context))
+  }
+  if (mode === 'shadow' && local) void secondOpinion($, id, text, was, isRecording)
 
   const verdict = decision
     ? `${source} ${decision.tier}${decision.explore ? '/explore' : ''} p=${decision.confidence.toFixed(2)} · ${ms} ms`
@@ -476,14 +579,16 @@ export const register: Register = (on, options) => {
   // The prompt each main turn starts with, read by its first model request.
   const prompts = new Map<string, string>()
   const isShared = decider === 'laya' && options.daemon === 'shared'
+  const isRecording = options.record === 'on'
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'pignon',
-      description: 'Model router: status, live, shadow, off, unpin, log, compare, watch, setup',
-      argumentHint: '[live|shadow|off|unpin|log|compare|watch|setup]',
+      description: 'Model router: status, live, shadow, off, unpin, log, compare, stats, watch, setup',
+      argumentHint: '[live|shadow|off|unpin|log|compare|stats|watch|setup]',
       immediate: true,
     })
+    if (isRecording) void pruneLog($)
     if (isShared) void connectShared($, daemon)
     else if (decider === 'laya') void launchDaemon(
         $,
@@ -530,6 +635,7 @@ export const register: Register = (on, options) => {
         decider === 'laya',
         daemon,
         isShared,
+        isRecording,
       )
     }
 
@@ -587,6 +693,8 @@ export const register: Register = (on, options) => {
     }
 
     if (arg === 'compare') return { text: compareReport(await read($, log)) }
+
+    if (arg === 'stats' || arg.startsWith('stats ')) return { text: await statsReport($, arg.slice(5).trim()) }
 
     if (arg === 'watch') {
       const opened = await $.ui.open({ id: PANE, title: 'pignon' })
@@ -650,7 +758,8 @@ export const register: Register = (on, options) => {
         }`,
         `context ${Math.round((await read($, contextTokens)) / 1000)}k · ${guard}`,
         table,
-        'Commands: /pignon live | shadow | off | unpin | log | compare | watch | setup',
+        `decision log: ${isRecording ? `on (${kept.length} this session; /pignon stats sums them)` : 'off'}`,
+        'Commands: /pignon live | shadow | off | unpin | log | compare | stats | watch | setup',
       ].join('\n'),
     }
   })

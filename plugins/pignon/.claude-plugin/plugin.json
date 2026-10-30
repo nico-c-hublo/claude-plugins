@@ -27,6 +27,16 @@
         "shared"
       ],
       "default": "session"
+    },
+    "record": {
+      "type": "string",
+      "title": "Keep a decision log",
+      "description": "off: nothing is written to disk (default). on: one line per decision in $CLAUDE_CONFIG_DIR/pignon/decisions/, with the tiers, the judges' answers and timings but none of the prompt, for /pignon stats. Files older than 90 days are removed.",
+      "options": [
+        "off",
+        "on"
+      ],
+      "default": "off"
     }
   }
 }

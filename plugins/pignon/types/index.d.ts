@@ -37,6 +37,48 @@ export type LogEntry = {
   reason: string
 }
 
+/**
+ * One line of the decision log. Metadata only: nothing of the prompt is kept but
+ * its length, so the file can be shared or read in bulk without reading anyone's work.
+ */
+export type DecisionRecord = {
+  v: 1
+  /** Random per session: the file name carries it too. */
+  session: string
+  /** The entry id within the session, as `/pignon log` counts. */
+  n: number
+  /** When it was decided, in milliseconds since the epoch. */
+  at: number
+  /** The session's working directory. */
+  project: string
+  mode: 'live' | 'shadow'
+  /** Who was chosen in the settings; `decider` is who answered. */
+  chosen: 'haiku' | 'laya'
+  /** How the local model ran; null when Haiku was chosen. */
+  daemon: 'session' | 'shared' | null
+  decider: 'haiku' | 'laya' | 'rule'
+  /** Characters in the prompt. */
+  promptChars: number
+  /** The local model's probability for each tier, when it answered. */
+  tiers?: Record<string, number>
+  decision: Decision | null
+  /** Haiku's opinion in shadow mode, once it has answered (or failed to). */
+  second?: { decision: Decision | null; ms: number }
+  /** Why the local model, though chosen, did not decide. */
+  fallback?: string
+  /** What the decision took, from the mod's clock. */
+  ms: number
+  daemonMs?: number
+  action: 'switched' | 'would switch' | 'kept'
+  /** The tier in force before and after. */
+  was: string | null
+  tier: string | null
+  reason: string
+  /** The session's own model. */
+  model: string
+  contextTokens: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     pignon: {
