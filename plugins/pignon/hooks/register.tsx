@@ -815,7 +815,7 @@ export const register: Register = (on, options) => {
     const table = TIERS.map(
       t => `  ${t.id.padEnd(9)} ${`${t.model}/${t.effort}`.padEnd(14)} ${t.canExplore ? '' : '(no exploration) '}${t.criteria}`,
     ).join('\n')
-    const guard = `cache guard ${THRESHOLDS.cacheGuardTokens / 1000}k tokens, cooldown ${THRESHOLDS.minPromptsBetweenSwitches} prompts`
+    const guard = `cache guard ${THRESHOLDS.cacheGuardTokens / 1000}k tokens (${THRESHOLDS.upgradeGuardTokens / 1000}k for upgrades), cooldown ${THRESHOLDS.minPromptsBetweenSwitches} prompts`
 
     return {
       text: [

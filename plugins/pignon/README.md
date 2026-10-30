@@ -4,7 +4,7 @@ A Claude Code mod that shifts to the right model for each prompt, the way a bike
 
 - **A small decider judges each prompt.** On the first model request of a turn, Haiku (low effort) answers how hard the task is, whether it needs exploring the codebase, and how sure it is. Bare acknowledgements ("yes", "go ahead", "vas-y") keep the current tier without asking anyone. Or the judge is [a model on your Mac](#a-local-decider): then the prompt goes to Claude only.
 - **Your session runs on the tier's model and effort.** Every main-loop request of the turn is sent with that tier's model and effort, tool steps included. Subagents keep their own settings.
-- **Switching is cache-aware.** Upgrades need confidence ≥ 0.5; downgrades need ≥ 0.85 (≥ 0.7 for the local model, whose probabilities are lower and calibrated) and a 2-prompt cooldown. A model switch drops the prompt cache, so past 60k tokens of context only effort changes go through.
+- **Switching is cache-aware.** Upgrades need confidence ≥ 0.5; downgrades need ≥ 0.85 (≥ 0.7 for the local model, whose probabilities are lower and calibrated) and a 2-prompt cooldown. A change of model or of effort drops the prompt cache, so past 60k tokens of context a downgrade is refused, and past 100k an upgrade is too.
 
 | Tier | Model / effort | For |
 | --- | --- | --- |
