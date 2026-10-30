@@ -351,6 +351,36 @@ describe('the local decider: its daemon', () => {
     expect(calls.model).toBe(1)
   })
 
+  test('a session daemon that starts to hold a network socket is no longer asked', LOCAL, async ($, on) => {
+    const sockets = { held: '' }
+    let fetched = 0
+    const calls = engine(on, TRIVIAL, [], 'live')
+    mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+    on('process.run', (_, e) => {
+      const stdout = e.argv[0] === '/usr/sbin/lsof' ? sockets.held : ''
+      return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    on('process.spawn', async function* () {
+      yield { stream: 'stdout' as const, text: 'ready 4242\n' }
+      await forever
+      return { value: { code: 0, signal: null } }
+    })
+    on('http.fetch', () => {
+      fetched++
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ tiers: TIERS_TRIVIAL, latencyMs: 9 }) } }
+    })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await prompt($, 't1', 'rename foo')
+    await calls.clock.advance(6 * 60_000)
+    sockets.held = 'Python 4242 me 3u IPv4 0x1 0t0 TCP 10.0.0.2:51234->93.184.216.34:443 (ESTABLISHED)\n'
+    await prompt($, 't2', 'rename bar')
+
+    expect(fetched).toBe(1)
+    expect(calls.model).toBe(1)
+  })
+
   test('an acknowledgement keeps the tier and asks neither the daemon nor Haiku', LOCAL, async ($, on) => {
     const sent: TurnStepInput[] = []
     let fetched = 0
@@ -597,7 +627,7 @@ describe('/pignon setup', () => {
       'uv --version',
       'mkdir -p /cfg/pignon',
       'uv venv --clear --python 3.13 /cfg/pignon/venv',
-      `uv pip install --python /cfg/pignon/venv/bin/python --require-hashes --no-deps -r ${root}/daemon/requirements.lock`,
+      `uv pip install --python /cfg/pignon/venv/bin/python --require-hashes --no-deps --only-binary :all: -r ${root}/daemon/requirements.lock`,
       '/cfg/pignon/venv/bin/python -m pignon_decider.setup --dest /cfg/pignon/model',
     ])
     expect(runs[4]?.cwd).toBe(`${root}/daemon`)
@@ -609,10 +639,10 @@ describe('/pignon setup', () => {
   test('keeps an environment built from this lock, and only fetches the model', async ($, on) => {
     const { runs, text, writes } = await setup($, on, () => ({}), LOCK)
 
-    expect(runs.map(r => r.argv.join(' '))).toEqual([
+    expect(runs.map(r => (r.argv[1] === '-c' ? '<environment check>' : r.argv.join(' ')))).toEqual([
       'uv --version',
       'mkdir -p /cfg/pignon',
-      '/cfg/pignon/venv/bin/python --version',
+      '<environment check>',
       '/cfg/pignon/venv/bin/python -m pignon_decider.setup --dest /cfg/pignon/model',
     ])
     expect(writes).toEqual([])
@@ -626,9 +656,16 @@ describe('/pignon setup', () => {
   })
 
   test('rebuilds when the environment no longer runs', async ($, on) => {
-    const { runs } = await setup($, on, argv => (argv.at(-1) === '--version' && argv[0] !== 'uv' ? { exitCode: 127 } : {}), LOCK)
+    const { runs } = await setup($, on, argv => (argv[1] === '-c' ? { exitCode: 1 } : {}), LOCK)
 
     expect(runs.map(r => r.argv.slice(0, 2).join(' '))).toContain('uv venv')
+  })
+
+  test('checks that the packages are there, not only that the interpreter runs', async ($, on) => {
+    const { runs } = await setup($, on, () => ({}), LOCK)
+
+    const check = runs.find(r => r.argv[1] === '-c')?.argv[2] ?? ''
+    for (const name of ['laya_mlx', 'mlx', 'numpy', 'tokenizers']) expect(check).toContain(`"${name}"`)
   })
 
   test('a rebuild that fails leaves the environment marked as unbuilt', async ($, on) => {
@@ -1023,6 +1060,7 @@ function sharedDaemon(on: On, init: { isUp: boolean; launchedPid?: number; launc
     pid: 4242,
     launches: [] as { argv: readonly string[]; cwd?: string; timeoutMs?: number }[],
     audits: [] as string[],
+    sockets: init.sockets,
     decides: 0,
     fail: 0,
   }
@@ -1031,7 +1069,7 @@ function sharedDaemon(on: On, init: { isUp: boolean; launchedPid?: number; launc
     if (e.argv[0] === '/usr/sbin/lsof') {
       state.audits.push(e.argv[3] ?? '')
 
-      return { value: { exitCode: init.sockets ? 0 : 1, ...NO_OUTPUT, stdout: init.sockets ?? '' } }
+      return { value: { exitCode: state.sockets ? 0 : 1, ...NO_OUTPUT, stdout: state.sockets ?? '' } }
     }
     state.launches.push({ argv: e.argv, cwd: e.init?.cwd, timeoutMs: e.init?.timeoutMs })
     if ((init.launcherExit ?? 0) !== 0) return { value: { exitCode: init.launcherExit!, ...NO_OUTPUT, stdout: 'failed: RuntimeError\n' } }
@@ -1123,6 +1161,44 @@ describe('the local decider: a shared daemon', () => {
     await settle()
 
     expect(daemon.audits).toEqual(['4242'])
+  })
+
+  test('looks at the sockets again when the last look is old, and stops using a daemon that now holds one', SHARED, async ($, on) => {
+    const sent: TurnStepInput[] = []
+    const calls = engine(on, TRIVIAL, sent, 'live')
+    const daemon = sharedDaemon(on, { isUp: true })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await prompt($, 't1', 'rename foo')
+    await calls.clock.advance(60_000)
+    await prompt($, 't2', 'rename bar')
+    expect(daemon.audits).toEqual(['4242']) // a minute later: not looked at again
+
+    await calls.clock.advance(5 * 60_000)
+    daemon.sockets = 'Python 4242 me 3u IPv4 0x1 0t0 TCP 10.0.0.2:51234->93.184.216.34:443 (ESTABLISHED)\n'
+    await prompt($, 't3', 'rename baz')
+    await prompt($, 't4', 'rename qux')
+
+    expect(daemon.audits).toEqual(['4242', '4242'])
+    expect(daemon.decides).toBe(2) // t1 and t2 only
+    expect(calls.model).toBe(2) // Haiku decided t3 and t4
+  })
+
+  test('a daemon that is still clean after a while keeps serving', SHARED, async ($, on) => {
+    const calls = engine(on, TRIVIAL, [], 'live')
+    const daemon = sharedDaemon(on, { isUp: true })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await calls.clock.advance(6 * 60_000)
+    await prompt($, 't1', 'rename foo')
+    await calls.clock.advance(6 * 60_000)
+    await prompt($, 't2', 'rename bar')
+
+    expect(daemon.audits).toEqual(['4242', '4242', '4242'])
+    expect(daemon.decides).toBe(2)
+    expect(calls.model).toBe(0)
   })
 
   test('a daemon holding a network socket is not used, and Haiku decides', SHARED, async ($, on) => {

@@ -135,6 +135,25 @@ class LifecycleTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.socket_path))
         self.assertFalse(os.path.exists(self.directory))
 
+    def test_exits_when_its_parent_dies_while_the_model_loads(self):
+        loading = f"{self.directory}/loading"
+        launcher = subprocess.Popen(
+            [sys.executable, "-c", LAUNCHER, launch_code("SlowLoadScorer"), self.socket_path],
+            cwd=DAEMON_DIR,
+            stdout=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "PIGNON_TEST_LOADING": loading},
+        )
+        self.addCleanup(reap, launcher)
+        daemon_pid = int(launcher.stdout.readline())
+        self.addCleanup(lambda: is_alive(daemon_pid) and os.kill(daemon_pid, signal.SIGKILL))
+
+        self.assertTrue(wait_for(lambda: os.path.exists(loading)), "the model never started loading")
+        launcher.kill()  # the model is loading and the socket does not exist yet
+        launcher.wait()
+
+        self.assertTrue(wait_for(lambda: not is_alive(daemon_pid), seconds=8), "the daemon outlived its parent")
+
 
 class SharedDaemonTest(unittest.TestCase):
     """`--shared`: a daemon that detaches, serves every caller, and leaves when idle."""

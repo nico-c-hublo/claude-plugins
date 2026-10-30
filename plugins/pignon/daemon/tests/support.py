@@ -35,6 +35,16 @@ class ExplodingScorer(FakeScorer):
         raise RuntimeError(f"cannot tokenize {text!r}")
 
 
+class SlowLoadScorer(FakeScorer):
+    """A model that takes a while to load, as the real one does; says when it starts."""
+
+    def __init__(self):
+        super().__init__()
+        with open(os.environ["PIGNON_TEST_LOADING"], "w"):
+            pass
+        time.sleep(1.5)
+
+
 class FailingScorer:
     """A model that cannot be loaded."""
 
