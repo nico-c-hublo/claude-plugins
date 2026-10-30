@@ -12,7 +12,17 @@ export type Decision = {
 
 /** One routed prompt, as `/pignon log` lists it. */
 export type LogEntry = {
+  /** When it was decided, in milliseconds since the epoch. */
+  at: number
   prompt: string
+  /** The start of the prompt as a decider read it; empty when a rule decided. */
+  sent: string
+  /** The local model's probability for each tier, when it answered. */
+  tiers?: Record<string, number>
+  /** How long the daemon says its own work took. */
+  daemonMs?: number
+  /** Why the local model, though chosen, did not decide and Haiku did. */
+  fallback?: string
   /** Who decided: Haiku, the model on this Mac, or a rule (an acknowledgement). */
   decider: 'haiku' | 'laya' | 'rule'
   decision: Decision | null

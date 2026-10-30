@@ -13,7 +13,11 @@ const promptsSinceSwitch = atom({ plugin: 'pignon', key: 'promptsSinceSwitch' } 
 const contextTokens = atom({ plugin: 'pignon', key: 'contextTokens' } as const, 0)
 const base = atom({ plugin: 'pignon', key: 'base' } as const, null as string | null)
 const isPinned = atom({ plugin: 'pignon', key: 'isPinned' } as const, false)
-const log = atom({ plugin: 'pignon', key: 'log' } as const, [] as LogEntry[], { shape: 'log-2' })
+const log = atom({ plugin: 'pignon', key: 'log' } as const, [] as LogEntry[], { shape: 'log-3' })
+
+const PANE = 'decisions'
+// What the local model reads of a prompt; the pane shows as much.
+const SENT_CHARS = 400
 
 const DECIDER_MODEL = 'haiku'
 const DECIDER_TIMEOUT_MS = 5_000
@@ -40,9 +44,18 @@ async function ask($: EngineInterface, text: string, tier: string | null): Promi
   return reply.isAnswered ? parseDecision(reply.text) : null
 }
 
+// What the local model's daemon answered, or why there is no answer.
+type LocalAnswer = { decision: Decision; tiers: Record<string, number>; daemonMs: number | undefined }
+type LocalFailure = { cause: string }
+
 // The local model's daemon, over its Unix socket: a path no proxy and no other
 // user can reach, so the prompt goes nowhere else.
-async function askLocal($: EngineInterface, socketPath: string, text: string, contextSize: number): Promise<Decision | null> {
+async function askLocal(
+  $: EngineInterface,
+  socketPath: string,
+  text: string,
+  contextSize: number,
+): Promise<LocalAnswer | LocalFailure> {
   const prompt = text.slice(0, PROMPT_CHARS)
   const answer = $.http.fetch('http://pignon/decide', {
     method: 'POST',
@@ -51,10 +64,20 @@ async function askLocal($: EngineInterface, socketPath: string, text: string, co
     socketPath,
   })
   // `fetch` has no timeout of its own, and the turn waits on this.
-  const reply = await Promise.race([answer, $.clock.sleep(LOCAL_TIMEOUT_MS).then(() => null)])
-  if (!reply?.ok) return null
+  const reply = await Promise.race([answer, $.clock.sleep(LOCAL_TIMEOUT_MS).then(() => null)]).catch(() => undefined)
+  if (reply === undefined) return { cause: 'the connection failed' }
+  if (reply === null) return { cause: `it timed out after ${LOCAL_TIMEOUT_MS / 1000} s` }
+  if (!reply.ok) return { cause: `it answered HTTP ${reply.status}` }
 
-  return decisionFromTiers((JSON.parse(reply.text) as { tiers: Record<string, number> }).tiers)
+  try {
+    const body = JSON.parse(reply.text) as { tiers: Record<string, number>; latencyMs?: number }
+    const decision = decisionFromTiers(body.tiers)
+    if (decision) return { decision, tiers: body.tiers, daemonMs: body.latencyMs }
+  } catch {
+    // falls through: an answer that is not JSON is as unusable as an empty one
+  }
+
+  return { cause: 'it answered nothing usable' }
 }
 
 function randomHex(bytes: number): string {
@@ -138,6 +161,71 @@ async function holdsNoNetworkSocket($: EngineInterface, pid: string): Promise<bo
   return sockets !== null && sockets.exitCode <= 1 && sockets.stdout.trim() === ''
 }
 
+// The text lines of an entry, as the pane draws them: what it measures with too.
+function entryLines(entry: LogEntry): string[] {
+  return [
+    `${clockTime(entry.at)} ${entry.decider.padEnd(5)} ${entry.sent || entry.prompt}`,
+    ...(entry.fallback ? [`laya unavailable: ${entry.fallback}`] : []),
+    entry.tiers ? TIERS.map(tier => tierBar(entry, tier.id)).join('  ') : verdictLine(entry),
+    outcomeLine(entry),
+    entry.reason,
+  ]
+}
+
+function tierBar(entry: LogEntry, id: string): string {
+  const probability = entry.tiers?.[id] ?? 0
+
+  return `${id} ${bar(probability)} ${probability.toFixed(2)}`
+}
+
+// Rows an entry takes at `columns` wide: each line wraps, and a gap follows.
+function entryRows(entry: LogEntry, columns: number): number {
+  return entryLines(entry).reduce((rows, line) => rows + Math.max(1, Math.ceil(line.length / columns)), 1)
+}
+
+// The newest entries that fit `rows`, leaving one row for the note on the rest.
+function newestThatFit(entries: readonly LogEntry[], rows: number, columns: number): readonly LogEntry[] {
+  const total = entries.reduce((sum, entry) => sum + entryRows(entry, columns), 0)
+  if (total <= rows) return entries
+
+  const fit: LogEntry[] = []
+  let used = 1
+  for (const entry of [...entries].reverse()) {
+    used += entryRows(entry, columns)
+    if (used > rows && fit.length > 0) break
+    fit.unshift(entry)
+  }
+
+  return fit
+}
+
+function clockTime(ms: number): string {
+  const at = new Date(ms)
+
+  return [at.getHours(), at.getMinutes(), at.getSeconds()].map(n => String(n).padStart(2, '0')).join(':')
+}
+
+function bar(probability: number): string {
+  const filled = Math.round(Math.min(1, Math.max(0, probability)) * 8)
+
+  return '█'.repeat(filled) + '░'.repeat(8 - filled)
+}
+
+// What a decider with no probabilities said: Haiku's guess, or the rule's keep.
+function verdictLine(entry: LogEntry): string {
+  if (entry.decider === 'rule') return 'an acknowledgement: the tier is kept'
+  const d = entry.decision
+
+  return d ? `decided ${d.tier}${d.explore ? '/explore' : ''} p=${d.confidence.toFixed(2)}` : 'no decision'
+}
+
+function outcomeLine(entry: LogEntry): string {
+  const daemon = entry.daemonMs === undefined ? '' : ` (daemon ${entry.daemonMs} ms)`
+  const outcome = entry.action === 'kept' ? 'kept' : `${entry.action} to`
+
+  return `${entry.ms} ms${daemon} · ${outcome} ${describe(entry.tier)}`
+}
+
 function describe(id: string | null): string {
   const tier = tierOf(id)
   return tier ? `${tier.id} · ${tier.model}/${tier.effort}` : 'session model'
@@ -149,6 +237,7 @@ async function route(
   model: string,
   effort: Effort | undefined,
   mode: Mode,
+  wantsLocal: boolean,
   socketPath: string | null,
 ) {
   const was = await read($, current)
@@ -158,7 +247,18 @@ async function route(
   // An acknowledgement needs no judge: it keeps the tier, whoever would have been asked.
   const isAcknowledgement = isFollowUp(text)
   let decision: Decision | null = isAcknowledgement ? { tier: 'same', explore: false, confidence: 1 } : null
-  if (!decision && socketPath) decision = await askLocal($, socketPath, text, contextSize).catch(() => null)
+  let local: LocalAnswer | null = null
+  let fallback: string | undefined
+  if (!decision && wantsLocal) {
+    if (socketPath === null) {
+      fallback = 'it is not running'
+    } else {
+      const asked = await askLocal($, socketPath, text, contextSize)
+      if ('cause' in asked) fallback = asked.cause
+      else local = asked
+      decision = local?.decision ?? null
+    }
+  }
   if (!decision) {
     // No daemon, or it failed: Haiku, so a prompt is never left undecided.
     decider = 'haiku'
@@ -187,7 +287,12 @@ async function route(
   const now = isLive && target !== null ? target : was
   const source = isAcknowledgement ? 'rule' : decider
   const entry: LogEntry = {
+    at: startedAt,
     prompt: text.slice(0, 80).replace(/\s+/g, ' '),
+    sent: isAcknowledgement ? '' : text.slice(0, SENT_CHARS),
+    tiers: local?.tiers,
+    daemonMs: local?.daemonMs,
+    fallback,
     decider: source,
     decision,
     ms,
@@ -216,8 +321,8 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'pignon',
-      description: 'Model router: status, live, shadow, off, unpin, log, setup',
-      argumentHint: '[live|shadow|off|unpin|log|setup]',
+      description: 'Model router: status, live, shadow, off, unpin, log, watch, setup',
+      argumentHint: '[live|shadow|off|unpin|log|watch|setup]',
       immediate: true,
     })
     if (decider === 'laya') void launchDaemon(
@@ -256,7 +361,7 @@ export const register: Register = (on, options) => {
     if (await read($, isPinned)) return yield* next(e)
 
     if (e.index === 0 && text !== undefined) {
-      await route($, text, e.model, e.effort as Effort | undefined, mode, socketPath)
+      await route($, text, e.model, e.effort as Effort | undefined, mode, decider === 'laya', socketPath)
     }
 
     const tier = mode === 'live' ? tierOf(await read($, current)) : undefined
@@ -269,6 +374,37 @@ export const register: Register = (on, options) => {
     return result
   })
 
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const all = await read($, log)
+    const list = newestThatFit(all, e.props.scroll.bodyRows, e.props.bodyColumns)
+
+    return (
+      <Box flexDirection="column">
+        {all.length === 0 && <Text dimColor>No decisions yet.</Text>}
+        {list.length < all.length && (
+          <Text dimColor>{`${all.length - list.length} earlier decision${all.length - list.length === 1 ? '' : 's'} not shown`}</Text>
+        )}
+        {list.map(entry => (
+          <Box flexDirection="column" marginBottom={1}>
+            <Text>{`${clockTime(entry.at)} ${entry.decider.padEnd(5)} ${entry.sent || entry.prompt}`}</Text>
+            {entry.fallback && <Text dimColor>{`laya unavailable: ${entry.fallback}`}</Text>}
+            {entry.tiers && (
+              <Box gap={2}>
+                {TIERS.map(tier => (
+                  <Text>{tierBar(entry, tier.id)}</Text>
+                ))}
+              </Box>
+            )}
+            {!entry.tiers && <Text>{verdictLine(entry)}</Text>}
+            <Text>{outcomeLine(entry)}</Text>
+            <Text dimColor>{entry.reason}</Text>
+          </Box>
+        ))}
+      </Box>
+    )
+  })
+
   on('command.run', { command: 'pignon' }, async ($, e) => {
     const arg = e.args.trim()
 
@@ -278,6 +414,16 @@ export const register: Register = (on, options) => {
       $.ui.status(arg === 'off' ? undefined : `pignon ${arg}`)
 
       return { text: `pignon is ${arg}.` }
+    }
+
+    if (arg === 'watch') {
+      const opened = await $.ui.open({ id: PANE, title: 'pignon' })
+
+      return {
+        text: opened.isPlaced
+          ? 'pignon decisions pane opened.'
+          : `pignon decisions pane is open but not drawn: ${opened.reason}. Widen the window or run /pignon watch again.`,
+      }
     }
 
     if (arg === 'setup') {
@@ -330,7 +476,7 @@ export const register: Register = (on, options) => {
         }`,
         `context ${Math.round((await read($, contextTokens)) / 1000)}k · ${guard}`,
         table,
-        'Commands: /pignon live | shadow | off | unpin | log | setup',
+        'Commands: /pignon live | shadow | off | unpin | log | watch | setup',
       ].join('\n'),
     }
   })

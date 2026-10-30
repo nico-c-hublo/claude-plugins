@@ -602,3 +602,226 @@ describe('/pignon setup', () => {
     expect(text).not.toContain('ready')
   })
 })
+
+const COMMAND = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } } as const
+
+describe('/pignon watch', () => {
+  test('opens the decisions pane', async ($, on) => {
+    const opened: { id: string; title?: string }[] = []
+    engine(on, TRIVIAL, [], 'shadow')
+    on('ui.open', (_, e) => {
+      opened.push(e)
+      return { value: { isPlaced: true } }
+    })
+
+    const { text = '' } = await $.command.run({ command: 'pignon', args: 'watch', ...COMMAND })
+
+    expect(opened).toEqual([expect.objectContaining({ id: 'decisions', title: 'pignon' })])
+    expect(text).toContain('pane')
+  })
+
+  test('says why when the surface cannot draw it', async ($, on) => {
+    engine(on, TRIVIAL, [], 'shadow')
+    on('ui.open', () => ({ value: { isPlaced: false, reason: 'the terminal is too narrow' } }))
+
+    const { text = '' } = await $.command.run({ command: 'pignon', args: 'watch', ...COMMAND })
+
+    expect(text).toBe('pignon decisions pane is open but not drawn: the terminal is too narrow. Widen the window or run /pignon watch again.')
+  })
+})
+
+// A daemon that comes up ready and answers every request with `reply()`.
+function withDaemon(on: On, reply: () => { status: number; ok: boolean; headers: Record<string, string>; text: string }) {
+  mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+  on('process.run', () => ({ value: OK }))
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout' as const, text: 'ready 4242\n' }
+    await forever
+    return { value: { code: 0, signal: null } }
+  })
+  on('http.fetch', () => ({ value: reply() }))
+}
+
+const SURFACES = ['terminal', 'desktop'] as const
+const DECISIONS_PANE = {
+  plugin: 'pignon',
+  component: 'Pane',
+  requestId: 'decisions',
+  props: {
+    title: 'pignon',
+    isFocused: false,
+    bodyColumns: 80,
+    placement: 'dock',
+    scroll: { offset: 0, bodyRows: 20 },
+    view: {},
+  },
+} as const
+
+describe('the decisions pane', () => {
+  test('says so before any decision, on every surface', async ($, on) => {
+    engine(on, TRIVIAL, [], 'shadow')
+
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...DECISIONS_PANE, surface })
+
+      expect((await ui.find({ type: 'Text' }))?.text).toBe('No decisions yet.')
+      await ui.unmount()
+    }
+  })
+
+  test('shows what was sent to the local model and what it answered, on every surface', LOCAL, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    withDaemon(on, () => ({
+      status: 200,
+      ok: true,
+      headers: {},
+      text: JSON.stringify({
+        tiers: { trivial: 0.9, standard: 0.07, hard: 0.03 },
+        tier: 'trivial',
+        model: 'laya-conductor',
+        latencyMs: 9,
+      }),
+    }))
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await $.turn.start({ turnId: 't1', text: 'rename foo to bar in utils.ts' })
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
+
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...DECISIONS_PANE, surface })
+
+      expect((await ui.find({ type: 'Text', text: /rename foo/ }))?.text).toMatch(/^\d{2}:\d{2}:\d{2} laya +rename foo to bar in utils\.ts$/)
+      expect((await ui.find({ type: 'Text', text: /^trivial/ }))?.text).toMatch(/^trivial [█░]+ 0\.90$/)
+      expect((await ui.find({ type: 'Text', text: /^standard/ }))?.text).toMatch(/^standard [█░]+ 0\.07$/)
+      expect((await ui.find({ type: 'Text', text: /^hard/ }))?.text).toMatch(/^hard [█░]+ 0\.03$/)
+      expect((await ui.find({ type: 'Text', text: /daemon/ }))?.text).toBe('0 ms (daemon 9 ms) · switched to trivial · haiku/low')
+      await ui.unmount()
+    }
+  })
+
+  test('says why the local model did not decide when Haiku did', LOCAL, async ($, on) => {
+    engine(on, TRIVIAL, [], 'shadow')
+    const failures = [
+      () => ({ status: 500, ok: false, headers: {}, text: '{"error":"scoring failed"}' }),
+      () => {
+        throw new Error('connection reset')
+      },
+      () => ({ status: 200, ok: true, headers: {}, text: '{"tiers":{}}' }),
+    ]
+    let attempt = 0
+    withDaemon(on, () => failures[attempt++]!())
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    for (const [i, text] of ['first prompt', 'second prompt', 'third prompt'].entries()) {
+      await $.turn.start({ turnId: `t${i}`, text })
+      for await (const _ of $.turn.step({ turnId: `t${i}`, index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
+    }
+
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...DECISIONS_PANE, surface })
+
+      expect((await ui.find({ type: 'Text', text: /HTTP 500/ }))?.text).toBe('laya unavailable: it answered HTTP 500')
+      expect((await ui.find({ type: 'Text', text: /connection/ }))?.text).toBe('laya unavailable: the connection failed')
+      expect((await ui.find({ type: 'Text', text: /usable/ }))?.text).toBe('laya unavailable: it answered nothing usable')
+      await ui.unmount()
+    }
+  })
+
+  test('says when the local model is not running at all', LOCAL, async ($, on) => {
+    engine(on, TRIVIAL, [], 'shadow')
+    mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+    on('process.run', () => ({ value: OK }))
+    on('process.spawn', async function* () {
+      return { value: { code: 127, signal: null } } // it never starts
+    })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await $.turn.start({ turnId: 't1', text: 'rename foo' })
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
+
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, surface: 'terminal' })
+
+    expect((await ui.find({ type: 'Text', text: /unavailable/ }))?.text).toBe('laya unavailable: it is not running')
+    await ui.unmount()
+  })
+
+  test('draws a decision the moment it is made, in a pane already open', LOCAL, async ($, on) => {
+    engine(on, TRIVIAL, [], 'shadow')
+    withDaemon(on, () => ({
+      status: 200,
+      ok: true,
+      headers: {},
+      text: JSON.stringify({ tiers: { trivial: 0.2, standard: 0.7, hard: 0.1 }, latencyMs: 8 }),
+    }))
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, surface: 'terminal' })
+    expect((await ui.find({ type: 'Text' }))?.text).toBe('No decisions yet.')
+
+    await $.turn.start({ turnId: 't1', text: 'add a pagination parameter' })
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
+
+    expect((await ui.find({ type: 'Text', text: /pagination/ }))?.text).toMatch(/laya +add a pagination parameter$/)
+    expect((await ui.find({ type: 'Text', text: /No decisions yet/ }))).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('shows what Haiku decided, and when a rule kept the tier', async ($, on) => {
+    engine(on, '{"tier":"hard","explore":true,"confidence":0.8}', [], 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    for (const [i, text] of ['investigate the flaky deploy', 'yes, go ahead'].entries()) {
+      await $.turn.start({ turnId: `t${i}`, text })
+      for await (const _ of $.turn.step({ turnId: `t${i}`, index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
+    }
+
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, surface: 'terminal' })
+
+    expect((await ui.find({ type: 'Text', text: /investigate/ }))?.text).toMatch(/haiku +investigate the flaky deploy$/)
+    expect((await ui.find({ type: 'Text', text: /decided/ }))?.text).toBe('decided hard/explore p=0.80')
+    expect((await ui.find({ type: 'Text', text: /rule +yes, go ahead$/ }))?.text).toMatch(/rule +yes, go ahead$/)
+    expect((await ui.find({ type: 'Text', text: /acknowledgement/ }))?.text).toBe('an acknowledgement: the tier is kept')
+    await ui.unmount()
+  })
+
+  test('shows the newest decisions that fit the pane, and counts the rest', async ($, on) => {
+    engine(on, TRIVIAL, [], 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    for (const [i, text] of ['one one', 'two two', 'three three', 'four four'].entries()) {
+      await $.turn.start({ turnId: `t${i}`, text })
+      for await (const _ of $.turn.step({ turnId: `t${i}`, index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
+    }
+
+    // Each Haiku-decided entry takes 5 rows; 11 rows hold a note and two of them.
+    const props = { ...DECISIONS_PANE.props, scroll: { offset: 0, bodyRows: 11 } }
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, props, surface: 'terminal' })
+
+    expect((await ui.find({ type: 'Text', text: /earlier/ }))?.text).toBe('2 earlier decisions not shown')
+    expect(await ui.find({ type: 'Text', text: /one one/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /two two/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /three three/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /four four/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('counts the rows a long prompt wraps over when it picks what fits', async ($, on) => {
+    engine(on, TRIVIAL, [], 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    for (const [i, text] of [`alpha ${'a'.repeat(194)}`, `omega ${'b'.repeat(194)}`].entries()) {
+      await $.turn.start({ turnId: `t${i}`, text })
+      for await (const _ of $.turn.step({ turnId: `t${i}`, index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
+    }
+
+    // At 40 columns the prompt alone takes 6 rows, so an entry is over 10 and 11 rows hold one.
+    const props = { ...DECISIONS_PANE.props, bodyColumns: 40, scroll: { offset: 0, bodyRows: 11 } }
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, props, surface: 'terminal' })
+
+    expect((await ui.find({ type: 'Text', text: /earlier/ }))?.text).toBe('1 earlier decision not shown')
+    expect(await ui.find({ type: 'Text', text: /alpha/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /omega/ })).toBeDefined()
+    await ui.unmount()
+  })
+})

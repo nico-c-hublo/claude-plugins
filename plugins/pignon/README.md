@@ -24,6 +24,7 @@ The table and thresholds live in [`hooks/policy.ts`](hooks/policy.ts).
 | `/pignon off` | Stop routing |
 | `/pignon unpin` | Route again after you picked a model with `/model` or `/effort` |
 | `/pignon log` | The last decisions: who decided (`haiku`, `laya` or `rule`), confidence, latency and reason |
+| `/pignon watch` | Open a pane that shows each decision as it is made (see below) |
 | `/pignon setup` | Build the local decider (see below) |
 
 Each routed prompt leaves a dim line in the transcript, e.g. `pignon trivial p=0.95 · 412 ms  👁 would switch to trivial · haiku/low (downgrade opus -> trivial)`, and the status line shows the tier in force. The mode is kept across sessions.
@@ -39,6 +40,12 @@ At the prompt of a terminal session:
 ```
 
 Then watch a few decisions in shadow mode and run `/pignon live` when they look right.
+
+## Watching the decisions
+
+`/pignon watch` opens a pane beside the chat that draws each decision the moment it is made: the time, who decided (`laya`, `haiku` or `rule`), the start of the prompt as the decider read it (the local model reads the first 400 characters), the local model's probability for each tier, how long it took (the mod's clock and the daemon's own), what was done about it, and why. When the local model was chosen but Haiku decided, the pane says why: not running, timed out, an HTTP error, a dropped connection, or an unusable answer.
+
+The pane keeps the last 50 decisions in the session's memory (nothing is written to disk) and shows the newest ones that fit, noting how many older ones are hidden. It shows prompt text on your screen, no more than the transcript does, so mind it when sharing your screen. A pane opened by a command is placed at any width; if the surface cannot draw it, the command says why.
 
 ## A local decider
 
@@ -73,4 +80,4 @@ What this does not do: no operating-system rule blocks the daemon's network acce
 
 ## Tests
 
-`claude plugin test plugins/pignon` runs the mod's tests against a mocked engine. The daemon's own tests are standard-library `unittest` (`cd daemon && python3 -m unittest discover -s tests -t .`); the opt-in smoke test against the real model is described at the top of `daemon/tests/test_smoke_mlx.py`. The mod has not yet been run in a live session.
+`claude plugin test plugins/pignon` runs the mod's tests against a mocked engine. The daemon's own tests are standard-library `unittest` (`cd daemon && python3 -m unittest discover -s tests -t .`); the opt-in smoke test against the real model is described at the top of `daemon/tests/test_smoke_mlx.py`. The mod has been started in a live session (setup and the daemon launch worked), but its routing decisions on real prompts have not been reviewed yet.
