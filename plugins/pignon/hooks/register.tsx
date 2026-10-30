@@ -294,7 +294,7 @@ async function runSetup($: EngineInterface): Promise<string> {
   const daemon = `${$.plugin.root}/daemon`
   const steps = [
     ['mkdir', '-p', home],
-    ['uv', 'venv', '--python', '3.13', `${home}/venv`],
+    ['uv', 'venv', '--clear', '--python', '3.13', `${home}/venv`],
     ['uv', 'pip', 'install', '--python', `${home}/venv/bin/python`, '--require-hashes', '--no-deps', '-r', `${daemon}/requirements.lock`],
     [`${home}/venv/bin/python`, '-m', 'pignon_decider.setup', '--dest', `${home}/model`],
   ]
