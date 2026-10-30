@@ -51,6 +51,24 @@ describe('policy', () => {
     expect(out.reason).toContain('cache protected')
   })
 
+  test('an effort change alone is a cache miss too, so the guard holds it', async () => {
+    const hard = { tier: 'hard', explore: true, confidence: 0.95 }
+    const settings = { ...base, sessionEffort: 'xhigh' as const, decision: hard }
+
+    expect(decide({ ...settings, contextTokens: 120_000 }).reason).toContain('cache protected')
+    expect(decide({ ...settings, contextTokens: 10_000 }).target).toBe('hard')
+  })
+
+  test('an upgrade is guarded past 100k tokens, not before', async () => {
+    const hard = { tier: 'hard', explore: true, confidence: 0.95 }
+    const sonnet = { ...base, current: 'standard', decision: hard }
+
+    expect(decide({ ...sonnet, contextTokens: 90_000 }).target).toBe('hard')
+    const out = decide({ ...sonnet, contextTokens: 110_000 })
+    expect(out.target).toBe(null)
+    expect(out.reason).toContain('cache protected')
+  })
+
   test('the cooldown holds a downgrade right after a switch', async () => {
     const out = decide({
       ...base,

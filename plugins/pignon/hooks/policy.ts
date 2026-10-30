@@ -56,8 +56,13 @@ export const CONFIDENCE: Record<DeciderId, { minUpgrade: number; minDowngrade: n
 
 export const THRESHOLDS = {
   minPromptsBetweenSwitches: 2,
-  /** Past this much context, a model switch (a full cache miss) is refused. */
+  /**
+   * Past this much context, a downgrade is refused: a change of model or of
+   * effort invalidates the cached messages, a full miss on all of the context.
+   */
   cacheGuardTokens: 60_000,
+  /** The same for an upgrade, which quality justifies more readily. */
+  upgradeGuardTokens: 100_000,
 }
 
 export type PolicyInput = {
@@ -78,9 +83,9 @@ export type PolicyOutput = { target: string | null; reason: string }
 /**
  * Whether to move the main loop to another tier.
  *
- * Upgrades are quality-driven: only confidence gates them. Every other move
- * must also clear the cooldown and, when the model itself changes, the cache
- * guard. Effort alone changes without a cache miss, so the guard skips it.
+ * Upgrades are quality-driven: confidence gates them, and a higher cache
+ * guard. Every other move must also clear the cooldown and the cache guard.
+ * A change of model or of effort alone both miss the cache, so both are guarded.
  * Fail-open: a missing or unusable signal keeps what runs.
  */
 export function decide(input: PolicyInput): PolicyOutput {
@@ -105,9 +110,12 @@ export function decide(input: PolicyInput): PolicyOutput {
   const label = `${running?.id ?? short(input.sessionModel)} -> ${target.id}`
 
   if (currentRank >= 0 && rank > currentRank) {
-    return decision.confidence < bar.minUpgrade
-      ? { target: null, reason: `confidence ${decision.confidence.toFixed(2)} < upgrade threshold` }
-      : { target: target.id, reason: `upgrade ${label}` }
+    if (decision.confidence < bar.minUpgrade) {
+      return { target: null, reason: `confidence ${decision.confidence.toFixed(2)} < upgrade threshold` }
+    }
+    if (input.contextTokens > THRESHOLDS.upgradeGuardTokens) return cacheProtected(input.contextTokens)
+
+    return { target: target.id, reason: `upgrade ${label}` }
   }
 
   if (decision.confidence < bar.minDowngrade) {
@@ -118,10 +126,13 @@ export function decide(input: PolicyInput): PolicyOutput {
   if (current !== null && input.promptsSinceSwitch < THRESHOLDS.minPromptsBetweenSwitches) {
     return { target: null, reason: `cooldown: ${input.promptsSinceSwitch} prompt(s) since last switch` }
   }
-  if (!isSameModel && input.contextTokens > THRESHOLDS.cacheGuardTokens) {
-    return { target: null, reason: `context ${Math.round(input.contextTokens / 1000)}k: cache protected` }
-  }
+  if (input.contextTokens > THRESHOLDS.cacheGuardTokens) return cacheProtected(input.contextTokens)
+
   return { target: target.id, reason: `${isSameModel ? 'effort' : 'downgrade'} ${label}` }
+}
+
+function cacheProtected(contextTokens: number): PolicyOutput {
+  return { target: null, reason: `context ${Math.round(contextTokens / 1000)}k: cache protected` }
 }
 
 /**
