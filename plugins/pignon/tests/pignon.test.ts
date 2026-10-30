@@ -382,11 +382,16 @@ describe('the local decider: its daemon', () => {
     await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
     await settle()
     await prompt($, 't1', 'rename foo')
-    await calls.clock.advance(6 * 60_000)
+    await calls.clock.advance(5 * 60_000 - 1)
     sockets.held = 'Python 4242 me 3u IPv4 0x1 0t0 TCP 10.0.0.2:51234->93.184.216.34:443 (ESTABLISHED)\n'
     await prompt($, 't2', 'rename bar')
+    expect(fetched).toBe(2)
+    expect(toasts).toEqual([])
 
-    expect(fetched).toBe(1)
+    await calls.clock.advance(1)
+    await prompt($, 't3', 'rename baz')
+
+    expect(fetched).toBe(2)
     expect(calls.model).toBe(1)
     expect(toasts).toEqual([expect.stringContaining('holds a network socket')])
   })

@@ -160,7 +160,9 @@ type LocalDaemon = {
 async function auditAgain($: EngineInterface, daemon: LocalDaemon): Promise<void> {
   if (daemon.socketPath === null || daemon.auditedPid === null) return
   const now = await $.clock.now()
-  if (now - daemon.auditedAt < AUDIT_EVERY_MS) return
+  // A clock set back would otherwise skip the audit until it caught up.
+  const age = now - daemon.auditedAt
+  if (age >= 0 && age < AUDIT_EVERY_MS) return
 
   const problem = await socketProblem($, String(daemon.auditedPid))
   if (problem === null) {

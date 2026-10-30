@@ -36,6 +36,9 @@ def _go_offline():
 
 def main(argv=None, load_scorer=None):
     """Runs until stopped. `load_scorer(model_dir)` is injectable for tests."""
+    # Read first: a parent that dies during the seconds the model takes to load
+    # must not leave us waiting on launchd, whose pid we would then take for the parent's.
+    parent = os.getppid()
     parser = argparse.ArgumentParser(prog="pignon_decider")
     parser.add_argument("--socket", required=True, help="path of the Unix socket to serve on")
     parser.add_argument("--model", required=True, help="directory of the converted checkpoint")
@@ -49,9 +52,6 @@ def main(argv=None, load_scorer=None):
     if args.idle_seconds < 1:
         parser.error("--idle-seconds must be positive")
 
-    # Read before the model loads: a parent that dies during the seconds that takes
-    # must not leave us waiting on launchd, whose pid we would then take for the parent's.
-    parent = os.getppid()
     _go_offline()
     if args.shared:
         return _run_shared(args, load_scorer)
