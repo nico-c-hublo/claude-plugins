@@ -964,3 +964,200 @@ describe('the second opinion (shadow mode, local model chosen)', () => {
     expect(text).toContain('shadow')
   })
 })
+
+// The shared daemon: one process for every session, started detached through
+// `process.run` (a spawned child would end with the session), found by its socket.
+const SHARED = { options: { decider: 'laya', daemon: 'shared' } }
+const NO_OUTPUT = { stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+const TIERS_TRIVIAL = { trivial: 0.9, standard: 0.07, hard: 0.03 }
+
+// A shared daemon as the engine sees it: `isUp` says whether anything listens on its
+// socket, the launcher brings it up as `launchedPid`, and `listening` records each call.
+function sharedDaemon(on: On, init: { isUp: boolean; launchedPid?: number; launcherExit?: number; sockets?: string }) {
+  const state = {
+    isUp: init.isUp,
+    pid: 4242,
+    launches: [] as { argv: readonly string[]; cwd?: string; timeoutMs?: number }[],
+    audits: [] as string[],
+    decides: 0,
+    fail: 0,
+  }
+  mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+  on('process.run', (_, e) => {
+    if (e.argv[0] === '/usr/sbin/lsof') {
+      state.audits.push(e.argv[3] ?? '')
+
+      return { value: { exitCode: init.sockets ? 0 : 1, ...NO_OUTPUT, stdout: init.sockets ?? '' } }
+    }
+    state.launches.push({ argv: e.argv, cwd: e.init?.cwd, timeoutMs: e.init?.timeoutMs })
+    if ((init.launcherExit ?? 0) !== 0) return { value: { exitCode: init.launcherExit!, ...NO_OUTPUT, stdout: 'failed: RuntimeError\n' } }
+    state.isUp = true
+    state.pid = init.launchedPid ?? 5151
+
+    return { value: { exitCode: 0, ...NO_OUTPUT, stdout: `ready ${state.pid}\n` } }
+  })
+  on('http.fetch', (_, e) => {
+    if (!state.isUp) throw new Error('connection refused')
+    if (e.url.endsWith('/health')) {
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ status: 'ok', ready: true, pid: state.pid }) } }
+    }
+    if (state.fail > 0) {
+      state.fail--
+      state.isUp = false
+      throw new Error('connection reset')
+    }
+    state.decides++
+
+    return {
+      value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ tiers: TIERS_TRIVIAL, tier: 'trivial', model: 'x', latencyMs: 9 }) },
+    }
+  })
+
+  return state
+}
+
+async function prompt($: Engine, id: string, text: string) {
+  await $.turn.start({ turnId: id, text })
+  for await (const _ of $.turn.step({ turnId: id, index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
+}
+
+describe('the local decider: a shared daemon', () => {
+  test('is started detached through run when nothing answers, and never spawned as a child', SHARED, async ($, on) => {
+    const sent: TurnStepInput[] = []
+    const spawned: ProcessSpawnRequest[] = []
+    const calls = engine(on, TRIVIAL, sent, 'live')
+    const daemon = sharedDaemon(on, { isUp: false })
+    on('process.spawn', async function* (_, e) {
+      spawned.push(e)
+      return { value: { code: 0, signal: null } }
+    })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await prompt($, 't1', 'rename foo to bar in utils.ts')
+
+    const socket = daemon.launches[0]?.argv[4] ?? ''
+    expect(daemon.launches[0]?.argv).toEqual([
+      '/cfg/pignon/venv/bin/python',
+      '-m',
+      'pignon_decider',
+      '--socket',
+      socket,
+      '--model',
+      '/cfg/pignon/model',
+      '--shared',
+    ])
+    expect(socket).toMatch(/^\/cfg\/pignon\/run-[0-9a-f]{8}\/s\.sock$/)
+    expect(daemon.launches[0]?.cwd).toMatch(/\/pignon\/daemon$/)
+    // The launcher waits for the model to load, so the call's timeout must outlast it.
+    expect(daemon.launches[0]?.timeoutMs).toBeGreaterThanOrEqual(120_000)
+    expect(spawned).toEqual([])
+    expect(daemon.decides).toBe(1)
+    expect(calls.model).toBe(0)
+  })
+
+  test('joins a daemon that is already running, and launches nothing', SHARED, async ($, on) => {
+    const sent: TurnStepInput[] = []
+    const calls = engine(on, TRIVIAL, sent, 'live')
+    const daemon = sharedDaemon(on, { isUp: true })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await prompt($, 't1', 'rename foo to bar in utils.ts')
+
+    expect(daemon.launches).toEqual([])
+    expect(daemon.decides).toBe(1)
+    expect(calls.model).toBe(0)
+    expect(sent.map(e => `${e.model}/${e.effort}`)).toEqual(['haiku/low'])
+  })
+
+  test('checks the sockets of the process it reached, by the pid it announced', SHARED, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    const daemon = sharedDaemon(on, { isUp: true })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    expect(daemon.audits).toEqual(['4242'])
+  })
+
+  test('a daemon holding a network socket is not used, and Haiku decides', SHARED, async ($, on) => {
+    const sent: TurnStepInput[] = []
+    const calls = engine(on, TRIVIAL, sent, 'live')
+    const daemon = sharedDaemon(on, { isUp: true, sockets: 'Python 4242 me 3u IPv4 0x1 0t0 TCP 10.0.0.2:51234->93.184.216.34:443 (ESTABLISHED)\n' })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await prompt($, 't1', 'rename foo to bar in utils.ts')
+
+    expect(daemon.decides).toBe(0)
+    expect(calls.model).toBe(1)
+  })
+
+  test('starts a new daemon after the old one left, and Haiku decides meanwhile', SHARED, async ($, on) => {
+    const sent: TurnStepInput[] = []
+    const calls = engine(on, TRIVIAL, sent, 'live')
+    const daemon = sharedDaemon(on, { isUp: true })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    daemon.fail = 1 // the daemon left after its idle time: the next request finds nothing
+    await prompt($, 't1', 'rename foo')
+    await settle()
+    await prompt($, 't2', 'rename bar')
+
+    expect(calls.model).toBe(1) // the first prompt only
+    expect(daemon.launches).toHaveLength(1)
+    expect(daemon.decides).toBe(1) // the second prompt, on the new daemon
+    expect(daemon.audits).toEqual(['4242', '5151']) // each process is checked
+  })
+
+  test('a launcher that fails leaves Haiku deciding, and is not retried on every prompt', SHARED, async ($, on) => {
+    const calls = engine(on, TRIVIAL, [], 'live')
+    const daemon = sharedDaemon(on, { isUp: false, launcherExit: 1 })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await prompt($, 't1', 'rename foo')
+    await prompt($, 't2', 'rename bar')
+
+    expect(daemon.launches).toHaveLength(1)
+    expect(daemon.decides).toBe(0)
+    expect(calls.model).toBe(2)
+  })
+
+  test('/pignon says the daemon is shared', SHARED, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    sharedDaemon(on, { isUp: true })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    const { text = '' } = await $.command.run({
+      command: 'pignon',
+      args: '',
+      origin: { kind: 'composer' },
+      presentation: { isFullscreen: false, columns: 80 },
+    })
+
+    expect(text).toContain('decider: laya (running) · shared daemon')
+  })
+
+  test('the per-session daemon stays the default when laya is chosen', LOCAL, async ($, on) => {
+    const spawned: ProcessSpawnRequest[] = []
+    engine(on, TRIVIAL, [], 'live')
+    mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+    on('process.run', () => ({ value: { exitCode: 0, ...NO_OUTPUT } }))
+    on('process.spawn', async function* (_, e) {
+      spawned.push(e)
+      yield { stream: 'stdout' as const, text: 'ready 4242\n' }
+      await forever
+      return { value: { code: 0, signal: null } }
+    })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    expect(spawned).toHaveLength(1)
+    expect(spawned[0]?.argv).not.toContain('--shared')
+  })
+})

@@ -64,7 +64,7 @@ The cost is one small Haiku call per decided prompt, in shadow mode only. Live m
 
 ## A local decider
 
-For work where a prompt must not go anywhere but to Claude, a small classifier ([laya-conductor](https://huggingface.co/mvilacad/laya-conductor), 421M parameters, Apache 2.0) can judge the prompts instead of Haiku. It runs on your Mac with MLX; about 10 ms per prompt, about 930 MiB of memory per session.
+For work where a prompt must not go anywhere but to Claude, a small classifier ([laya-conductor](https://huggingface.co/mvilacad/laya-conductor), 421M parameters, Apache 2.0) can judge the prompts instead of Haiku. It runs on your Mac with MLX; about 10 ms per prompt. A copy of the model takes about 930 MiB resident, and macOS charges about 1.3 to 1.5 GB for it (Activity Monitor's figure). By default each session runs its own copy; [a shared daemon](#one-daemon-for-all-sessions) serves every session from one.
 
 1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
 2. Run `/pignon setup` once. It builds a Python 3.13 environment from [`daemon/requirements.lock`](daemon/requirements.lock) (every file hash-checked) and downloads the pinned model (about 850 MB, SHA-256 checked) into `$CLAUDE_CONFIG_DIR/pignon/` (`~/.claude/pignon/` by default). These are the only steps that use the network, and no prompt is involved.
@@ -80,12 +80,22 @@ What happens then: at session start the mod launches a small daemon (`daemon/pig
 
 What this does not do: no operating-system rule blocks the daemon's network access (`sandbox-exec` is deprecated), so the guarantee rests on the audit of `laya-mlx` 0.6.0, the stripped environment and the socket check. The compiled dependencies (`mlx`, `tokenizers`, `numpy`) were not audited.
 
+### One daemon for all sessions
+
+Set *How the local model runs* to `shared` (the `daemon` option, beside `decider` in `/config`, or `"daemon": "shared"` in the same `settings.json` block). The first session to need the model starts one daemon; every other session on the Mac uses it. It leaves by itself after 30 minutes without a prompt, so nothing keeps running when you stop working.
+
+- **Started detached.** A child the mod spawns ends with the session, so a shared daemon starts itself through `process.run`: it double-forks, calls `setsid`, closes its standard streams and prints `ready PID` once the model answers (about a second with the model cached). Its errors go to `daemon.log` beside its socket, which holds class names only, never a prompt.
+- **One socket, one lock.** The socket lives in `$CLAUDE_CONFIG_DIR/pignon/run-<hash of the mod folder>/`, a directory only you can enter (the daemon refuses one that is not yours or is open to others). A lock held for the daemon's life means two sessions starting at the same moment load the model once. A new version of the mod gets its own directory and daemon; the old one leaves when idle.
+- **Checked by every session.** The first time a session reaches a given process, the mod runs `lsof` on the pid the daemon reports and does not use a process that holds a network socket, or whose sockets cannot be checked.
+- **Idle means one slow prompt.** After the daemon has left, the next prompt finds no connection, Haiku decides that one, and the mod starts the daemon again in the background for the prompts after it.
+- **What it changes in the guarantees above.** Several sessions share one process, and it outlives the one that started it. Prompts still reach only that process over its Unix socket, and the daemon keeps nothing of them. `pkill -f pignon_decider` stops it by hand.
+
 ## Limits
 
 - Each new prompt waits for one decision before the turn starts: a Haiku call (5 s timeout) or the local model (about 10 ms, 1.5 s timeout). On failure the current model stays.
 - Haiku's confidence is its own estimate. The local model's is a probability, but it is soft (top probabilities of 0.5 to 0.85 on clear prompts), the 0.7 downgrade bar is provisional, and the claimed 87% routing accuracy could not be reproduced: the training data is private. Compare the two in shadow mode on your own prompts.
 - The local model cannot say whether a task needs exploring the codebase, so a trivial prompt that does is not moved up to standard.
-- One local daemon runs per session, about 930 MiB each.
+- By default one local daemon runs per session, about 1.3 to 1.5 GB each (930 MiB resident): ten open sessions cost ten copies. Choose the [shared daemon](#one-daemon-for-all-sessions) to run one copy for all of them.
 - `/model` keeps showing the session's model; the routed one is in the status line and the log.
 
 ## Requirements

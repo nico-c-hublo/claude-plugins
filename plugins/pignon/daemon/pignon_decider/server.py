@@ -15,6 +15,9 @@ ROUTES = ("/health", "/decide")
 
 MAX_BODY_BYTES = 16 * 1024
 
+# macOS allows 104 bytes in a socket path, the terminating NUL included.
+MAX_SOCKET_PATH_BYTES = 103
+
 # What the conductor's model card says a request may hold. Head only: whether the
 # tail carries more signal is untested, so shadow mode decides.
 MAX_PROMPT_CHARS = 400
@@ -28,6 +31,8 @@ class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
     def __init__(self, socket_path, scorer):
         self.scorer = scorer
+        # When a request last arrived, for a daemon that exits once nobody uses it.
+        self.last_activity = time.monotonic()
         # One forward pass at a time: the model is not safe to call concurrently.
         self.scoring = threading.Lock()
         super().__init__(socket_path, _Handler)
@@ -48,14 +53,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     timeout = 5
 
     def do_GET(self):
+        self.server.last_activity = time.monotonic()
         if self.path != "/health":
             self._refuse()
             return
-        self._send(200, {"status": "ok", "ready": self.server.scorer.ready})
+        # The pid is how a client inspects the sockets of the process it reached.
+        self._send(200, {"status": "ok", "ready": self.server.scorer.ready, "pid": os.getpid()})
 
     do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = lambda self: self._refuse()
 
     def do_POST(self):
+        self.server.last_activity = time.monotonic()
         if self.path != "/decide":
             self._refuse()
             return
@@ -155,6 +163,8 @@ def _clear_stale_socket(path):
 
 def serve(socket_path, scorer):
     """Binds `socket_path` and returns the server; the caller runs `serve_forever`."""
+    if len(os.fsencode(socket_path)) > MAX_SOCKET_PATH_BYTES:
+        raise ValueError(f"{socket_path} is longer than the {MAX_SOCKET_PATH_BYTES} bytes a socket path may have")
     directory = os.path.dirname(socket_path)
     if stat.S_IMODE(os.stat(directory).st_mode) & 0o077:
         raise PermissionError(f"{directory} must not be accessible to group or others")

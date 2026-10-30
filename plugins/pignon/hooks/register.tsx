@@ -35,6 +35,9 @@ const DECIDER_TIMEOUT_MS = 5_000
 const PROMPT_CHARS = 4_000
 // The daemon answers in about 10 ms; this is for one that is stuck.
 const LOCAL_TIMEOUT_MS = 1_500
+const CONNECTION_FAILED = 'the connection failed'
+// The launcher returns once the model has loaded, and gives up after 120 s itself.
+const LAUNCH_TIMEOUT_MS = 130_000
 
 // Shadow until the person has watched a few decisions and says `/pignon live`.
 async function modeOf($: EngineInterface): Promise<Mode> {
@@ -86,7 +89,7 @@ async function askLocal(
   })
   // `fetch` has no timeout of its own, and the turn waits on this.
   const reply = await Promise.race([answer, $.clock.sleep(LOCAL_TIMEOUT_MS).then(() => null)]).catch(() => undefined)
-  if (reply === undefined) return { cause: 'the connection failed' }
+  if (reply === undefined) return { cause: CONNECTION_FAILED }
   if (reply === null) return { cause: `it timed out after ${LOCAL_TIMEOUT_MS / 1000} s` }
   if (!reply.ok) return { cause: `it answered HTTP ${reply.status}` }
 
@@ -99,6 +102,84 @@ async function askLocal(
   }
 
   return { cause: 'it answered nothing usable' }
+}
+
+// The pid of the daemon answering on `socketPath`, or null when none does.
+async function healthPid($: EngineInterface, socketPath: string): Promise<number | null> {
+  const answer = $.http.fetch('http://pignon/health', { socketPath })
+  const reply = await Promise.race([answer, $.clock.sleep(LOCAL_TIMEOUT_MS).then(() => null)]).catch(() => null)
+  if (!reply?.ok) return null
+
+  try {
+    const { pid } = JSON.parse(reply.text) as { pid?: unknown }
+
+    return typeof pid === 'number' ? pid : null
+  } catch {
+    return null
+  }
+}
+
+// FNV-1a, enough to tell mod folders apart in a directory name.
+function shortHash(text: string): string {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193)
+
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
+// The shared daemon's socket, in a directory per mod folder: a new version of the
+// mod starts a daemon of its own, and the old one leaves when it has been idle.
+async function sharedSocket($: EngineInterface): Promise<string> {
+  return `${await dataHome($)}/run-${shortHash($.plugin.root)}/s.sock`
+}
+
+// What a session knows of the local model's daemon.
+type LocalDaemon = {
+  // Set once the daemon answers; routing asks Haiku until then.
+  socketPath: string | null
+  isStarting: boolean
+  // The process whose sockets were last checked; a new one is checked again.
+  auditedPid: number | null
+}
+
+// Reaches the shared daemon, starting it when nothing answers. It never throws:
+// when it cannot, Haiku decides until the next try, which a lost connection triggers.
+async function connectShared($: EngineInterface, daemon: LocalDaemon): Promise<void> {
+  if (daemon.isStarting) return
+  daemon.isStarting = true
+  try {
+    const path = await sharedSocket($)
+    let pid = await healthPid($, path)
+    if (pid === null) {
+      const home = await dataHome($)
+      const launched = await $.process
+        .run([`${home}/venv/bin/python`, '-m', 'pignon_decider', '--socket', path, '--model', `${home}/model`, '--shared'], {
+          cwd: `${$.plugin.root}/daemon`,
+          timeoutMs: LAUNCH_TIMEOUT_MS,
+        })
+        .catch(() => null)
+      if (launched === null || launched.exitCode !== 0) {
+        const said = launched ? ` (${launched.stdout.trim() || 'no answer'})` : ''
+        $.ui.toast(`pignon: the shared local model did not start${said}. Haiku decides. /pignon setup builds it.`)
+
+        return
+      }
+      pid = await healthPid($, path)
+    }
+    if (pid === null) return
+
+    if (pid !== daemon.auditedPid) {
+      if (!(await holdsNoNetworkSocket($, String(pid)))) {
+        $.ui.toast(`pignon: the shared local model (pid ${pid}) holds a network socket, so it is not used. Haiku decides.`)
+
+        return
+      }
+      daemon.auditedPid = pid
+    }
+    daemon.socketPath = path
+  } finally {
+    daemon.isStarting = false
+  }
 }
 
 function randomHex(bytes: number): string {
@@ -304,7 +385,8 @@ async function route(
   effort: Effort | undefined,
   mode: Mode,
   wantsLocal: boolean,
-  socketPath: string | null,
+  daemon: LocalDaemon,
+  isShared: boolean,
 ) {
   const was = await read($, current)
   const startedAt = await $.clock.now()
@@ -316,12 +398,18 @@ async function route(
   let local: LocalAnswer | null = null
   let fallback: string | undefined
   if (!decision && wantsLocal) {
-    if (socketPath === null) {
-      fallback = 'it is not running'
+    if (daemon.socketPath === null) {
+      fallback = daemon.isStarting ? 'it is starting' : 'it is not running'
     } else {
-      const asked = await askLocal($, socketPath, text, contextSize)
-      if ('cause' in asked) fallback = asked.cause
-      else local = asked
+      const asked = await askLocal($, daemon.socketPath, text, contextSize)
+      if ('cause' in asked) {
+        fallback = asked.cause
+        // A shared daemon leaves when idle: start it again for the next prompt.
+        if (asked.cause === CONNECTION_FAILED && isShared) {
+          daemon.socketPath = null
+          void connectShared($, daemon)
+        }
+      } else local = asked
       decision = local?.decision ?? null
     }
   }
@@ -384,10 +472,10 @@ async function route(
 
 export const register: Register = (on, options) => {
   const decider: DeciderId = options.decider === 'laya' ? 'laya' : 'haiku'
-  // Set once the daemon says it is ready; routing asks Haiku until then.
-  let socketPath: string | null = null
+  const daemon: LocalDaemon = { socketPath: null, isStarting: false, auditedPid: null }
   // The prompt each main turn starts with, read by its first model request.
   const prompts = new Map<string, string>()
+  const isShared = decider === 'laya' && options.daemon === 'shared'
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -396,10 +484,11 @@ export const register: Register = (on, options) => {
       argumentHint: '[live|shadow|off|unpin|log|compare|watch|setup]',
       immediate: true,
     })
-    if (decider === 'laya') void launchDaemon(
+    if (isShared) void connectShared($, daemon)
+    else if (decider === 'laya') void launchDaemon(
         $,
-        path => (socketPath = path),
-        () => (socketPath = null),
+        path => (daemon.socketPath = path),
+        () => (daemon.socketPath = null),
       )
 
     return next(e)
@@ -432,7 +521,16 @@ export const register: Register = (on, options) => {
     if (await read($, isPinned)) return yield* next(e)
 
     if (e.index === 0 && text !== undefined) {
-      await route($, text, e.model, e.effort as Effort | undefined, mode, decider === 'laya', socketPath)
+      await route(
+        $,
+        text,
+        e.model,
+        e.effort as Effort | undefined,
+        mode,
+        decider === 'laya',
+        daemon,
+        isShared,
+      )
     }
 
     const tier = mode === 'live' ? tierOf(await read($, current)) : undefined
@@ -544,9 +642,11 @@ export const register: Register = (on, options) => {
         `decider: ${
           decider === 'haiku'
             ? 'haiku'
-            : socketPath
-              ? 'laya (running)'
-              : 'laya (not running: Haiku decides; /pignon setup builds it)'
+            : daemon.socketPath
+              ? `laya (running)${isShared ? ' · shared daemon' : ''}`
+              : daemon.isStarting
+                ? 'laya (starting: Haiku decides until the model has loaded)'
+                : 'laya (not running: Haiku decides; /pignon setup builds it)'
         }`,
         `context ${Math.round((await read($, contextTokens)) / 1000)}k · ${guard}`,
         table,

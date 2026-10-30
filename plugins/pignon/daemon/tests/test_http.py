@@ -19,7 +19,7 @@ class HealthTest(unittest.TestCase):
             status, body = request(socket_path, "GET", "/health")
 
         self.assertEqual(status, 200)
-        self.assertEqual(body, {"status": "ok", "ready": True})
+        self.assertEqual(body, {"status": "ok", "ready": True, "pid": os.getpid()})
 
 
 class DecideTest(unittest.TestCase):
@@ -80,6 +80,14 @@ class SocketSecurityTest(unittest.TestCase):
             serve(f"{directory}/s.sock", FakeScorer())
 
         self.assertFalse(os.path.exists(f"{directory}/s.sock"))
+
+
+    def test_refuses_a_socket_path_longer_than_a_socket_may_have(self):
+        directory = tempfile.mkdtemp(prefix="pd", dir="/tmp")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+
+        with self.assertRaises(ValueError):
+            serve(f"{directory}/{'s' * 100}.sock", FakeScorer())
 
 
 class OccupiedPathTest(unittest.TestCase):

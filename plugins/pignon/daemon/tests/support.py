@@ -35,6 +35,13 @@ class ExplodingScorer(FakeScorer):
         raise RuntimeError(f"cannot tokenize {text!r}")
 
 
+class FailingScorer:
+    """A model that cannot be loaded."""
+
+    def __init__(self):
+        raise RuntimeError("no model")
+
+
 WATCHED_ENV = (
     "HF_HUB_OFFLINE",
     "HF_TOKEN",
