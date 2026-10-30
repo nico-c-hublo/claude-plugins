@@ -12,6 +12,8 @@ export type Decision = {
 
 /** One routed prompt, as `/pignon log` lists it. */
 export type LogEntry = {
+  /** Counts up through the session, so a late answer finds its entry. */
+  id: number
   /** When it was decided, in milliseconds since the epoch. */
   at: number
   prompt: string
@@ -23,6 +25,8 @@ export type LogEntry = {
   daemonMs?: number
   /** Why the local model, though chosen, did not decide and Haiku did. */
   fallback?: string
+  /** Haiku's opinion on the same prompt, asked in shadow mode for comparison. */
+  second?: { decision: Decision | null; ms: number; isPending?: boolean }
   /** Who decided: Haiku, the model on this Mac, or a rule (an acknowledgement). */
   decider: 'haiku' | 'laya' | 'rule'
   decision: Decision | null
@@ -46,6 +50,8 @@ declare module 'claude-code' {
       base: string | null
       /** True once the person picked a model by hand: routing waits for unpin. */
       isPinned: boolean
+      /** The id the next log entry takes. */
+      nextId: number
       log: Shaped<LogEntry[]>
     }
   }

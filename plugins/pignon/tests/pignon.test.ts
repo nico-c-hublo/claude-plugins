@@ -122,22 +122,24 @@ describe('policy: the local model\'s answer', () => {
 
 // Stands for the engine beneath the mod: a decider that answers `reply`, and
 // a model that records each request it is sent.
-function engine(on: On, reply: string, sent: TurnStepInput[], mode = 'shadow') {
+function engine(on: On, reply: string | (() => Promise<string>), sent: TurnStepInput[], mode = 'shadow') {
   const clock = mock.clock(on)
   const calls = { model: 0, clock }
   mock.store(on, { mode })
   on('command.register', () => ({ value: { command: 'pignon' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
-  on('model.complete', () => {
+  on('model.complete', async () => {
     calls.model++
+    const text = typeof reply === 'string' ? reply : await reply()
+
     return {
-    value: {
-      isAnswered: true,
-      text: reply,
-      usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
-    },
-  }
+      value: {
+        isAnswered: true as const,
+        text,
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      },
+    }
   })
   on('turn.step', async function* (_, e) {
     sent.push(e)
@@ -823,5 +825,142 @@ describe('the decisions pane', () => {
     expect(await ui.find({ type: 'Text', text: /alpha/ })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /omega/ })).toBeDefined()
     await ui.unmount()
+  })
+})
+
+describe('the second opinion (shadow mode, local model chosen)', () => {
+  const LAYA_SAYS_TRIVIAL = () => ({
+    status: 200,
+    ok: true,
+    headers: {},
+    text: JSON.stringify({ tiers: { trivial: 0.9, standard: 0.07, hard: 0.03 }, latencyMs: 9 }),
+  })
+  const HAIKU_SAYS_STANDARD = '{"tier":"standard","explore":false,"confidence":0.8}'
+
+  async function turn($: Engine, id: string, text: string) {
+    await $.turn.start({ turnId: id, text })
+    for await (const _ of $.turn.step({ turnId: id, index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
+  }
+
+  test('Haiku is asked, and the turn does not wait for it', LOCAL, async ($, on) => {
+    let release!: () => void
+    const held = new Promise<void>(resolve => (release = resolve))
+    const calls = engine(on, async () => (await held, HAIKU_SAYS_STANDARD), [], 'shadow')
+    withDaemon(on, LAYA_SAYS_TRIVIAL)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await turn($, 't1', 'rename foo to bar') // returns although Haiku has not answered
+
+    expect(calls.model).toBe(1)
+    release()
+    await settle()
+  })
+
+  test('is not asked in live mode', LOCAL, async ($, on) => {
+    const calls = engine(on, HAIKU_SAYS_STANDARD, [], 'live')
+    withDaemon(on, LAYA_SAYS_TRIVIAL)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await turn($, 't1', 'rename foo to bar')
+    await settle()
+
+    expect(calls.model).toBe(0)
+  })
+
+  test('is not asked for an acknowledgement, nor when Haiku already decided', LOCAL, async ($, on) => {
+    const calls = engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    withDaemon(on, () => ({ status: 500, ok: false, headers: {}, text: '{}' }))
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await turn($, 't1', 'yes, go ahead') // a rule decides
+    await turn($, 't2', 'rename foo to bar') // the daemon fails, so Haiku is the decider
+    await settle()
+
+    expect(calls.model).toBe(1) // Haiku's own decision for t2, and no second opinion
+  })
+
+  test('the pane shows Haiku agreeing, differing, or giving no answer', LOCAL, async ($, on) => {
+    const opinions = [
+      '{"tier":"trivial","explore":false,"confidence":0.9}',
+      '{"tier":"trivial","explore":true,"confidence":0.8}', // it would run on standard
+      'no idea',
+    ]
+    let asked = 0
+    engine(on, async () => opinions[asked++]!, [], 'shadow')
+    withDaemon(on, LAYA_SAYS_TRIVIAL)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    for (const [i, text] of ['rename foo', 'rename bar', 'rename baz'].entries()) await turn($, `t${i}`, text)
+    await settle()
+
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...DECISIONS_PANE, surface })
+
+      expect((await ui.find({ type: 'Text', text: /agrees/ }))?.text).toBe('haiku agrees: trivial p=0.90 · 0 ms')
+      expect((await ui.find({ type: 'Text', text: /differs/ }))?.text).toBe('haiku differs: trivial/explore p=0.80 · 0 ms')
+      expect((await ui.find({ type: 'Text', text: /no answer/ }))?.text).toBe('haiku: no answer')
+      await ui.unmount()
+    }
+  })
+
+  test('the pane says Haiku is still thinking, then shows its answer in place', LOCAL, async ($, on) => {
+    let release!: () => void
+    const held = new Promise<void>(resolve => (release = resolve))
+    engine(on, async () => (await held, HAIKU_SAYS_STANDARD), [], 'shadow')
+    withDaemon(on, LAYA_SAYS_TRIVIAL)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await turn($, 't1', 'rename foo to bar')
+
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, surface: 'terminal' })
+    expect((await ui.find({ type: 'Text', text: /^haiku/ }))?.text).toBe('haiku: asking...')
+
+    release()
+    await settle()
+
+    expect((await ui.find({ type: 'Text', text: /^haiku/ }))?.text).toBe('haiku differs: standard p=0.80 · 0 ms')
+    await ui.unmount()
+  })
+
+  async function compare($: Engine) {
+    const { text = '' } = await $.command.run({ command: 'pignon', args: 'compare', ...COMMAND })
+
+    return text
+  }
+
+  test('/pignon compare totals the agreement and lists the differences', LOCAL, async ($, on) => {
+    const opinions = [
+      '{"tier":"trivial","explore":false,"confidence":0.9}',
+      '{"tier":"trivial","explore":true,"confidence":0.8}',
+      'no idea',
+    ]
+    let asked = 0
+    engine(on, async () => opinions[asked++]!, [], 'shadow')
+    withDaemon(on, LAYA_SAYS_TRIVIAL)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    for (const [i, text] of ['rename foo', 'rename bar', 'rename baz'].entries()) await turn($, `t${i}`, text)
+    await settle()
+
+    const text = await compare($)
+
+    expect(text).toContain('2 compared: 1 agree (50%), 1 differ.')
+    expect(text).toContain('Haiku gave no answer for 1.')
+    expect(text).toContain('trivial → trivial/explore  “rename bar”')
+    expect(text).not.toContain('rename foo')
+  })
+
+  test('/pignon compare says what it needs when there is nothing to compare', async ($, on) => {
+    engine(on, TRIVIAL, [], 'shadow')
+
+    const text = await compare($)
+
+    expect(text).toContain('No comparisons yet')
+    expect(text).toContain('laya')
+    expect(text).toContain('shadow')
   })
 })

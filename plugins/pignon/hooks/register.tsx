@@ -3,7 +3,17 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Decision, Effort, LogEntry } from '../types'
 import type { DeciderId } from './policy'
-import { DECIDER_SYSTEM, THRESHOLDS, TIERS, decide, decisionFromTiers, isFollowUp, parseDecision, tierOf } from './policy'
+import {
+  DECIDER_SYSTEM,
+  THRESHOLDS,
+  TIERS,
+  decide,
+  decisionFromTiers,
+  effectiveTier,
+  isFollowUp,
+  parseDecision,
+  tierOf,
+} from './policy'
 
 type Mode = 'live' | 'shadow' | 'off'
 const MODES: readonly Mode[] = ['live', 'shadow', 'off']
@@ -13,7 +23,8 @@ const promptsSinceSwitch = atom({ plugin: 'pignon', key: 'promptsSinceSwitch' } 
 const contextTokens = atom({ plugin: 'pignon', key: 'contextTokens' } as const, 0)
 const base = atom({ plugin: 'pignon', key: 'base' } as const, null as string | null)
 const isPinned = atom({ plugin: 'pignon', key: 'isPinned' } as const, false)
-const log = atom({ plugin: 'pignon', key: 'log' } as const, [] as LogEntry[], { shape: 'log-3' })
+const log = atom({ plugin: 'pignon', key: 'log' } as const, [] as LogEntry[], { shape: 'log-4' })
+const nextId = atom({ plugin: 'pignon', key: 'nextId' } as const, 0)
 
 const PANE = 'decisions'
 // What the local model reads of a prompt; the pane shows as much.
@@ -42,6 +53,16 @@ async function ask($: EngineInterface, text: string, tier: string | null): Promi
   })
 
   return reply.isAnswered ? parseDecision(reply.text) : null
+}
+
+// Haiku's opinion on a prompt the local model decided, for comparison. Shadow
+// mode switches nothing, so no turn waits for it: it fills in the entry later.
+async function secondOpinion($: EngineInterface, id: number, text: string, tier: string | null): Promise<void> {
+  const startedAt = await $.clock.now()
+  const decision = await ask($, text, tier).catch(() => null)
+  const ms = Math.round((await $.clock.now()) - startedAt)
+
+  await update($, log, list => list.map(entry => (entry.id === id ? { ...entry, second: { decision, ms } } : entry)))
 }
 
 // What the local model's daemon answered, or why there is no answer.
@@ -167,9 +188,54 @@ function entryLines(entry: LogEntry): string[] {
     `${clockTime(entry.at)} ${entry.decider.padEnd(5)} ${entry.sent || entry.prompt}`,
     ...(entry.fallback ? [`laya unavailable: ${entry.fallback}`] : []),
     entry.tiers ? TIERS.map(tier => tierBar(entry, tier.id)).join('  ') : verdictLine(entry),
+    ...(secondLine(entry) ? [secondLine(entry)!] : []),
     outcomeLine(entry),
     entry.reason,
   ]
+}
+
+// Haiku's opinion on a prompt the local model decided, and whether they agree
+// on the tier that would run.
+function secondLine(entry: LogEntry): string | undefined {
+  const second = entry.second
+  if (!second) return undefined
+  if (second.isPending) return 'haiku: asking...'
+  const opinion = second.decision
+  if (!opinion) return 'haiku: no answer'
+
+  return `haiku ${agrees(entry) ? 'agrees' : 'differs'}: ${opinion.tier}${opinion.explore ? '/explore' : ''} p=${opinion.confidence.toFixed(2)} · ${second.ms} ms`
+}
+
+// Whether Haiku would run the same tier as the judge that decided.
+function agrees(entry: LogEntry): boolean {
+  const opinion = effectiveTier(entry.second?.decision ?? null)
+
+  return opinion !== null && opinion === effectiveTier(entry.decision)
+}
+
+// `/pignon compare`: how often the two judges would run the same tier, and where they differ.
+function compareReport(entries: readonly LogEntry[]): string {
+  const asked = entries.filter(entry => entry.second)
+  if (asked.length === 0) {
+    return 'No comparisons yet. Choose laya as the decider, stay in shadow mode (/pignon shadow) and send a few prompts: Haiku is then asked for a second opinion on each.'
+  }
+  const answered = asked.filter(entry => entry.second?.decision)
+  const differ = answered.filter(entry => !agrees(entry))
+  const noAnswer = asked.filter(entry => !entry.second?.isPending && !entry.second?.decision).length
+  const pending = asked.filter(entry => entry.second?.isPending).length
+  const share = answered.length === 0 ? 0 : Math.round(((answered.length - differ.length) / answered.length) * 100)
+  const summary =
+    `${answered.length} compared: ${answered.length - differ.length} agree (${share}%), ${differ.length} differ.` +
+    (noAnswer > 0 ? ` Haiku gave no answer for ${noAnswer}.` : '') +
+    (pending > 0 ? ` ${pending} still pending.` : '')
+  if (differ.length === 0) return summary
+
+  const lines = differ.slice(-15).map(entry => {
+    const opinion = entry.second?.decision
+    return `  ${entry.decision?.tier} → ${opinion?.tier}${opinion?.explore ? '/explore' : ''}  “${entry.prompt}”`
+  })
+
+  return [summary, 'Differences (laya → haiku):', ...lines].join('\n')
 }
 
 function tierBar(entry: LogEntry, id: string): string {
@@ -286,13 +352,17 @@ async function route(
   }
   const now = isLive && target !== null ? target : was
   const source = isAcknowledgement ? 'rule' : decider
+  const id = await read($, nextId)
+  await update($, nextId, n => n + 1)
   const entry: LogEntry = {
+    id,
     at: startedAt,
     prompt: text.slice(0, 80).replace(/\s+/g, ' '),
     sent: isAcknowledgement ? '' : text.slice(0, SENT_CHARS),
     tiers: local?.tiers,
     daemonMs: local?.daemonMs,
     fallback,
+    second: mode === 'shadow' && local ? { decision: null, ms: 0, isPending: true } : undefined,
     decider: source,
     decision,
     ms,
@@ -301,6 +371,7 @@ async function route(
     reason,
   }
   await update($, log, list => [...list, entry].slice(-50))
+  if (mode === 'shadow' && local) void secondOpinion($, id, text, was)
 
   const verdict = decision
     ? `${source} ${decision.tier}${decision.explore ? '/explore' : ''} p=${decision.confidence.toFixed(2)} · ${ms} ms`
@@ -321,8 +392,8 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'pignon',
-      description: 'Model router: status, live, shadow, off, unpin, log, watch, setup',
-      argumentHint: '[live|shadow|off|unpin|log|watch|setup]',
+      description: 'Model router: status, live, shadow, off, unpin, log, compare, watch, setup',
+      argumentHint: '[live|shadow|off|unpin|log|compare|watch|setup]',
       immediate: true,
     })
     if (decider === 'laya') void launchDaemon(
@@ -397,6 +468,7 @@ export const register: Register = (on, options) => {
               </Box>
             )}
             {!entry.tiers && <Text>{verdictLine(entry)}</Text>}
+            {secondLine(entry) && <Text>{secondLine(entry)}</Text>}
             <Text>{outcomeLine(entry)}</Text>
             <Text dimColor>{entry.reason}</Text>
           </Box>
@@ -415,6 +487,8 @@ export const register: Register = (on, options) => {
 
       return { text: `pignon is ${arg}.` }
     }
+
+    if (arg === 'compare') return { text: compareReport(await read($, log)) }
 
     if (arg === 'watch') {
       const opened = await $.ui.open({ id: PANE, title: 'pignon' })
@@ -476,7 +550,7 @@ export const register: Register = (on, options) => {
         }`,
         `context ${Math.round((await read($, contextTokens)) / 1000)}k · ${guard}`,
         table,
-        'Commands: /pignon live | shadow | off | unpin | log | watch | setup',
+        'Commands: /pignon live | shadow | off | unpin | log | compare | watch | setup',
       ].join('\n'),
     }
   })

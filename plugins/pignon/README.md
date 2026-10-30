@@ -24,6 +24,7 @@ The table and thresholds live in [`hooks/policy.ts`](hooks/policy.ts).
 | `/pignon off` | Stop routing |
 | `/pignon unpin` | Route again after you picked a model with `/model` or `/effort` |
 | `/pignon log` | The last decisions: who decided (`haiku`, `laya` or `rule`), confidence, latency and reason |
+| `/pignon compare` | How often the local model and Haiku would run the same tier, and the prompts where they differ (see below) |
 | `/pignon watch` | Open a pane that shows each decision as it is made (see below) |
 | `/pignon setup` | Build the local decider (see below) |
 
@@ -46,6 +47,20 @@ Then watch a few decisions in shadow mode and run `/pignon live` when they look 
 `/pignon watch` opens a pane beside the chat that draws each decision the moment it is made: the time, who decided (`laya`, `haiku` or `rule`), the start of the prompt as the decider read it (the local model reads the first 400 characters), the local model's probability for each tier, how long it took (the mod's clock and the daemon's own), what was done about it, and why. When the local model was chosen but Haiku decided, the pane says why: not running, timed out, an HTTP error, a dropped connection, or an unusable answer.
 
 The pane keeps the last 50 decisions in the session's memory (nothing is written to disk) and shows the newest ones that fit, noting how many older ones are hidden. It shows prompt text on your screen, no more than the transcript does, so mind it when sharing your screen. A pane opened by a command is placed at any width; if the surface cannot draw it, the command says why.
+
+## Comparing the two judges
+
+With `laya` chosen and the mode on `shadow` (the default), pignon also asks Haiku about every prompt the local model decided, in the background: the turn does not wait for it, and nothing is switched in shadow mode. The pane shows Haiku's answer under the local model's (`haiku agrees: …`, `haiku differs: …`, `haiku: no answer`, or `haiku: asking...` while it thinks). `/pignon compare` totals it:
+
+```
+2 compared: 1 agree (50%), 1 differ. Haiku gave no answer for 1.
+Differences (laya → haiku):
+  trivial → trivial/explore  “rename bar”
+```
+
+"Agree" means the two would run the same tier: a prompt Haiku says is trivial but must explore the codebase would run on standard, so it differs from a local model's plain trivial. With no ground truth, the disagreements are the data: read them and decide which judge was right, which is also how the 0.7 downgrade bar gets tuned.
+
+The cost is one small Haiku call per decided prompt, in shadow mode only. Live mode asks the chosen judge alone, and acknowledgements and prompts Haiku already decided are not compared. The prompt goes to Claude either way, and nowhere else.
 
 ## A local decider
 

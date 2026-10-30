@@ -89,12 +89,8 @@ export function decide(input: PolicyInput): PolicyOutput {
   if (!decision) return { target: null, reason: 'no decision' }
   if (decision.tier === 'same') return { target: null, reason: 'follow-up' }
 
-  let rank = rankOf(decision.tier)
-  if (rank < 0) return { target: null, reason: `unknown tier ${decision.tier}` }
-  if (decision.explore && !TIERS[rank]!.canExplore) {
-    const up = TIERS.findIndex((t, i) => i > rank && t.canExplore)
-    if (up >= 0) rank = up
-  }
+  if (rankOf(decision.tier) < 0) return { target: null, reason: `unknown tier ${decision.tier}` }
+  const rank = rankOf(effectiveTier(decision)!)
   const target = TIERS[rank]!
 
   const running = current === null ? undefined : TIERS[rankOf(current)]
@@ -126,6 +122,22 @@ export function decide(input: PolicyInput): PolicyOutput {
     return { target: null, reason: `context ${Math.round(input.contextTokens / 1000)}k: cache protected` }
   }
   return { target: target.id, reason: `${isSameModel ? 'effort' : 'downgrade'} ${label}` }
+}
+
+/**
+ * The tier a decision would run on: a prompt that must explore moves up from a
+ * tier that cannot. Null for a follow-up or an unknown tier.
+ */
+export function effectiveTier(decision: Decision | null): string | null {
+  if (!decision || decision.tier === 'same') return null
+  let rank = rankOf(decision.tier)
+  if (rank < 0) return null
+  if (decision.explore && !TIERS[rank]!.canExplore) {
+    const up = TIERS.findIndex((t, i) => i > rank && t.canExplore)
+    if (up >= 0) rank = up
+  }
+
+  return TIERS[rank]!.id
 }
 
 export function tierOf(id: string | null): Tier | undefined {
