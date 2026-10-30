@@ -356,9 +356,15 @@ describe('the local decider: its daemon', () => {
 
   test('a session daemon that starts to hold a network socket is no longer asked', LOCAL, async ($, on) => {
     const sockets = { held: '' }
+    const toasts: string[] = []
     let fetched = 0
     const calls = engine(on, TRIVIAL, [], 'live')
     mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+    on('ui.toast', (_, e) => {
+      toasts.push(e.text)
+
+      return { value: undefined }
+    })
     on('process.run', (_, e) => {
       const stdout = e.argv[0] === '/usr/sbin/lsof' ? sockets.held : ''
       return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -382,6 +388,40 @@ describe('the local decider: its daemon', () => {
 
     expect(fetched).toBe(1)
     expect(calls.model).toBe(1)
+    expect(toasts).toEqual([expect.stringContaining('holds a network socket')])
+  })
+
+  test('the toast for a daemon that cannot be checked does not say it holds a network socket', LOCAL, async ($, on) => {
+    const lsof = { exitCode: 1, stdout: '' }
+    const toasts: string[] = []
+    const calls = engine(on, TRIVIAL, [], 'live')
+    mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+    on('ui.toast', (_, e) => {
+      toasts.push(e.text)
+
+      return { value: undefined }
+    })
+    on('process.run', (_, e) => {
+      const answer = e.argv[0] === '/usr/sbin/lsof' ? lsof : { exitCode: 0, stdout: '' }
+      return { value: { ...answer, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    on('process.spawn', async function* () {
+      yield { stream: 'stdout' as const, text: 'ready 4242\n' }
+      await forever
+      return { value: { code: 0, signal: null } }
+    })
+    on('http.fetch', () => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ tiers: TIERS_TRIVIAL, latencyMs: 9 }) } }))
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await prompt($, 't0', 'rename foo')
+    await calls.clock.advance(6 * 60_000)
+    lsof.exitCode = 2
+    await prompt($, 't1', 'rename foo')
+
+    expect(toasts).toHaveLength(1)
+    expect(toasts[0]).toContain('could not be checked')
+    expect(toasts[0]).not.toContain('holds a network socket')
   })
 
   test('an acknowledgement keeps the tier and asks neither the daemon nor Haiku', LOCAL, async ($, on) => {

@@ -162,12 +162,13 @@ async function auditAgain($: EngineInterface, daemon: LocalDaemon): Promise<void
   const now = await $.clock.now()
   if (now - daemon.auditedAt < AUDIT_EVERY_MS) return
 
-  if (await holdsNoNetworkSocket($, String(daemon.auditedPid))) {
+  const problem = await socketProblem($, String(daemon.auditedPid))
+  if (problem === null) {
     daemon.auditedAt = now
 
     return
   }
-  $.ui.toast(`pignon: the local model (pid ${daemon.auditedPid}) now holds a network socket, so it is not used. Haiku decides.`)
+  $.ui.toast(`pignon: the local model (pid ${daemon.auditedPid}) ${problem}, so it is not used. Haiku decides.`)
   daemon.socketPath = null
   daemon.auditedPid = null
 }
@@ -200,8 +201,9 @@ async function connectShared($: EngineInterface, daemon: LocalDaemon): Promise<v
 
     const now = await $.clock.now()
     if (pid !== daemon.auditedPid || now - daemon.auditedAt >= AUDIT_EVERY_MS) {
-      if (!(await holdsNoNetworkSocket($, String(pid)))) {
-        $.ui.toast(`pignon: the shared local model (pid ${pid}) holds a network socket, so it is not used. Haiku decides.`)
+      const problem = await socketProblem($, String(pid))
+      if (problem !== null) {
+        $.ui.toast(`pignon: the shared local model (pid ${pid}) ${problem}, so it is not used. Haiku decides.`)
 
         return
       }
@@ -374,8 +376,9 @@ async function launchDaemon($: EngineInterface, daemon: LocalDaemon): Promise<vo
   for await (const piece of child) {
     const pid = piece.stream === 'stdout' ? /^ready (\d+)/m.exec(piece.text)?.[1] : undefined
     if (pid === undefined) continue
-    if (!(await holdsNoNetworkSocket($, pid))) {
-      $.ui.toast('pignon: the local model holds a network socket, so it is stopped. Haiku decides.')
+    const problem = await socketProblem($, pid)
+    if (problem !== null) {
+      $.ui.toast(`pignon: the local model ${problem}, so it is stopped. Haiku decides.`)
       break // leaving the loop kills the child
     }
     daemon.auditedPid = Number(pid)
@@ -389,11 +392,14 @@ async function launchDaemon($: EngineInterface, daemon: LocalDaemon): Promise<vo
 }
 
 // The daemon's code is audited and its environment stripped; this checks the
-// result on the running process. Unable to check counts as failing it.
-async function holdsNoNetworkSocket($: EngineInterface, pid: string): Promise<boolean> {
+// result on the running process. Null when it holds no network socket, else why
+// it is refused. Unable to check counts as failing it, and says so: an lsof that
+// failed is not a leak.
+async function socketProblem($: EngineInterface, pid: string): Promise<string | null> {
   const sockets = await $.process.run(['/usr/sbin/lsof', '-a', '-p', pid, '-i', '-n', '-P'], { timeoutMs: LSOF_TIMEOUT_MS }).catch(() => null)
+  if (sockets === null || sockets.exitCode > 1) return 'could not be checked for network sockets'
 
-  return sockets !== null && sockets.exitCode <= 1 && sockets.stdout.trim() === ''
+  return sockets.stdout.trim() === '' ? null : 'holds a network socket'
 }
 
 // The text lines of an entry, as the pane draws them: what it measures with too.
