@@ -1,0 +1,42 @@
+{
+  "name": "pignon",
+  "version": "0.1.0",
+  "author": {
+    "name": "nico-c-hublo"
+  },
+  "description": "Routes each prompt to the right Claude model and effort level (Haiku, Sonnet or Opus), with a cache-aware switching policy.",
+  "types": "./types/index.d.ts",
+  "license": "MIT",
+  "userConfig": {
+    "decider": {
+      "type": "string",
+      "title": "Who judges each prompt",
+      "description": "haiku: ask Haiku about each prompt (default). laya: a model on this Mac, nothing sent anywhere; run /pignon setup once. Falls back to Haiku whenever it is unavailable.",
+      "options": [
+        "haiku",
+        "laya"
+      ],
+      "default": "haiku"
+    },
+    "daemon": {
+      "type": "string",
+      "title": "How the local model runs",
+      "description": "session: one copy per session, about 1.3 GB each, stopped with the session (default). shared: one copy for every session, stopped after 30 minutes without a prompt. Only matters when the decider is laya.",
+      "options": [
+        "session",
+        "shared"
+      ],
+      "default": "session"
+    },
+    "record": {
+      "type": "string",
+      "title": "Keep a decision log",
+      "description": "off: nothing is written to disk (default). on: one line per decision in $CLAUDE_CONFIG_DIR/pignon/decisions/, with the tiers, the judges' answers and timings but none of the prompt, for /pignon stats. Files older than 90 days are removed.",
+      "options": [
+        "off",
+        "on"
+      ],
+      "default": "off"
+    }
+  }
+}
