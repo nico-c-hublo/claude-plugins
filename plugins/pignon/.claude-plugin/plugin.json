@@ -37,6 +37,17 @@
         "on"
       ],
       "default": "off"
+    },
+    "cacheTtl": {
+      "type": "string",
+      "title": "Prompt cache lifetime",
+      "description": "After this long without a request the cache has lapsed, so a switch costs nothing and the cache guard is lifted for the next prompt. auto (default): FORCE_PROMPT_CACHING_5M, CLAUDE_CODE_PROMPT_CACHE_TTL, the promptCacheTtl setting or ENABLE_PROMPT_CACHING_1H when set, else an hour, the safe guess. 5m: an API key, Bedrock, Vertex or Foundry with none of those set.",
+      "options": [
+        "auto",
+        "5m",
+        "1h"
+      ],
+      "default": "auto"
     }
   }
 }

@@ -1,6 +1,6 @@
 // Pure routing policy, ported from pi-pignon: no `$`, the part worth testing.
 
-import type { Decision, Effort } from '../types'
+import type { Decision, Effort, LogEntry, TurnOutcome } from '../types'
 
 export type Tier = {
   id: string
@@ -63,6 +63,8 @@ export const THRESHOLDS = {
   cacheGuardTokens: 60_000,
   /** The same for an upgrade, which quality justifies more readily. */
   upgradeGuardTokens: 100_000,
+  /** A trivial turn that makes this many requests was more than a trivial task. */
+  longTurnSteps: 8,
 }
 
 export type PolicyInput = {
@@ -76,6 +78,12 @@ export type PolicyInput = {
   sessionEffort: Effort | undefined
   contextTokens: number
   promptsSinceSwitch: number
+  /**
+   * True when the cached prefix is already gone (a compaction, or an idle gap
+   * past the cache TTL): a switch then costs nothing, so the guards and the
+   * cooldown do not apply.
+   */
+  isCacheCold?: boolean
 }
 
 export type PolicyOutput = { target: string | null; reason: string }
@@ -85,12 +93,15 @@ export type PolicyOutput = { target: string | null; reason: string }
  *
  * Upgrades are quality-driven: confidence gates them, and a higher cache
  * guard. Every other move must also clear the cooldown and the cache guard.
- * A change of model or of effort alone both miss the cache, so both are guarded.
- * Fail-open: a missing or unusable signal keeps what runs.
+ * A change of model or of effort alone both miss the cache, so both are guarded,
+ * unless the cache is cold already. Fail-open: a missing or unusable signal
+ * keeps what runs.
  */
 export function decide(input: PolicyInput): PolicyOutput {
   const { decision, current } = input
   const bar = CONFIDENCE[input.decider ?? 'haiku']
+  const isCold = input.isCacheCold === true
+  const tag = isCold ? ' (cache cold)' : ''
   if (!decision) return { target: null, reason: 'no decision' }
   if (decision.tier === 'same') return { target: null, reason: 'follow-up' }
 
@@ -113,22 +124,23 @@ export function decide(input: PolicyInput): PolicyOutput {
     if (decision.confidence < bar.minUpgrade) {
       return { target: null, reason: `confidence ${decision.confidence.toFixed(2)} < upgrade threshold` }
     }
-    if (input.contextTokens > THRESHOLDS.upgradeGuardTokens) return cacheProtected(input.contextTokens)
+    if (!isCold && input.contextTokens > THRESHOLDS.upgradeGuardTokens) return cacheProtected(input.contextTokens)
 
-    return { target: target.id, reason: `upgrade ${label}` }
+    return { target: target.id, reason: `upgrade ${label}${tag}` }
   }
 
   if (decision.confidence < bar.minDowngrade) {
     return { target: null, reason: `confidence ${decision.confidence.toFixed(2)} < downgrade threshold` }
   }
   // Hysteresis, so the model does not flap on consecutive prompts; leaving
-  // the session's model is not a switch back, so it skips the cooldown.
-  if (current !== null && input.promptsSinceSwitch < THRESHOLDS.minPromptsBetweenSwitches) {
+  // the session's model is not a switch back, so it skips the cooldown. A cold
+  // cache skips it too: flapping costs nothing then.
+  if (!isCold && current !== null && input.promptsSinceSwitch < THRESHOLDS.minPromptsBetweenSwitches) {
     return { target: null, reason: `cooldown: ${input.promptsSinceSwitch} prompt(s) since last switch` }
   }
-  if (input.contextTokens > THRESHOLDS.cacheGuardTokens) return cacheProtected(input.contextTokens)
+  if (!isCold && input.contextTokens > THRESHOLDS.cacheGuardTokens) return cacheProtected(input.contextTokens)
 
-  return { target: target.id, reason: `${isSameModel ? 'effort' : 'downgrade'} ${label}` }
+  return { target: target.id, reason: `${isSameModel ? 'effort' : 'downgrade'} ${label}${tag}` }
 }
 
 function cacheProtected(contextTokens: number): PolicyOutput {
@@ -167,13 +179,32 @@ function rankOfModel(model: string): number {
 /** `opus` and `claude-opus-5-5` name the same model; two full ids must match. */
 function sameModel(a: string, b: string): boolean {
   if (a === b) return true
-  const family = (m: string) => /haiku|sonnet|opus|fable/.exec(m)?.[0]
   const isAlias = (m: string) => !m.includes('-')
-  return (isAlias(a) || isAlias(b)) && family(a) !== undefined && family(a) === family(b)
+  return (isAlias(a) || isAlias(b)) && familyOf(a) !== undefined && familyOf(a) === familyOf(b)
+}
+
+export type Family = 'haiku' | 'sonnet' | 'opus' | 'fable'
+
+/** The family an alias or a full id names, `haiku` for `claude-haiku-5-5`; undefined for a model of none. */
+export function familyOf(model: string): Family | undefined {
+  return /haiku|sonnet|opus|fable/.exec(model)?.[0] as Family | undefined
 }
 
 function short(model: string): string {
-  return /haiku|sonnet|opus|fable/.exec(model)?.[0] ?? model
+  return familyOf(model) ?? model
+}
+
+/**
+ * Whether the tier fell short of the task: a trivial turn that ran a long tool
+ * loop, or a turn that was switched and ended in an error or a refusal. The
+ * quality signal the savings are weighed against. False until the turn has ended.
+ */
+export function isUnderRouted(entry: { tier: string | null; action: LogEntry['action']; turn?: TurnOutcome }): boolean {
+  const turn = entry.turn
+  if (!turn) return false
+  if (entry.tier === TIERS[0]!.id && turn.steps >= THRESHOLDS.longTurnSteps) return true
+
+  return entry.action === 'switched' && (turn.reason === 'error' || turn.reason === 'refusal')
 }
 
 /** The decider's reply, `{"tier":..,"explore":..,"confidence":..}`, or null. */

@@ -4,7 +4,8 @@ A Claude Code mod that shifts to the right model for each prompt, the way a bike
 
 - **A small decider judges each prompt.** On the first model request of a turn, Haiku (low effort) answers how hard the task is, whether it needs exploring the codebase, and how sure it is. Bare acknowledgements ("yes", "go ahead", "vas-y") keep the current tier without asking anyone. Or the judge is [a model on your Mac](#a-local-decider): then the prompt goes to Claude only.
 - **Your session runs on the tier's model and effort.** Every main-loop request of the turn is sent with that tier's model and effort, tool steps included. Subagents keep their own settings.
-- **Switching is cache-aware.** Upgrades need confidence ≥ 0.5; downgrades need ≥ 0.85 (≥ 0.7 for the local model, whose probabilities are lower and calibrated) and a 2-prompt cooldown. A change of model or of effort drops the prompt cache, so past 60k tokens of context a downgrade is refused, and past 100k an upgrade is too.
+- **Switching is cache-aware.** Upgrades need confidence ≥ 0.5; downgrades need ≥ 0.85 (≥ 0.7 for the local model, whose probabilities are lower and calibrated) and a 2-prompt cooldown. A change of model or of effort drops the prompt cache, so past 60k tokens of context a downgrade is refused, and past 100k an upgrade is too. When the cache is gone anyway, after a compaction or an idle gap longer than its lifetime, the guards and the cooldown are lifted for the next prompt (see [below](#when-the-cache-is-cold)).
+- **It says what routing saves.** When a turn ends, its requests, its duration and its cost at list price go on its decision, against what the session model would have charged, and `/pignon stats` sums them with the turns where the tier fell short (see [below](#what-routing-costs-and-saves)).
 
 | Tier | Model / effort | For |
 | --- | --- | --- |
@@ -18,13 +19,13 @@ The table and thresholds live in [`hooks/policy.ts`](hooks/policy.ts).
 
 | Command | What it does |
 | --- | --- |
-| `/pignon` | Mode, decider (and whether the local model runs), tier in force, context size and the routing table |
+| `/pignon` | Mode, decider (and whether the local model runs), tier in force, context size and whether the cache is warm, this session's spend and savings, and the routing table |
 | `/pignon shadow` | Decide and show, without switching (the default) |
 | `/pignon live` | Apply the decisions |
 | `/pignon off` | Stop routing |
 | `/pignon unpin` | Route again after you picked a model with `/model` or `/effort` |
-| `/pignon log` | The last decisions: who decided (`haiku`, `laya` or `rule`), confidence, latency and reason |
-| `/pignon stats [days]` | Totals from the [decision log](#keeping-a-decision-log) across sessions and projects: agreement by confidence band and by project, latency, fallbacks |
+| `/pignon log` | The last decisions: who decided (`haiku`, `laya` or `rule`), confidence, latency and reason, and what the turn then did: steps, time, cost |
+| `/pignon stats [days]` | Totals from the [decision log](#keeping-a-decision-log) across sessions and projects: agreement by confidence band and by project, latency, fallbacks, what was spent and saved, the turns where the tier fell short |
 | `/pignon compare` | How often the local model and Haiku would run the same tier, and the prompts where they differ (see below) |
 | `/pignon watch` | Open a pane that shows each decision as it is made (see below) |
 | `/pignon setup` | Build the local decider (see below) |
@@ -32,6 +33,15 @@ The table and thresholds live in [`hooks/policy.ts`](hooks/policy.ts).
 Each routed prompt leaves a dim line in the transcript, e.g. `pignon trivial p=0.95 · 412 ms  👁 would switch to trivial · haiku/low (downgrade opus -> trivial)`, and the status line shows the tier in force. The mode is kept across sessions.
 
 Picking a model or effort by hand (`/model`, `/effort`) pins it: pignon pauses until `/pignon unpin`.
+
+### When the cache is cold
+
+The cache guard exists because a switch drops the cached prefix and the next request pays for all of the context again. Two moments make the guard moot, and pignon lifts it, and the cooldown, for the next prompt:
+
+- **After a compaction.** The conversation was rewritten, so nothing of it is cached. The context size is reset to what the compaction left.
+- **After an idle gap longer than the cache's lifetime.** Claude Code asks for a one-hour cache on a Claude subscription within its plan's usage, and a five-minute one on an API key, Bedrock, Vertex or Foundry, or once the subscription is in overage; `FORCE_PROMPT_CACHING_5M`, `CLAUDE_CODE_PROMPT_CACHE_TTL`, the `promptCacheTtl` setting and `ENABLE_PROMPT_CACHING_1H` override that, in this order. A mod can read the overrides but not the login or the overage, and the engine may also keep a cache alive on its own, so by default (*Prompt cache lifetime*, the `cacheTtl` option, on `auto`) pignon takes the override when there is one and otherwise assumes **an hour**: calling the cache cold while it is warm costs a full re-cache of the context, calling it warm while it is cold only forgoes a free switch. On an API key with no override set, choose `5m` (in `/config`, or `"cacheTtl": "5m"` in the same `pluginConfigs` block as `decider`) to get the free switches back; `1h` forces the long lifetime.
+
+The confidence bars still apply. A switch made this way says so in its reason (`upgrade trivial -> hard (cache cold)`), and `/pignon` shows the cache's state and the lifetime it goes by: `cache warm (last request 30 s ago), ttl 1h (assumed)`, `cold (idle 12 min)` or `cold (compacted)`.
 
 ## Install
 
@@ -45,7 +55,7 @@ Then watch a few decisions in shadow mode and run `/pignon live` when they look 
 
 ## Watching the decisions
 
-`/pignon watch` opens a pane beside the chat that draws each decision the moment it is made: the time, who decided (`laya`, `haiku` or `rule`), the start of the prompt as the decider read it (the local model reads the first 400 characters), the local model's probability for each tier, how long it took (the mod's clock and the daemon's own), what was done about it, and why. When the local model was chosen but Haiku decided, the pane says why: not running, timed out, an HTTP error, a dropped connection, or an unusable answer.
+`/pignon watch` opens a pane beside the chat that draws each decision the moment it is made: the time, who decided (`laya`, `haiku` or `rule`), the start of the prompt as the decider read it (the local model reads the first 400 characters), the local model's probability for each tier, how long it took (the mod's clock and the daemon's own), what was done about it, and why. When the local model was chosen but Haiku decided, the pane says why: not running, timed out, an HTTP error, a dropped connection, or an unusable answer. When the turn ends, one more line says what it did: `3 steps · 12 s · $0.012 (session model $0.090)`, in yellow with `under-routed` when the tier fell short (see [below](#what-routing-costs-and-saves)).
 
 Colour carries the same information at a glance: the first line takes the decider's colour, each tier is green (trivial), yellow (standard) or red (hard) with the tier the local model leans to in bold and the others dimmed, Haiku's second opinion is green when it agrees and yellow when it differs, and the outcome is green for a switch, yellow for a would-switch in shadow mode, and dim for a kept tier. The colours are theme keys, so they follow your theme.
 
@@ -104,7 +114,8 @@ Each decision then adds one JSON line to a file for the session in `$CLAUDE_CONF
 - the local model's probability for each tier, its decision and confidence;
 - Haiku's opinion, in shadow mode, once it has answered;
 - how long each took, the fallback cause when the local model was chosen but Haiku decided;
-- what was done (kept, would switch, switched), the tier before and after, the policy's reason, the session's model and the context size.
+- what was done (kept, would switch, switched), the tier before and after, the policy's reason, the session's model and the context size;
+- once the turn has ended, how many requests it made, why it ended, how long it took, the API's token counts and the model that answered, and the cost below.
 
 `/pignon stats` sums the newest 200 session files (`/pignon stats 7` keeps the last 7 days). The numbers below only show the format:
 
@@ -120,9 +131,21 @@ laya vs haiku: 301 compared · 268 agree (89%) · 33 differ · haiku gave no ans
   differences (laya → haiku): trivial → standard 12 · standard → hard 9
   by project:
     work/api                        92% agree (n=120)
+
+cost (estimated at list price): 180 turns priced
+  live:   spent $4.12 · $11.30 on the session model · saved $7.18 (64%)
+  shadow: would have saved $3.40 of $9.90
+  by tier: trivial 60 turns $0.30 · standard 90 turns $2.10 · hard 30 turns $1.72
+under-routed: 7 trivial turns ran 8+ steps · 2 switched turns ended in an error or a refusal
 ```
 
 The confidence bands are what the 0.7 downgrade bar is tuned against: if agreement stays high below it, the bar is too strict. With no ground truth, "agree" means the two judges would run the same tier, and the disagreements are the data.
+
+### What routing costs and saves
+
+When a turn ends, its token counts are priced three ways on the same numbers: on the model that answered, on the session's own model, and on the tier's model. Live mode reports what was spent and what the session model would have charged; shadow mode, where the turn ran on the session model, reports what the tier would have cost. The prices are the Claude API's list prices for Haiku 5.5, Sonnet 5.5 and Opus 5.5 ([`hooks/prices.ts`](hooks/prices.ts)); a model with no price there (Fable) leaves the turn unpriced. These are estimates: a cheaper model may spend more tokens on the same task, and a managed account's own prices are not visible to a mod.
+
+The savings are weighed against one quality signal, **under-routed** turns: a prompt judged `trivial` whose turn made 8 or more model requests (a trivial task does not loop that long, whichever model ran it), and a turn that was switched and ended in an error or a refusal. The watch pane and `/pignon log` flag them, and `/pignon stats` counts them. Read them with the savings: a routing that saves a third and under-routes one prompt in fifty is a different proposition from one that under-routes one in five.
 
 Files are rewritten whole on each decision (the engine has no append, and two sessions sharing a file would lose lines), capped at 3,000 decisions each. A file older than 90 days is deleted when a session starts with the log on; delete the folder to clear everything. The file also holds your project paths, so mind it when sharing.
 
@@ -133,6 +156,8 @@ Files are rewritten whole on each decision (the engine has no append, and two se
 - The local model cannot say whether a task needs exploring the codebase, so a trivial prompt that does is not moved up to standard.
 - By default one local daemon runs per session, about 1.3 to 1.5 GB each (930 MiB resident): ten open sessions cost ten copies. Choose the [shared daemon](#one-daemon-for-all-sessions) to run one copy for all of them.
 - `/model` keeps showing the session's model; the routed one is in the status line and the log.
+- The costs are estimates at list price (see [above](#what-routing-costs-and-saves)): a cheaper model may use more tokens, a managed account may pay other prices, and the cache write is priced at the 5-minute premium.
+- Whether the cache is still warm after an idle gap is inferred, not observed: the engine reads the real lifetime back from each response and may renew the cache itself, and tells neither to a mod. The default assumes an hour, the safe side (see [above](#when-the-cache-is-cold)).
 
 ## Requirements
 

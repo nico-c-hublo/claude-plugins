@@ -1,5 +1,6 @@
 import type { DecisionRecord, LogEntry } from '../types'
-import { effectiveTier } from './policy'
+import { THRESHOLDS, TIERS, effectiveTier, isUnderRouted } from './policy'
+import { usd } from './prices'
 
 // A session file holds this many records at most; the oldest go first.
 export const MAX_RECORDS = 3_000
@@ -45,6 +46,7 @@ export function recordOf(entry: LogEntry, context: RecordContext): DecisionRecor
     reason: entry.reason.slice(0, REASON_CHARS),
     model: context.model,
     contextTokens: context.contextTokens,
+    ...(entry.turn && { turn: entry.turn }),
   }
 }
 
@@ -164,5 +166,47 @@ export function summarize(records: readonly DecisionRecord[], sessions: number):
     lines.push(`live: switched ${live.filter(r => r.action === 'switched').length} of ${live.length}`)
   }
 
+  lines.push(...costLines(records))
+
   return lines.join('\n')
+}
+
+const sum = (values: readonly number[]) => values.reduce((total, value) => total + value, 0)
+
+// What the routed turns cost against what the session model would have, and
+// how often a tier fell short: the savings and the price paid for them.
+function costLines(records: readonly DecisionRecord[]): string[] {
+  const lines: string[] = []
+  const priced = records.filter(r => r.turn?.cost)
+  if (priced.length > 0) {
+    lines.push('', `cost (estimated at list price): ${priced.length} turn${priced.length === 1 ? '' : 's'} priced`)
+    const live = priced.filter(r => r.mode === 'live')
+    if (live.length > 0) {
+      const spent = sum(live.map(r => r.turn!.cost!.actual))
+      const onSessionModel = sum(live.map(r => r.turn!.cost!.onSessionModel))
+      lines.push(`  live:   spent ${usd(spent)} · ${usd(onSessionModel)} on the session model · saved ${usd(onSessionModel - spent)} (${share(onSessionModel - spent, onSessionModel)})`)
+    }
+    const shadow = priced.filter(r => r.mode === 'shadow')
+    if (shadow.length > 0) {
+      const onSessionModel = sum(shadow.map(r => r.turn!.cost!.onSessionModel))
+      const onTier = sum(shadow.map(r => r.turn!.cost!.onTier))
+      lines.push(`  shadow: would have saved ${usd(onSessionModel - onTier)} of ${usd(onSessionModel)}`)
+    }
+    const byTier = [...TIERS.map(t => t.id), null].flatMap(tier => {
+      const mine = priced.filter(r => r.tier === tier)
+      return mine.length === 0 ? [] : [`${tier ?? 'session model'} ${mine.length} turn${mine.length === 1 ? '' : 's'} ${usd(sum(mine.map(r => r.turn!.cost!.onTier)))}`]
+    })
+    lines.push(`  by tier: ${byTier.join(' · ')}`)
+  }
+
+  const ended = records.filter(r => r.turn)
+  const long = ended.filter(r => isUnderRouted(r) && r.tier === TIERS[0]!.id && r.turn!.steps >= THRESHOLDS.longTurnSteps)
+  const failed = ended.filter(r => isUnderRouted(r) && r.action === 'switched' && r.turn!.reason !== 'answer')
+  const parts = [
+    ...(long.length > 0 ? [`${long.length} trivial turn${long.length === 1 ? '' : 's'} ran ${THRESHOLDS.longTurnSteps}+ steps`] : []),
+    ...(failed.length > 0 ? [`${failed.length} switched turn${failed.length === 1 ? '' : 's'} ended in an error or a refusal`] : []),
+  ]
+  if (parts.length > 0) lines.push(`under-routed: ${parts.join(' · ')}`)
+
+  return lines
 }
