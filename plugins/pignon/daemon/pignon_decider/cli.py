@@ -6,6 +6,7 @@ import os
 import select
 import signal
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -52,6 +53,8 @@ def main(argv=None, load_scorer=None):
         "--stop-file",
         help="with --shared only: while this file exists the daemon does not start, and one serving leaves",
     )
+    # Set by the launcher on the daemon it starts; not for callers.
+    parser.add_argument("--status-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.idle_seconds < 1:
         parser.error("--idle-seconds must be positive")
@@ -93,13 +96,16 @@ def _run_shared(args, load_scorer):
         print(f"failed: {error}", flush=True)
         return 1
 
-    # Forked before the model is touched: Metal does not survive a fork.
-    pipe, is_daemon = _detach()
-    if not is_daemon:
+    if args.status_fd is None:
+        try:
+            pipe = _detach()
+        except OSError as error:
+            print(f"failed: {error}", flush=True)
+            return 1
         return _await_start(pipe)
 
-    status = _serve_shared(args, load_scorer, directory, pipe)
-    os.close(pipe)
+    status = _serve_shared(args, load_scorer, directory, args.status_fd)
+    os.close(args.status_fd)
 
     return status
 
@@ -117,28 +123,29 @@ def _private_directory(path):
 
 
 def _detach():
-    """Double-forks into a session of its own.
+    """Starts the daemon as a new process, in a session of its own, and returns the pipe it reports on.
 
-    Returns (pipe, False) in the caller, which reads the daemon's status from
-    `pipe`, and (pipe, True) in the daemon, which writes to it.
+    A new process, not a fork: a forked child cannot reach macOS XPC services, and
+    MLX needs MTLCompilerService whenever Metal's shader cache is cold (a fresh
+    venv, a cleared cache), where it fails with a RuntimeError. The daemon reruns
+    our own command line, so `ps` shows it as the launch did, plus `--status-fd`.
+    It is adopted by launchd once we exit.
     """
     reader, writer = os.pipe()
-    first = os.fork()
-    if first != 0:
+    try:
+        subprocess.Popen(
+            [sys.executable, *sys.orig_argv[1:], "--status-fd", str(writer)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(writer,),
+            start_new_session=True,
+        )
+    finally:
+        # Ours closed, the daemon's end is its only one: its exit shows as end of file.
         os.close(writer)
-        os.waitpid(first, 0)
-        return reader, False
 
-    os.close(reader)
-    os.setsid()
-    if os.fork() != 0:
-        os._exit(0)
-    null = os.open(os.devnull, os.O_RDWR)
-    for descriptor in (0, 1, 2):
-        os.dup2(null, descriptor)
-    os.close(null)
-
-    return writer, True
+    return reader
 
 
 def _await_start(pipe):
