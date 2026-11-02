@@ -300,6 +300,35 @@ class SharedDaemonTest(unittest.TestCase):
         self.assertTrue(wait_for(lambda: not is_alive(pid), seconds=5))
         self.assertFalse(os.path.exists(self.socket_path))
 
+    def test_does_not_start_while_the_stop_file_exists(self):
+        stop_file = f"{self.directory}/shared-stopped"
+        open(stop_file, "w").close()
+
+        done = self.launch("--stop-file", stop_file)
+
+        self.assertEqual((done.returncode, done.stdout), (1, "stopped\n"))
+        self.assertFalse(os.path.exists(self.socket_path))
+        self.assertFalse(os.path.exists(f"{self.directory}/lock"))
+
+    def test_leaves_once_the_stop_file_appears(self):
+        stop_file = f"{self.directory}/shared-stopped"
+        pid = int(self.launch("--stop-file", stop_file).stdout.split()[1])
+
+        open(stop_file, "w").close()
+
+        self.assertTrue(wait_for(lambda: not is_alive(pid), seconds=5), "the daemon never left")
+        self.assertFalse(os.path.exists(self.socket_path))
+
+    def test_holds_its_lock_where_lockf_sees_it(self):
+        """`/pignon daemon stop` clears a run directory only when `lockf -t 0` can take its lock."""
+        pid = int(self.launch().stdout.split()[1])
+        take = ["/usr/bin/lockf", "-s", "-k", "-t", "0", f"{self.directory}/lock", "/usr/bin/true"]
+
+        self.assertNotEqual(subprocess.run(take).returncode, 0)
+        os.kill(pid, signal.SIGTERM)
+        self.assertTrue(wait_for(lambda: not is_alive(pid), seconds=5))
+        self.assertEqual(subprocess.run(take).returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
