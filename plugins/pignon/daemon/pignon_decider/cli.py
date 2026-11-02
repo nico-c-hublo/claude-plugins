@@ -45,9 +45,13 @@ def main(argv=None, load_scorer=None):
     parser.add_argument(
         "--shared",
         action="store_true",
-        help="detach and serve every session, leaving after --idle-seconds without a request",
+        help="detach and serve every session, leaving after --idle-seconds without a prompt",
     )
     parser.add_argument("--idle-seconds", type=int, default=DEFAULT_IDLE_SECONDS, help="with --shared only")
+    parser.add_argument(
+        "--stop-file",
+        help="with --shared only: while this file exists the daemon does not start, and one serving leaves",
+    )
     args = parser.parse_args(argv)
     if args.idle_seconds < 1:
         parser.error("--idle-seconds must be positive")
@@ -79,7 +83,8 @@ def _run_shared(args, load_scorer):
     """Detaches from the caller, then serves until idle. The caller gets one line.
 
     The line is `ready PID` once the model answers, `running` when a daemon already
-    holds the lock, or `failed: Reason`. The exit status is 0 for the first two.
+    holds the lock, `stopped` while the stop file exists, or `failed: Reason`. The
+    exit status is 0 for the first two.
     """
     directory = os.path.dirname(args.socket)
     try:
@@ -148,9 +153,21 @@ def _await_start(pipe):
     return 0 if line.startswith(("ready", "running")) else 1
 
 
+def _is_stopped(stop_file):
+    """Whether `/pignon daemon stop` holds: its file is there."""
+    return stop_file is not None and os.path.exists(stop_file)
+
+
 def _serve_shared(args, load_scorer, directory, pipe):
+    # Read here, not only by the session that launched us: a stop written after it
+    # looked must still keep the model from loading.
+    if _is_stopped(args.stop_file):
+        os.write(pipe, b"stopped\n")
+        return 1
+
     # One daemon per socket directory, whoever launched it: the lock is held for
-    # the life of the process, so a second launch loads nothing.
+    # the life of the process, so a second launch loads nothing. `/pignon daemon
+    # stop` removes only a directory whose lock it can take.
     lock = os.open(f"{directory}/lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -165,7 +182,7 @@ def _serve_shared(args, load_scorer, directory, pipe):
     try:
         if load_scorer is None:
             from .mlx_scorer import load_scorer
-        daemon = serve(args.socket, load_scorer(args.model))
+        daemon = serve(args.socket, load_scorer(args.model), args.idle_seconds)
     except Exception as error:
         sys.stderr.write(f"pignon-decider: could not start: {type(error).__name__}\n")
         sys.stderr.flush()
@@ -179,7 +196,8 @@ def _serve_shared(args, load_scorer, directory, pipe):
     thread.start()
     os.write(pipe, f"ready {os.getpid()}\n".encode())
     while not stop.wait(PARENT_CHECK_SECONDS):
-        if time.monotonic() - daemon.last_activity > args.idle_seconds:
+        # The stop file too: a daemon the stop's `ps` did not see still leaves.
+        if time.monotonic() - daemon.last_activity > args.idle_seconds or _is_stopped(args.stop_file):
             break
     daemon.shutdown()
     thread.join()

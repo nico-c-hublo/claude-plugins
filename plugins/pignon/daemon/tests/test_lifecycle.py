@@ -1,5 +1,6 @@
 """The daemon as a process: started, signalled and orphaned for real."""
 
+import contextlib
 import os
 import select
 import shutil
@@ -81,7 +82,9 @@ class LifecycleTest(unittest.TestCase):
         status, body = request(self.socket_path, "GET", "/health")
 
         self.assertEqual(status, 200)
-        self.assertEqual(body, {"status": "ok", "ready": True, "pid": process.pid})
+        self.assertEqual((body["status"], body["ready"], body["pid"]), ("ok", True, process.pid))
+        # A session's own daemon leaves with its session, not when idle.
+        self.assertIsNone(body["idleLimitSeconds"])
 
 
     def test_goes_offline_and_drops_tokens_and_proxies_before_loading_the_model(self):
@@ -224,15 +227,28 @@ class SharedDaemonTest(unittest.TestCase):
         self.assertTrue(wait_for(lambda: not is_alive(pid), seconds=6), "the daemon never left")
         self.assertFalse(os.path.exists(self.socket_path))
 
-    def test_a_request_keeps_it_from_leaving(self):
+    def test_a_prompt_keeps_it_from_leaving(self):
         pid = int(self.launch("--idle-seconds", "2").stdout.split()[1])
 
         for _ in range(7):  # 3.5 s of traffic, longer than the idle time
             time.sleep(0.5)
-            request(self.socket_path, "GET", "/health")
+            request(self.socket_path, "POST", "/decide", {"prompt": "rename foo"})
 
         self.assertTrue(is_alive(pid))
         self.assertTrue(wait_for(lambda: not is_alive(pid), seconds=6), "the daemon never left")
+
+    def test_a_look_at_its_health_does_not_keep_it(self):
+        pid = int(self.launch("--idle-seconds", "2").stdout.split()[1])
+
+        _, body = request(self.socket_path, "GET", "/health")
+        self.assertEqual(body["idleLimitSeconds"], 2)
+        # Asked every half second, as a status view could; it leaves on time all the same.
+        deadline = time.monotonic() + 6
+        while is_alive(pid) and time.monotonic() < deadline:
+            with contextlib.suppress(OSError):
+                request(self.socket_path, "GET", "/health")
+            time.sleep(0.5)
+        self.assertFalse(is_alive(pid), "the daemon never left")
 
     def test_the_next_launch_after_it_left_starts_a_new_daemon(self):
         old = int(self.launch("--idle-seconds", "1").stdout.split()[1])
@@ -283,6 +299,35 @@ class SharedDaemonTest(unittest.TestCase):
 
         self.assertTrue(wait_for(lambda: not is_alive(pid), seconds=5))
         self.assertFalse(os.path.exists(self.socket_path))
+
+    def test_does_not_start_while_the_stop_file_exists(self):
+        stop_file = f"{self.directory}/shared-stopped"
+        open(stop_file, "w").close()
+
+        done = self.launch("--stop-file", stop_file)
+
+        self.assertEqual((done.returncode, done.stdout), (1, "stopped\n"))
+        self.assertFalse(os.path.exists(self.socket_path))
+        self.assertFalse(os.path.exists(f"{self.directory}/lock"))
+
+    def test_leaves_once_the_stop_file_appears(self):
+        stop_file = f"{self.directory}/shared-stopped"
+        pid = int(self.launch("--stop-file", stop_file).stdout.split()[1])
+
+        open(stop_file, "w").close()
+
+        self.assertTrue(wait_for(lambda: not is_alive(pid), seconds=5), "the daemon never left")
+        self.assertFalse(os.path.exists(self.socket_path))
+
+    def test_holds_its_lock_where_lockf_sees_it(self):
+        """`/pignon daemon stop` clears a run directory only when `lockf -t 0` can take its lock."""
+        pid = int(self.launch().stdout.split()[1])
+        take = ["/usr/bin/lockf", "-s", "-k", "-t", "0", f"{self.directory}/lock", "/usr/bin/true"]
+
+        self.assertNotEqual(subprocess.run(take).returncode, 0)
+        os.kill(pid, signal.SIGTERM)
+        self.assertTrue(wait_for(lambda: not is_alive(pid), seconds=5))
+        self.assertEqual(subprocess.run(take).returncode, 0)
 
 
 if __name__ == "__main__":

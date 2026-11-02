@@ -25,14 +25,31 @@ MAX_PROMPT_CHARS = 400
 # The conductor's labels, as pignon's tiers (see hooks/policy.ts).
 TIER_OF = {"smol": "trivial", "default": "standard", "slow": "hard"}
 
+# The plugin.json of the mod this daemon ships with: daemon/pignon_decider/ is two levels below it.
+MANIFEST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".claude-plugin", "plugin.json")
+
+
+def _mod_version():
+    """The mod's version, so `/pignon daemon` can tell a daemon left by an older one; None when unreadable."""
+    try:
+        with open(MANIFEST) as manifest:
+            version = json.load(manifest).get("version")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return version if isinstance(version, str) else None
+
 
 class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
 
-    def __init__(self, socket_path, scorer):
+    def __init__(self, socket_path, scorer, idle_seconds=None):
         self.scorer = scorer
-        # When a request last arrived, for a daemon that exits once nobody uses it.
-        self.last_activity = time.monotonic()
+        self.version = _mod_version()
+        self.started = time.monotonic()
+        # When a prompt last arrived, for a daemon that exits once nobody uses it.
+        self.last_activity = self.started
+        # How long a shared daemon waits for one; None for a session's own.
+        self.idle_seconds = idle_seconds
         # One forward pass at a time: the model is not safe to call concurrently.
         self.scoring = threading.Lock()
         super().__init__(socket_path, _Handler)
@@ -53,23 +70,37 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     timeout = 5
 
     def do_GET(self):
-        self.server.last_activity = time.monotonic()
+        # Not activity: a look at the daemon's state must not keep it from leaving.
         if self.path != "/health":
             self._refuse()
             return
-        # The pid is how a client inspects the sockets of the process it reached.
-        self._send(200, {"status": "ok", "ready": self.server.scorer.ready, "pid": os.getpid()})
+        now = time.monotonic()
+        server = self.server
+        self._send(
+            200,
+            {
+                "status": "ok",
+                "ready": server.scorer.ready,
+                # The pid is how a client inspects the sockets of the process it reached.
+                "pid": os.getpid(),
+                "version": server.version,
+                "uptimeSeconds": round(now - server.started),
+                "idleSeconds": round(now - server.last_activity),
+                "idleLimitSeconds": server.idle_seconds,
+            },
+        )
 
     do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = lambda self: self._refuse()
 
     def do_POST(self):
-        self.server.last_activity = time.monotonic()
         if self.path != "/decide":
             self._refuse()
             return
         parsed = self._parse_decide_request()
         if parsed is None:
             return
+        # Only a prompt is activity: a wrong path or a malformed body is not one.
+        self.server.last_activity = time.monotonic()
         prompt, context_tokens = parsed
         started = time.perf_counter()
         try:
@@ -161,8 +192,11 @@ def _clear_stale_socket(path):
             raise FileExistsError(f"another daemon is serving on {path}")
 
 
-def serve(socket_path, scorer):
-    """Binds `socket_path` and returns the server; the caller runs `serve_forever`."""
+def serve(socket_path, scorer, idle_seconds=None):
+    """Binds `socket_path` and returns the server; the caller runs `serve_forever`.
+
+    `idle_seconds` is only reported: the shared daemon's loop is what leaves.
+    """
     if len(os.fsencode(socket_path)) > MAX_SOCKET_PATH_BYTES:
         raise ValueError(f"{socket_path} is longer than the {MAX_SOCKET_PATH_BYTES} bytes a socket path may have")
     directory = os.path.dirname(socket_path)
@@ -173,6 +207,6 @@ def serve(socket_path, scorer):
     # after bind would leave a window. Called before any thread is started.
     previous = os.umask(0o177)
     try:
-        return _Server(socket_path, scorer)
+        return _Server(socket_path, scorer, idle_seconds)
     finally:
         os.umask(previous)

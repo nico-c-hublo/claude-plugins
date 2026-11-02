@@ -58,6 +58,12 @@ const LAUNCH_TIMEOUT_MS = 130_000
 const AUDIT_EVERY_MS = 5 * 60_000
 // lsof takes tens of milliseconds; one that hangs would stall every prompt, and counts as a failed check.
 const LSOF_TIMEOUT_MS = 2_000
+// A shared daemon that would not start is tried again on a prompt, at most this often.
+const RETRY_EVERY_MS = 60_000
+// How long `/pignon daemon stop` waits for the daemons it signalled to exit.
+const STOP_WAIT_MS = 5_000
+// In the config dir's pignon folder while `/pignon daemon stop` holds: no session starts a shared daemon.
+const STOPPED_FILE = 'shared-stopped'
 
 // How long the API keeps a cached prefix without a request: past it, a switch costs nothing.
 type CacheTtl = '5m' | '1h'
@@ -231,19 +237,35 @@ async function askLocal(
   return { cause: 'it answered nothing usable' }
 }
 
-// The pid of the daemon answering on `socketPath`, or null when none does.
-async function healthPid($: EngineInterface, socketPath: string): Promise<number | null> {
+// What a daemon says of itself. A daemon from before 0.1.7 gives its pid only.
+type Health = { pid: number; version?: string; uptimeSeconds?: number; idleSeconds?: number; idleLimitSeconds?: number }
+
+// The daemon answering on `socketPath`, or null when none does. Asking is not a
+// prompt: it does not keep a shared daemon from leaving.
+async function healthOf($: EngineInterface, socketPath: string): Promise<Health | null> {
   const answer = $.http.fetch('http://pignon/health', { socketPath })
   const reply = await Promise.race([answer, $.clock.sleep(LOCAL_TIMEOUT_MS).then(() => null)]).catch(() => null)
   if (!reply?.ok) return null
 
   try {
-    const { pid } = JSON.parse(reply.text) as { pid?: unknown }
+    const body = JSON.parse(reply.text) as Record<string, unknown>
+    if (typeof body.pid !== 'number') return null
+    const number = (key: string) => (typeof body[key] === 'number' ? { [key]: body[key] as number } : {})
 
-    return typeof pid === 'number' ? pid : null
+    return {
+      pid: body.pid,
+      ...(typeof body.version === 'string' && { version: body.version }),
+      ...number('uptimeSeconds'),
+      ...number('idleSeconds'),
+      ...number('idleLimitSeconds'),
+    }
   } catch {
     return null
   }
+}
+
+async function healthPid($: EngineInterface, socketPath: string): Promise<number | null> {
+  return (await healthOf($, socketPath))?.pid ?? null
 }
 
 // FNV-1a, enough to tell mod folders apart in a directory name.
@@ -254,20 +276,73 @@ function shortHash(text: string): string {
   return (hash >>> 0).toString(16).padStart(8, '0')
 }
 
-// The shared daemon's socket, in a directory per mod folder: a new version of the
-// mod starts a daemon of its own, and the old one leaves when it has been idle.
-async function sharedSocket($: EngineInterface): Promise<string> {
-  return `${await dataHome($)}/run-${shortHash($.plugin.root)}/s.sock`
+// The shared daemon's directory, one per mod folder: a new version of the mod
+// starts a daemon of its own, and the old one leaves when it has been idle.
+function sharedRun($: EngineInterface): string {
+  return `run-${shortHash($.plugin.root)}`
 }
+
+async function sharedSocket($: EngineInterface): Promise<string> {
+  return `${await dataHome($)}/${sharedRun($)}/s.sock`
+}
+
+// Whether `/pignon daemon stop` holds: then no session of this config dir starts
+// a shared daemon until `/pignon daemon start`.
+async function isStoppedByHand($: EngineInterface): Promise<boolean> {
+  return $.fs.exists(`${await dataHome($)}/${STOPPED_FILE}`).catch(() => false)
+}
+
+// The local model as this session last saw it. `down`: it did not start, or
+// left; `stopped`: by `/pignon daemon stop`; `refused`: it held a network socket,
+// or its sockets could not be checked. Haiku decides in all three.
+type DaemonState = 'starting' | 'up' | 'down' | 'stopped' | 'refused'
 
 // What a session knows of the local model's daemon.
 type LocalDaemon = {
   // Set once the daemon answers; routing asks Haiku until then.
   socketPath: string | null
   isStarting: boolean
+  state: DaemonState
+  // When a shared daemon was last tried, so one that will not start is not tried on every prompt.
+  triedAt: number
   // The process whose sockets were last checked, and when; a new one is checked again.
   auditedPid: number | null
   auditedAt: number
+}
+
+// The status line: pignon's mode and tier, then the local model's state when it judges.
+const STATE_WORD: Record<DaemonState, string> = {
+  starting: 'laya starting',
+  up: 'laya up',
+  down: 'laya down → haiku',
+  stopped: 'laya stopped → haiku',
+  refused: 'laya refused → haiku',
+}
+let statusBase: string | undefined
+let statusDaemon: DaemonState | undefined
+
+function paint($: EngineInterface): void {
+  $.ui.status(statusBase === undefined ? undefined : statusDaemon === undefined ? statusBase : `${statusBase} · ${STATE_WORD[statusDaemon]}`)
+}
+
+function showStatus($: EngineInterface, base: string | undefined): void {
+  statusBase = base
+  paint($)
+}
+
+function setState($: EngineInterface, daemon: LocalDaemon, state: DaemonState): void {
+  daemon.state = state
+  statusDaemon = state
+  paint($)
+}
+
+// Why the local model did not decide a prompt, when it was not reached at all.
+const NOT_REACHED: Record<DaemonState, string> = {
+  starting: 'it is starting',
+  up: 'it is not running',
+  down: 'it is not running',
+  stopped: 'it was stopped (/pignon daemon start)',
+  refused: 'it was refused (a network socket, or sockets that could not be checked)',
 }
 
 // Looks at the daemon's sockets again when the last look is old, and stops using
@@ -288,39 +363,72 @@ async function auditAgain($: EngineInterface, daemon: LocalDaemon): Promise<void
   $.ui.toast(`pignon: the local model (pid ${daemon.auditedPid}) ${problem}, so it is not used. Haiku decides.`)
   daemon.socketPath = null
   daemon.auditedPid = null
+  setState($, daemon, 'refused')
+}
+
+// Whether a session without a shared daemon should try to reach one now: once
+// `/pignon daemon start` lifted a stop, or a minute after a try that failed ended.
+async function shouldRetry($: EngineInterface, daemon: LocalDaemon): Promise<boolean> {
+  if (daemon.isStarting) return false
+  if (daemon.state === 'stopped') return !(await isStoppedByHand($))
+  if (daemon.state !== 'down') return false
+  const age = (await $.clock.now()) - daemon.triedAt
+
+  return age < 0 || age >= RETRY_EVERY_MS
 }
 
 // Reaches the shared daemon, starting it when nothing answers. It never throws:
-// when it cannot, Haiku decides until the next try, which a lost connection triggers.
+// when it cannot, Haiku decides until the next try (a lost connection, or a
+// prompt a minute later).
 async function connectShared($: EngineInterface, daemon: LocalDaemon): Promise<void> {
   if (daemon.isStarting) return
   daemon.isStarting = true
   try {
+    if (await isStoppedByHand($)) {
+      daemon.socketPath = null
+      setState($, daemon, 'stopped')
+
+      return
+    }
+    setState($, daemon, 'starting')
     const path = await sharedSocket($)
     let pid = await healthPid($, path)
     if (pid === null) {
       const home = await dataHome($)
+      // The daemon reads the stop file itself, before it loads the model and while
+      // it serves: a stop written during this launch still holds.
       const launched = await $.process
-        .run([`${home}/venv/bin/python`, '-m', 'pignon_decider', '--socket', path, '--model', `${home}/model`, '--shared'], {
-          cwd: `${$.plugin.root}/daemon`,
-          timeoutMs: LAUNCH_TIMEOUT_MS,
-        })
+        .run(
+          [`${home}/venv/bin/python`, '-m', 'pignon_decider', '--socket', path, '--model', `${home}/model`, '--shared', '--stop-file', `${home}/${STOPPED_FILE}`],
+          { cwd: `${$.plugin.root}/daemon`, timeoutMs: LAUNCH_TIMEOUT_MS },
+        )
         .catch(() => null)
+      if (await isStoppedByHand($)) {
+        setState($, daemon, 'stopped')
+
+        return
+      }
       if (launched === null || launched.exitCode !== 0) {
         const said = launched ? ` (${launched.stdout.trim() || 'no answer'})` : ''
         $.ui.toast(`pignon: the shared local model did not start${said}. Haiku decides. /pignon setup builds it.`)
+        setState($, daemon, 'down')
 
         return
       }
       pid = await healthPid($, path)
     }
-    if (pid === null) return
+    if (pid === null) {
+      setState($, daemon, 'down')
+
+      return
+    }
 
     const now = await $.clock.now()
     if (pid !== daemon.auditedPid || now - daemon.auditedAt >= AUDIT_EVERY_MS) {
       const problem = await socketProblem($, String(pid))
       if (problem !== null) {
         $.ui.toast(`pignon: the shared local model (pid ${pid}) ${problem}, so it is not used. Haiku decides.`)
+        setState($, daemon, 'refused')
 
         return
       }
@@ -328,9 +436,200 @@ async function connectShared($: EngineInterface, daemon: LocalDaemon): Promise<v
       daemon.auditedAt = now
     }
     daemon.socketPath = path
+    setState($, daemon, 'up')
   } finally {
+    // When the try ended, not began: a launch that failed after its two minutes is not tried again at once.
+    daemon.triedAt = await $.clock.now().catch(() => daemon.triedAt)
     daemon.isStarting = false
   }
+}
+
+// A shared daemon of this config dir, as `ps` lists it: every version's, and
+// whichever session started it. Found without asking it anything, so looking
+// does not reset an older daemon's idle time.
+type SharedProcess = { pid: number; run: string; uptimeSeconds: number; rssKb: number }
+
+async function sharedProcesses($: EngineInterface): Promise<SharedProcess[]> {
+  const home = await dataHome($)
+  // Without -a, ps lists only this user's processes; -x adds those with no terminal.
+  // Full paths, as for lsof: what ps prints decides what is signalled.
+  const listed = await $.process.run(['/bin/ps', '-xo', 'pid=,etime=,rss=,command=']).catch(() => null)
+  if (listed === null || listed.exitCode !== 0) return []
+  const prefix = `--socket ${home}/`
+
+  return listed.stdout.split('\n').flatMap(line => {
+    const fields = /^\s*(\d+)\s+(\S+)\s+(\d+)\s+(.*)$/.exec(line)
+    const command = fields?.[4] ?? ''
+    if (!fields || !command.includes(' -m pignon_decider ') || !command.includes(' --shared')) return []
+    const at = command.indexOf(prefix)
+    const run = at < 0 ? undefined : /^run-[0-9a-f]{8}(?=\/s\.sock )/.exec(command.slice(at + prefix.length))?.[0]
+
+    return run ? [{ pid: Number(fields[1]), run, uptimeSeconds: elapsedSeconds(fields[2] ?? ''), rssKb: Number(fields[3]) }] : []
+  })
+}
+
+// ps's etime, `[[dd-]hh:]mm:ss`, in seconds.
+function elapsedSeconds(etime: string): number {
+  const [days, clock] = etime.includes('-') ? etime.split('-') : ['0', etime]
+
+  return Number(days) * 86_400 + (clock ?? '').split(':').reduce((sum, part) => sum * 60 + Number(part), 0)
+}
+
+function duration(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)} s`
+  if (seconds < 3_600) return `${Math.round(seconds / 60)} min`
+
+  return `${Math.floor(seconds / 3_600)} h ${Math.round((seconds % 3_600) / 60)} min`
+}
+
+// Which installed version each run directory belongs to: the mod's siblings in
+// the plugin cache are its other versions, and a run directory is named after one.
+async function versionsByRun($: EngineInterface): Promise<Map<string, string>> {
+  const parent = $.plugin.root.replace(/\/[^/]+$/, '')
+  const siblings = await $.fs.list(parent).catch(() => [])
+
+  return new Map(
+    siblings.filter(entry => entry.kind === 'dir' && /^\d+\.\d+\.\d+/.test(entry.name)).map(entry => [`run-${shortHash(`${parent}/${entry.name}`)}`, entry.name]),
+  )
+}
+
+// Signals each daemon and waits, a few seconds at most, for them to exit.
+// Returns the pids still running.
+async function terminate($: EngineInterface, pids: readonly number[]): Promise<number[]> {
+  if (pids.length === 0) return []
+  await $.process.run(['/bin/kill', '-TERM', ...pids.map(String)]).catch(() => null)
+  const deadline = (await $.clock.now()) + STOP_WAIT_MS
+  for (;;) {
+    const running = new Set((await sharedProcesses($)).map(p => p.pid))
+    const left = pids.filter(pid => running.has(pid))
+    if (left.length === 0 || (await $.clock.now()) >= deadline) return left
+    await $.clock.sleep(200)
+  }
+}
+
+// Removes the run directories no daemon is in, except this version's: an exited
+// daemon leaves its lock and log behind. A daemon takes its directory's lock
+// before it loads the model and holds it for life, so the lock is what says a
+// directory is idle, not a `ps` taken earlier: a session of an older version may
+// be relaunching its daemon right now. `lockf -t 0` takes the lock or gives up at
+// once, removes the files while it holds it, then the lock file. Only names pignon
+// makes, and only the files it puts there; a directory holding anything else stays.
+async function removeIdleRuns($: EngineInterface): Promise<void> {
+  const home = await dataHome($)
+  const entries = await $.fs.list(home).catch(() => [])
+  for (const entry of entries) {
+    if (entry.kind !== 'dir' || !/^run-[0-9a-f]{8}$/.test(entry.name) || entry.name === sharedRun($)) continue
+    const dir = `${home}/${entry.name}`
+    const cleared = await $.process.run(['/usr/bin/lockf', '-s', '-t', '0', `${dir}/lock`, '/bin/rm', '-f', `${dir}/daemon.log`, `${dir}/s.sock`]).catch(() => null)
+    if (cleared?.exitCode === 0) await $.process.run(['/bin/rmdir', dir]).catch(() => null)
+  }
+}
+
+// This mod's version, from its manifest; undefined when unreadable.
+async function modVersion($: EngineInterface): Promise<string | undefined> {
+  try {
+    const version = (JSON.parse((await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`)) as string) as { version?: unknown }).version
+
+    return typeof version === 'string' ? version : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// What a daemon from another mod folder is to this session. A folder is not a
+// version: the same version installed twice (the cache and a clone) has two.
+function otherFolderLabel(version: string | undefined, ours: string | undefined): string {
+  if (version === undefined || ours === undefined) return 'another mod folder: its sessions use it until they restart'
+  if (version === ours) return 'this version from another mod folder: its sessions use it'
+
+  return 'another version: its sessions use it until they restart'
+}
+
+// `/pignon daemon`: every shared daemon of this config dir, and what this session uses.
+// Only this version's daemon is asked anything, and asking is not a prompt.
+async function daemonReport($: EngineInterface, daemon: LocalDaemon, decider: DeciderId, isShared: boolean): Promise<string> {
+  const home = await dataHome($)
+  const [found, versions, health, ours] = await Promise.all([sharedProcesses($), versionsByRun($), healthOf($, await sharedSocket($)), modVersion($)])
+  const mine = sharedRun($)
+  const lines = [
+    decider === 'haiku'
+      ? 'This session: Haiku judges; the local model is not used.'
+      : isShared
+        ? `This session: laya, shared daemon, ${daemon.state}${daemon.auditedPid !== null && daemon.state === 'up' ? ` (pid ${daemon.auditedPid})` : ''}.`
+        : `This session: laya, its own daemon, ${daemon.state}${daemon.auditedPid !== null && daemon.state === 'up' ? ` (pid ${daemon.auditedPid})` : ''}; it stops with the session.`,
+  ]
+  if (found.length === 0) {
+    lines.push(`No shared daemon is running for ${home}.`)
+  } else {
+    lines.push(`Shared daemons for ${home}:`)
+    for (const p of found) {
+      const isMine = p.run === mine
+      const version = isMine ? (health?.version ?? ours) : versions.get(p.run)
+      const about = [
+        `pid ${p.pid}`,
+        `${version ?? 'unknown version'} (${isMine ? 'this version' : otherFolderLabel(version, ours)})`,
+        `up ${duration(p.uptimeSeconds)}`,
+        ...(isMine && health?.pid === p.pid && health.idleSeconds !== undefined
+          ? [
+              `last prompt ${duration(health.idleSeconds)} ago${
+                health.idleLimitSeconds !== undefined ? `, leaves in ${duration(Math.max(0, health.idleLimitSeconds - health.idleSeconds))}` : ''
+              }`,
+            ]
+          : ['leaves after 30 min without a prompt']),
+        `${Math.round(p.rssKb / 1024)} MiB`,
+      ]
+      lines.push(`  ${about.join(' · ')}`)
+    }
+  }
+  if (await isStoppedByHand($)) lines.push('Stopped by hand: no session starts a shared daemon until /pignon daemon start.')
+  lines.push(
+    isShared
+      ? 'Commands: /pignon daemon stop | start | restart'
+      : 'stop, start and restart act on the shared daemon: set "How the local model runs" to shared in /config to use one.',
+  )
+
+  return lines.join('\n')
+}
+
+// `/pignon daemon stop`: every shared daemon of this config dir, whatever its
+// version, and none starts again until `/pignon daemon start`. Written first, so
+// a session that loses its connection meanwhile finds the stop and stays on Haiku,
+// and a daemon launched meanwhile reads it and leaves (one `ps` could miss it).
+// `isHeld` is false when the file could not be written: then nothing was stopped.
+async function stopShared($: EngineInterface, daemon: LocalDaemon): Promise<{ text: string; isHeld: boolean }> {
+  const home = await dataHome($)
+  const isHeld = await $.fs.write(`${home}/${STOPPED_FILE}`, `${new Date(await $.clock.now()).toISOString()}\n`).then(
+    () => true,
+    () => false,
+  )
+  if (!isHeld) return { text: `pignon could not write ${home}/${STOPPED_FILE}, so the stop would not hold: nothing was stopped.`, isHeld }
+  daemon.socketPath = null
+  daemon.auditedPid = null
+  setState($, daemon, 'stopped')
+  const found = await sharedProcesses($)
+  const left = await terminate($, found.map(p => p.pid))
+  await removeIdleRuns($)
+  const freed = found.filter(p => !left.includes(p.pid)).reduce((sum, p) => sum + p.rssKb, 0)
+  const stopped = found.length - left.length
+  const text = [
+    found.length === 0 ? 'No shared daemon was running.' : `Stopped ${stopped} shared daemon${stopped === 1 ? '' : 's'}, about ${Math.round(freed / 1024)} MiB freed.`,
+    ...(left.length > 0 ? [`Still running after ${STOP_WAIT_MS / 1000} s: pid ${left.join(', ')}.`] : []),
+  ]
+
+  return { text: text.join(' '), isHeld }
+}
+
+const STOP_HOLDS =
+  'Haiku decides in every session of this config dir until /pignon daemon start. Sessions of an older pignon do not know the stop and start theirs again.'
+
+// `/pignon daemon start`: lifts the stop and starts this version's daemon, or joins it.
+async function startShared($: EngineInterface, daemon: LocalDaemon): Promise<string> {
+  await $.process.run(['/bin/rm', '-f', `${await dataHome($)}/${STOPPED_FILE}`]).catch(() => null)
+  await connectShared($, daemon)
+  if (daemon.state !== 'up') return `The shared daemon is ${daemon.state}: Haiku decides. /pignon daemon says more.`
+  const health = daemon.socketPath ? await healthOf($, daemon.socketPath) : null
+
+  return `The shared daemon is up (pid ${daemon.auditedPid}${health?.version ? `, ${health.version}` : ''}). Other sessions use it from their next prompt.`
 }
 
 // The decision log (see record.ts): one file per session, rewritten whole, since
@@ -522,31 +821,36 @@ async function launchDaemon($: EngineInterface, daemon: LocalDaemon): Promise<vo
   const temp = ((await $.env.get('TMPDIR')) ?? '/tmp').replace(/\/+$/, '')
   // A directory of its own, so the socket is private whatever the rest of the temp folder allows.
   const directory = `${temp}/pignon-${randomHex(4)}`
-  await $.process.run(['mkdir', '-m', '700', directory])
+  setState($, daemon, 'starting')
 
-  const child = $.process.spawn({
-    argv: [`${home}/venv/bin/python`, '-m', 'pignon_decider', '--socket', `${directory}/s.sock`, '--model', `${home}/model`],
-    cwd: `${$.plugin.root}/daemon`,
-  })
   let isReady = false
   try {
+    // Inside the try: a folder or a spawn refused ends in `down`, not in `starting` for the whole session.
+    await $.process.run(['mkdir', '-m', '700', directory])
+    const child = $.process.spawn({
+      argv: [`${home}/venv/bin/python`, '-m', 'pignon_decider', '--socket', `${directory}/s.sock`, '--model', `${home}/model`],
+      cwd: `${$.plugin.root}/daemon`,
+    })
     for await (const piece of child) {
       const pid = piece.stream === 'stdout' ? /^ready (\d+)/m.exec(piece.text)?.[1] : undefined
       if (pid === undefined) continue
       const problem = await socketProblem($, pid)
       if (problem !== null) {
         $.ui.toast(`pignon: the local model ${problem}, so it is stopped. Haiku decides.`)
+        setState($, daemon, 'refused')
         break // leaving the loop kills the child
       }
       daemon.auditedPid = Number(pid)
       daemon.auditedAt = await $.clock.now()
       daemon.socketPath = `${directory}/s.sock`
       isReady = true
+      setState($, daemon, 'up')
     }
   } finally {
     // However the child ended, even by a stream that failed, it is not asked again.
     daemon.socketPath = null
     daemon.auditedPid = null
+    if (daemon.state !== 'refused') setState($, daemon, 'down')
     if (isReady) $.ui.toast('pignon: the local model stopped. Haiku decides until you restart the session.')
   }
 }
@@ -815,14 +1119,16 @@ async function route(
   if (!decision && wantsLocal) {
     await auditAgain($, daemon)
     if (daemon.socketPath === null) {
-      fallback = daemon.isStarting ? 'it is starting' : 'it is not running'
+      fallback = NOT_REACHED[daemon.state]
+      if (isShared && (await shouldRetry($, daemon))) void connectShared($, daemon)
     } else {
       const asked = await askLocal($, daemon.socketPath, text, contextSize)
       if ('cause' in asked) {
         fallback = asked.cause
-        // A shared daemon leaves when idle: start it again for the next prompt.
+        // A shared daemon leaves when idle, or is stopped: start it again for the next prompt, unless stopped by hand.
         if (asked.cause === CONNECTION_FAILED && isShared) {
           daemon.socketPath = null
+          setState($, daemon, 'down')
           void connectShared($, daemon)
         }
       } else local = asked
@@ -900,7 +1206,7 @@ async function route(
   const icon = action === 'switched' ? '⚡' : action === 'would switch' ? '👁' : '·'
   const outcome = action === 'kept' ? `kept ${describe(now)}` : `${action} to ${describe(target)}`
   $.ui.log(`pignon ${verdict}  ${icon} ${outcome} (${reason})`)
-  $.ui.status(`pignon ${mode}: ${describe(now)}`)
+  showStatus($, `pignon ${mode}: ${describe(now)}`)
 
   return { id, ...(asksOracle && { oracle: { text, tier: was } }) }
 }
@@ -915,7 +1221,7 @@ async function hasPinned($: EngineInterface, e: { model: string; effort?: unknow
     await update($, isPinned, () => true)
     await update($, current, () => null)
     $.ui.toast(`pignon paused: you picked ${e.model}. /pignon unpin to resume.`)
-    $.ui.status('pignon pinned')
+    showStatus($, 'pignon pinned')
   }
 
   return read($, isPinned)
@@ -923,7 +1229,7 @@ async function hasPinned($: EngineInterface, e: { model: string; effort?: unknow
 
 export const register: Register = (on, options) => {
   const decider: DeciderId = options.decider === 'laya' ? 'laya' : 'haiku'
-  const daemon: LocalDaemon = { socketPath: null, isStarting: false, auditedPid: null, auditedAt: 0 }
+  const daemon: LocalDaemon = { socketPath: null, isStarting: false, state: 'starting', triedAt: 0, auditedPid: null, auditedAt: 0 }
   // The prompt each main turn starts with, read by its first model request.
   const prompts = new Map<string, string>()
   const isShared = decider === 'laya' && options.daemon === 'shared'
@@ -940,12 +1246,18 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'pignon',
-      description: 'Model router: status, live, shadow, off, unpin, log, compare, mark, stats, watch, setup',
-      argumentHint: '[live|shadow|off|unpin|log|compare|mark|stats|watch|setup]',
+      description: 'Model router: status, live, shadow, off, unpin, log, compare, mark, stats, watch, daemon, setup',
+      argumentHint: '[live|shadow|off|unpin|log|compare|mark|stats|watch|daemon [stop|start|restart]|setup]',
       immediate: true,
     })
     cache = await resolveCacheTtl($, options.cacheTtl).catch(() => cache)
     if (isRecording) void pruneLog($)
+    // The local model's state shows from the start, before the first prompt.
+    if (decider === 'laya') {
+      const mode = await modeOf($)
+      statusDaemon = daemon.state
+      showStatus($, mode === 'off' ? undefined : (await read($, isPinned)) ? 'pignon pinned' : `pignon ${mode}`)
+    }
     if (isShared) void connectShared($, daemon)
     // A launch that fails (no folder, a spawn refused) leaves the socket unset: Haiku decides.
     else if (decider === 'laya') void launchDaemon($, daemon).catch(() => undefined)
@@ -1083,7 +1395,7 @@ export const register: Register = (on, options) => {
     if (MODES.includes(arg as Mode)) {
       await $.store.set('mode', arg)
       if (arg !== 'live') await update($, current, () => null)
-      $.ui.status(arg === 'off' ? undefined : `pignon ${arg}`)
+      showStatus($, arg === 'off' ? undefined : `pignon ${arg}`)
 
       return { text: `pignon is ${arg}.` }
     }
@@ -1125,8 +1437,26 @@ export const register: Register = (on, options) => {
       try {
         return { text: await runSetup($) }
       } finally {
-        $.ui.status(undefined)
+        paint($)
       }
+    }
+
+    if (arg === 'daemon' || arg.startsWith('daemon ')) {
+      const action = arg.slice(6).trim()
+      if (action === '') return { text: await daemonReport($, daemon, decider, isShared) }
+      if (!['stop', 'start', 'restart'].includes(action)) return { text: '/pignon daemon [stop|start|restart]: without a word, what runs and what this session uses.' }
+      if (!isShared) {
+        return {
+          text: `/pignon daemon ${action} acts on the shared daemon, and this session ${decider === 'laya' ? 'runs its own copy, which stops with it' : 'does not use the local model'}. Set "How the local model runs" to shared in /config to use one.`,
+        }
+      }
+      if (action === 'start') return { text: await startShared($, daemon) }
+      const stopped = await stopShared($, daemon)
+      if (!stopped.isHeld) return { text: stopped.text }
+      if (action === 'stop') return { text: `${stopped.text} ${STOP_HOLDS}` }
+
+      // Started even when a daemon outlived the signal: a restart must not leave the stop in place.
+      return { text: `${stopped.text} ${await startShared($, daemon)}` }
     }
 
     if (arg === 'unpin') {
@@ -1175,17 +1505,19 @@ export const register: Register = (on, options) => {
         `decider: ${
           decider === 'haiku'
             ? 'haiku'
-            : daemon.socketPath
-              ? `laya (running)${isShared ? ' · shared daemon' : ''}`
-              : daemon.isStarting
-                ? 'laya (starting: Haiku decides until the model has loaded)'
-                : 'laya (not running: Haiku decides; /pignon setup builds it)'
-        }`,
+            : {
+                up: `laya (running)${isShared ? ' · shared daemon' : ''}`,
+                starting: 'laya (starting: Haiku decides until the model has loaded)',
+                down: 'laya (not running: Haiku decides; /pignon setup builds it)',
+                stopped: 'laya (stopped by /pignon daemon stop: Haiku decides until /pignon daemon start)',
+                refused: 'laya (refused: it held a network socket or could not be checked; Haiku decides)',
+              }[daemon.socketPath ? 'up' : daemon.state === 'up' ? 'down' : daemon.state]
+        }${decider === 'laya' ? ' · /pignon daemon says more' : ''}`,
         `context ${Math.round((await read($, contextTokens)) / 1000)}k · cache ${cacheState}, ttl ${cache.ttl} (${cache.source}) · ${guard}`,
         sessionSavings(await read($, log), mode),
         table,
         `decision log: ${isRecording ? `on (${kept.length} this session; /pignon stats sums them)` : 'off'} · oracle: ${hasOracle ? `${mode === 'shadow' ? 'on (Opus judges each prompt once its turn ends)' : 'on, idle outside shadow mode'}${isRecording ? '' : '; the log is off, so its answers are lost when the session ends'}` : 'off'}`,
-        'Commands: /pignon live | shadow | off | unpin | log | compare | mark | stats | watch | setup',
+        'Commands: /pignon live | shadow | off | unpin | log | compare | mark | stats | watch | daemon | setup',
       ].join('\n'),
     }
   })

@@ -73,6 +73,7 @@ In shadow mode every turn runs on the session's model, so:
 | `/pignon compare` | How often the local model and Haiku would run the same tier, and the prompts where they differ (see below); then each judge's score this session, as `/pignon stats` gives it |
 | `/pignon mark low\|ok\|high [#n]` | Your verdict on the last judged prompt, or on prompt `#n` of `/pignon log`: the tier its line named was too low, right, or too high; or name the tier it deserved (`/pignon mark standard`). See [Scoring the judges](#scoring-the-judges) |
 | `/pignon watch` | Open a pane that shows each decision as it is made (see below) |
+| `/pignon daemon` | The local model's daemons: every shared daemon of this config dir (pid, version, uptime, time since the last prompt, memory) and the one this session uses. `stop`, `start` and `restart` act on the shared daemon (see [below](#starting-and-stopping-it)) |
 | `/pignon setup` | Build the local decider (see below) |
 
 Each routed prompt leaves a dim line in the transcript, e.g. `pignon trivial p=0.95 · 412 ms  👁 would switch to trivial · haiku/low (downgrade opus -> trivial)`, and the status line shows the tier in force. The mode is kept across sessions.
@@ -142,13 +143,24 @@ What this does not do: no operating-system rule blocks the daemon's network acce
 
 ### One daemon for all sessions
 
-Set *How the local model runs* to `shared` (the `daemon` option, beside `decider` in `/config`, or `"daemon": "shared"` in the same `settings.json` block). The first session to need the model starts one daemon; every other session on the Mac uses it. It leaves by itself after 30 minutes without a prompt, so nothing keeps running when you stop working.
+Set *How the local model runs* to `shared` (the `daemon` option, beside `decider` in `/config`, or `"daemon": "shared"` in the same `settings.json` block). The first session to need the model starts one daemon; every other session with the same `CLAUDE_CONFIG_DIR` uses it. Sessions under another config dir start their own, so work kept in separate config dirs never shares a process. It leaves by itself after 30 minutes without a prompt, so nothing keeps running when you stop working.
 
 - **Started detached.** A child the mod spawns ends with the session, so a shared daemon starts itself through `process.run`: it double-forks, calls `setsid`, closes its standard streams and prints `ready PID` once the model answers (about a second with the model cached). Its errors go to `daemon.log` beside its socket, which holds class names only, never a prompt.
 - **One socket, one lock.** The socket lives in `$CLAUDE_CONFIG_DIR/pignon/run-<hash of the mod folder>/`, a directory only you can enter (the daemon refuses one that is not yours or is open to others). A lock held for the daemon's life means two sessions starting at the same moment load the model once. A new version of the mod gets its own directory and daemon; the old one leaves when idle.
 - **Checked by every session.** The first time a session reaches a given process, and again every 5 minutes, the mod runs `lsof` on the pid the daemon reports and does not use a process that holds a network socket, or whose sockets cannot be checked.
-- **Idle means one slow prompt.** After the daemon has left, the next prompt finds no connection, Haiku decides that one, and the mod starts the daemon again in the background for the prompts after it.
-- **What it changes in the guarantees above.** Several sessions share one process, and it outlives the one that started it. Prompts still reach only that process over its Unix socket, and the daemon keeps nothing of them. `pkill -f pignon_decider` stops it by hand.
+- **Idle means one slow prompt.** After the daemon has left, the next prompt finds no connection, Haiku decides that one, and the mod starts the daemon again in the background for the prompts after it. A launch that failed is tried again on a prompt at the soonest a minute after it gave up. Asking the daemon for its health (`/pignon daemon` does) is not a prompt: it does not keep the daemon from leaving.
+- **What it changes in the guarantees above.** Several sessions share one process, and it outlives the one that started it. Prompts still reach only that process over its Unix socket, and the daemon keeps nothing of them.
+
+#### Starting and stopping it
+
+With the local model as the judge, the status line says where it stands, from the start of the session: `pignon live: standard · sonnet/medium · laya up`. The other states are `laya starting`, `laya down → haiku` (it did not start, or left), `laya stopped → haiku` (stopped by hand) and `laya refused → haiku` (it held a network socket, or its sockets could not be checked).
+
+- `/pignon daemon` lists every shared daemon of this config dir, found with `ps`: pid, version, uptime and memory. Only this version's daemon is asked anything, its health, which is not a prompt and does not reset its idle time; it says how long since the last prompt and when it will leave. A daemon from another mod folder is marked with its version when the folder is one of the plugin cache's versions: another version (the sessions opened before the upgrade keep using it until they restart), or this version from another folder, such as a clone added as a local marketplace.
+- `/pignon daemon stop` stops every shared daemon of this config dir, whatever its version, and writes `$CLAUDE_CONFIG_DIR/pignon/shared-stopped`. While that file is there no session starts one: each falls back to Haiku when its connection drops and says `laya stopped → haiku`. The daemon reads the file too, before it loads the model and every second while it serves, so one launched while the stop ran leaves by itself. The stop also removes the run directories of other mod folders whose lock it can take (a daemon holds its lock from before it loads the model, so a directory one is starting in stays). Sessions of a version older than 0.1.7 do not know the file and start theirs again on their next prompt.
+- `/pignon daemon start` removes the file and starts this version's daemon, or joins the one running. Other sessions find it on their next prompt (Haiku decides that one).
+- `/pignon daemon restart` does both, which also clears out the daemons of older versions. It starts this version's daemon even when one of them outlived the signal, and says which.
+
+With the per-session daemon (the default), each session's copy starts and stops with it, and `stop`, `start` and `restart` only say so.
 
 ## Scoring the judges
 
