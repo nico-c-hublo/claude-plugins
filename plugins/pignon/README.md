@@ -15,6 +15,50 @@ A Claude Code mod that shifts to the right model for each prompt, the way a bike
 
 The table and thresholds live in [`hooks/policy.ts`](hooks/policy.ts).
 
+## Status: measuring
+
+pignon 0.1.5 is in a measurement phase. It routes, but nobody has yet checked its decisions on real prompts. What is known:
+
+- **Shadow mode is the default and the place to be.** Decisions are shown and logged; nothing is switched.
+- **The judges are unproven.** Haiku's confidence is its own estimate. The local model's 0.7 downgrade bar is provisional, and its published accuracy could not be reproduced (see [Limits](#limits)).
+- **The hybrid judge is simulated, not built.** The stats score it from laya's and Haiku's verdicts; see [The hybrid, simulated](#the-hybrid-simulated).
+
+### Setting up a measurement
+
+1. Build the [local decider](#a-local-decider) (`/pignon setup`). With Haiku alone there is only one judge, so nothing to compare and no hybrid to simulate.
+2. Turn on the decision log and the oracle, in `/config` or `settings.json`:
+
+   ```json
+   { "pluginConfigs": { "pignon": { "options": { "decider": "laya", "record": "on", "oracle": "on" } } } }
+   ```
+
+   The log is what `/pignon stats` reads. Without it, your marks and the oracle's answers are lost when the session ends. The oracle costs about a cent per prompt (see [The oracle](#the-oracle-opus-as-the-reference)).
+3. Stay in shadow mode (`/pignon shadow`). Haiku's second opinion, the oracle and the hybrid only run there.
+4. Check `/pignon`: it should say `decider: laya (running)`, `decision log: on` and `oracle: on (Opus judges each prompt once its turn ends)`.
+5. Work as usual, and [mark](#scoring-the-judges) prompts as they come with `/pignon mark` or the [pane](#watching-the-decisions)'s buttons. Mark the ordinary prompts too, not only the surprising ones.
+6. Read `/pignon stats` once a week (`/pignon stats 7` for the last week).
+
+### What each question needs
+
+A share measured on *n* prompts is uncertain by about ±1/√*n*: ±18 points at 30, ±10 at 100, ±5 at 400. Two judges whose shares differ by less than that have not been told apart; measure more before deciding.
+
+| Question | Read in `/pignon stats` | Decide |
+| --- | --- | --- |
+| Can the local model decide alone? | the `laya` and `haiku` lines: `same as opus`, `right … marked`, `too low` | If laya is within the margin of Haiku, laya is enough: it is local and about 50 times faster. If it is clearly below, keep Haiku or look at the hybrid. |
+| Is the hybrid worth building? | the `hybrid` line against `laya` and `haiku` | Build it if it beats laya by more than the margin and comes within the margin of Haiku. If laya alone does as well, the hybrid only adds latency. |
+| Are the confidence bars right? | each judge's lines by confidence band (aim for 30+ verdicts per band) | If a judge is right as often just below its downgrade bar (0.7 for laya, 0.85 for Haiku) as just above it, lower the bar. If its rate does not rise with confidence, a bar on its confidence is noise. |
+| Is it worth going live? | `cost` (`shadow: would have saved`) beside the chosen judge's `too low` and `right` rates | Shadow mode cannot show what a cheaper model would have done, so this is a judgement call. Once the first three questions have answers, run `/pignon live` and watch `under-routed` and `corrected, by the tier the turn ran on` for a while. |
+
+### What shadow mode cannot measure
+
+In shadow mode every turn runs on the session's model, so:
+
+- **The outcome flags describe the session's model.** `too low` on a trivial verdict means the prompt took 8 or more requests on that model, not on Haiku.
+- **Corrections only charge judges that agreed with the session.** On an Opus session, only `hard` verdicts are charged with corrections, so the corrected rate says little about trivial or standard verdicts.
+- **A mark judges a tier that never ran.** `/pignon mark ok` on `would switch to trivial` says Haiku at low effort would have been enough. That is your guess, not something you saw.
+- **The savings assume the same tokens.** `would have saved` prices the session model's tokens at the tier's rates. A cheaper model may spend more of them.
+- **The hybrid can only be simulated here.** Haiku's second opinion is only asked in shadow mode, so there is no live record to simulate it on. How often it would call Haiku stays unknown until it is built.
+
 ## Commands
 
 | Command | What it does |
@@ -52,7 +96,7 @@ At the prompt of a terminal session:
 /plugin install pignon --marketplace nico-c-hublo/claude-plugins
 ```
 
-Then watch a few decisions in shadow mode and run `/pignon live` when they look right.
+It starts in shadow mode, which decides and shows without switching. To judge whether the decisions are good enough to go live, see [Setting up a measurement](#setting-up-a-measurement).
 
 ## Watching the decisions
 
@@ -77,6 +121,34 @@ Differences (laya → haiku):
 "Agree" means the two would run the same tier: a prompt Haiku says is trivial but must explore the codebase would run on standard, so it differs from a local model's plain trivial. With no ground truth, the disagreements are the data: read them and decide which judge was right, which is also how the 0.7 downgrade bar gets tuned.
 
 The cost is one small Haiku call per decided prompt, in shadow mode only. Live mode asks the chosen judge alone, and acknowledgements and prompts Haiku already decided are not compared. The prompt goes to Claude either way, and nowhere else.
+
+## A local decider
+
+For work where a prompt must not go anywhere but to Claude, a small classifier ([laya-conductor](https://huggingface.co/mvilacad/laya-conductor), 421M parameters, Apache 2.0) can judge the prompts instead of Haiku. It runs on your Mac with MLX; about 10 ms per prompt. A copy of the model takes about 930 MiB resident, and macOS charges about 1.3 to 1.5 GB for it (Activity Monitor's figure). By default each session runs its own copy; [a shared daemon](#one-daemon-for-all-sessions) serves every session from one.
+
+1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
+2. Run `/pignon setup` once. It builds a Python 3.13 environment from [`daemon/requirements.lock`](daemon/requirements.lock) (every file hash-checked, wheels only, so nothing is built from source with unchecked build tools) and downloads the pinned model (about 850 MB, SHA-256 checked) into `$CLAUDE_CONFIG_DIR/pignon/` (`~/.claude/pignon/` by default). These are the only steps that use the network, and no prompt is involved. Running it again rebuilds the environment only when the lock changed (or one of its packages is missing); otherwise it keeps it, so a running decider is not pulled out from under the session.
+3. Pick `laya` for *Who judges each prompt*: in `/config` (the pignon row), or in `settings.json`:
+
+   ```json
+   { "pluginConfigs": { "pignon": { "options": { "decider": "laya" } } } }
+   ```
+
+   The key is `pignon`, or `pignon@inline` under `--plugin-dir`. Then run `/pignon`: it should say `decider: laya (running)`. If it does not, restart the session. Run setup and the session under the same `CLAUDE_CONFIG_DIR`, since the environment and model live there.
+
+What happens then: at session start the mod launches a small daemon (`daemon/pignon_decider/`) as a child process, bound to a Unix socket in a private (`0700`) directory; the mod reaches it over that socket, so there is no TCP port and no proxy in the path. The daemon runs offline (it drops Hub tokens and proxy variables and sets `HF_HUB_OFFLINE=1`), loads only the model whose hashes are pinned in [`checkpoint.py`](daemon/pignon_decider/checkpoint.py), and exits with the session. When it announces itself the mod runs `lsof` on it and stops it if it holds any network socket, or if that cannot be checked; it looks again every 5 minutes, before the next prompt, and stops using the daemon if it now holds one or the check fails (the process itself keeps running until the session ends). Whenever the daemon is missing, slow (1.5 s), failing or stopped, Haiku decides.
+
+What this does not do: no operating-system rule blocks the daemon's network access (`sandbox-exec` is deprecated), so the guarantee rests on the audit of `laya-mlx` 0.6.0, the stripped environment and the socket check. The compiled dependencies (`mlx`, `tokenizers`, `numpy`) were not audited.
+
+### One daemon for all sessions
+
+Set *How the local model runs* to `shared` (the `daemon` option, beside `decider` in `/config`, or `"daemon": "shared"` in the same `settings.json` block). The first session to need the model starts one daemon; every other session on the Mac uses it. It leaves by itself after 30 minutes without a prompt, so nothing keeps running when you stop working.
+
+- **Started detached.** A child the mod spawns ends with the session, so a shared daemon starts itself through `process.run`: it double-forks, calls `setsid`, closes its standard streams and prints `ready PID` once the model answers (about a second with the model cached). Its errors go to `daemon.log` beside its socket, which holds class names only, never a prompt.
+- **One socket, one lock.** The socket lives in `$CLAUDE_CONFIG_DIR/pignon/run-<hash of the mod folder>/`, a directory only you can enter (the daemon refuses one that is not yours or is open to others). A lock held for the daemon's life means two sessions starting at the same moment load the model once. A new version of the mod gets its own directory and daemon; the old one leaves when idle.
+- **Checked by every session.** The first time a session reaches a given process, and again every 5 minutes, the mod runs `lsof` on the pid the daemon reports and does not use a process that holds a network socket, or whose sockets cannot be checked.
+- **Idle means one slow prompt.** After the daemon has left, the next prompt finds no connection, Haiku decides that one, and the mod starts the daemon again in the background for the prompts after it.
+- **What it changes in the guarantees above.** Several sessions share one process, and it outlives the one that started it. Prompts still reach only that process over its Unix socket, and the daemon keeps nothing of them. `pkill -f pignon_decider` stops it by hand.
 
 ## Scoring the judges
 

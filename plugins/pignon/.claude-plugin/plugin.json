@@ -11,7 +11,7 @@
     "decider": {
       "type": "string",
       "title": "Who judges each prompt",
-      "description": "haiku: ask Haiku about each prompt (default). laya: a model on this Mac, nothing sent anywhere; run /pignon setup once. Falls back to Haiku whenever it is unavailable.",
+      "description": "haiku: ask Haiku about each prompt (default). laya: a model on this Mac judges, and the prompt goes only to Claude (in shadow mode Haiku is also asked, to compare); run /pignon setup once. Falls back to Haiku whenever it is unavailable.",
       "options": [
         "haiku",
         "laya"
