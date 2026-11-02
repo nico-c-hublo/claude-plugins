@@ -1,5 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 import { detectHost, type Host, type Live } from './hosts'
+import { registerRecap, restoreRecap } from './recap'
 import { forget, record } from './registry'
 
 // Keeps a multiplexer (herdr, tmux) readable: every session carries its topic as its name, a
@@ -152,6 +153,7 @@ export const register: Register = (on, options) => {
     // Every start, /clear and resume included: each runs under a session id of its own.
     const location = await host.locate?.()
     if (location) await record($, e.session_id, location)
+    if (options.recap !== false) await restoreRecap($, host, e.session_id)
 
     if (options.askAt !== 'start' || e.source !== 'startup') return result
     isSettled = true
@@ -193,4 +195,6 @@ export const register: Register = (on, options) => {
     if ((await detectHost($))?.locate) await forget($, e.sessionId)
     return next(e)
   }).catch(($, e, next) => next(e))
+
+  if (options.recap !== false) registerRecap(on)
 }

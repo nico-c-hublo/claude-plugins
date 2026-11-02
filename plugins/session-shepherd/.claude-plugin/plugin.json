@@ -1,10 +1,11 @@
 {
   "name": "session-shepherd",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "nico-c-hublo"
   },
-  "description": "Names each session after its topic, offers to go back to a session of the same name, and labels the herdr workspace or tmux window.",
+  "description": "Names each session after its topic, offers to go back to a session of the same name, labels the herdr workspace or tmux window, and recaps where each session stands after every turn.",
+  "types": "./types/index.d.ts",
   "userConfig": {
     "askAt": {
       "type": "string",
@@ -15,6 +16,12 @@
         "start"
       ],
       "default": "prompt"
+    },
+    "recap": {
+      "type": "boolean",
+      "title": "Recap each turn",
+      "description": "After each turn, Haiku writes Done / Needs you / Next: shown above the prompt and in herdr's agent sidebar.",
+      "default": true
     }
   },
   "license": "MIT"
