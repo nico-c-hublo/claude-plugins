@@ -443,22 +443,26 @@ async function launchDaemon($: EngineInterface, daemon: LocalDaemon): Promise<vo
     cwd: `${$.plugin.root}/daemon`,
   })
   let isReady = false
-  for await (const piece of child) {
-    const pid = piece.stream === 'stdout' ? /^ready (\d+)/m.exec(piece.text)?.[1] : undefined
-    if (pid === undefined) continue
-    const problem = await socketProblem($, pid)
-    if (problem !== null) {
-      $.ui.toast(`pignon: the local model ${problem}, so it is stopped. Haiku decides.`)
-      break // leaving the loop kills the child
+  try {
+    for await (const piece of child) {
+      const pid = piece.stream === 'stdout' ? /^ready (\d+)/m.exec(piece.text)?.[1] : undefined
+      if (pid === undefined) continue
+      const problem = await socketProblem($, pid)
+      if (problem !== null) {
+        $.ui.toast(`pignon: the local model ${problem}, so it is stopped. Haiku decides.`)
+        break // leaving the loop kills the child
+      }
+      daemon.auditedPid = Number(pid)
+      daemon.auditedAt = await $.clock.now()
+      daemon.socketPath = `${directory}/s.sock`
+      isReady = true
     }
-    daemon.auditedPid = Number(pid)
-    daemon.auditedAt = await $.clock.now()
-    daemon.socketPath = `${directory}/s.sock`
-    isReady = true
+  } finally {
+    // However the child ended, even by a stream that failed, it is not asked again.
+    daemon.socketPath = null
+    daemon.auditedPid = null
+    if (isReady) $.ui.toast('pignon: the local model stopped. Haiku decides until you restart the session.')
   }
-  daemon.socketPath = null
-  daemon.auditedPid = null
-  if (isReady) $.ui.toast('pignon: the local model stopped. Haiku decides until you restart the session.')
 }
 
 // The daemon's code is audited and its environment stripped; this checks the
@@ -786,7 +790,8 @@ export const register: Register = (on, options) => {
     cache = await resolveCacheTtl($, options.cacheTtl).catch(() => cache)
     if (isRecording) void pruneLog($)
     if (isShared) void connectShared($, daemon)
-    else if (decider === 'laya') void launchDaemon($, daemon)
+    // A launch that fails (no folder, a spawn refused) leaves the socket unset: Haiku decides.
+    else if (decider === 'laya') void launchDaemon($, daemon).catch(() => undefined)
 
     return next(e)
   })

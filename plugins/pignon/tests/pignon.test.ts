@@ -567,6 +567,22 @@ describe('the local decider: its daemon', () => {
     expect(calls.model).toBe(1)
   })
 
+  test('a spawn the engine refuses leaves Haiku deciding, and nothing unhandled', LOCAL, async ($, on) => {
+    const calls = engine(on, TRIVIAL, [], 'shadow')
+    mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+    on('process.run', () => ({ value: OK }))
+    on('process.spawn', async function* () {
+      throw new Error('spawn refused')
+    })
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', 'rename foo to bar')
+
+    expect(calls.model).toBe(1) // Haiku decided
+    expect((await $.command.run({ command: 'pignon', args: '', ...COMMAND })).text).toContain('laya (not running')
+  })
+
   test('a daemon whose sockets cannot be checked is refused, not trusted', LOCAL, async ($, on) => {
     let fetched = 0
     const calls = engine(on, TRIVIAL, [], 'live')
