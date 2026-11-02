@@ -1,6 +1,6 @@
 // Pure routing policy, ported from pi-pignon: no `$`, the part worth testing.
 
-import type { Decision, Effort, LogEntry, TurnOutcome } from '../types'
+import type { Decision, Effort, LogEntry, Mark, TurnOutcome } from '../types'
 
 export type Tier = {
   id: string
@@ -54,6 +54,9 @@ export const CONFIDENCE: Record<DeciderId, { minUpgrade: number; minDowngrade: n
   laya: { minUpgrade: 0.5, minDowngrade: 0.7 },
 }
 
+/** Characters of a prompt the local model reads (its daemon cuts the rest); the other judges read 4,000. */
+export const LOCAL_PROMPT_CHARS = 400
+
 export const THRESHOLDS = {
   minPromptsBetweenSwitches: 2,
   /**
@@ -65,6 +68,15 @@ export const THRESHOLDS = {
   upgradeGuardTokens: 100_000,
   /** A trivial turn that makes this many requests was more than a trivial task. */
   longTurnSteps: 8,
+  /**
+   * A turn that answers in this many requests or fewer, under `shortTurnOutputTokens`
+   * (thinking included) and within `shortTurnMs`, was less than a hard task. The
+   * time bar catches a turn that handed the work to a subagent, whose requests
+   * the main loop does not count.
+   */
+  shortTurnSteps: 2,
+  shortTurnOutputTokens: 1_500,
+  shortTurnMs: 60_000,
 }
 
 export type PolicyInput = {
@@ -206,6 +218,131 @@ export function isUnderRouted(entry: { tier: string | null; action: LogEntry['ac
 
   return entry.action === 'switched' && (turn.reason === 'error' || turn.reason === 'refusal')
 }
+
+/**
+ * What a turn's outcome says of a judge's verdict on its prompt, whichever model
+ * ran it: `too low` for a trivial verdict whose turn ran a long tool loop, `too high`
+ * for a hard one whose turn answered in a request or two with a short output. Weak
+ * labels, free: null when the outcome says nothing, or the turn has not ended.
+ */
+export function verdictSignal(decision: Decision | null, turn: TurnOutcome | undefined): 'too low' | 'too high' | null {
+  const tier = effectiveTier(decision)
+  if (!turn || tier === null) return null
+  if (tier === TIERS[0]!.id && turn.steps >= THRESHOLDS.longTurnSteps) return 'too low'
+  const isShort =
+    turn.reason === 'answer' &&
+    turn.steps <= THRESHOLDS.shortTurnSteps &&
+    turn.durationMs < THRESHOLDS.shortTurnMs &&
+    turn.usage !== undefined &&
+    turn.usage.output < THRESHOLDS.shortTurnOutputTokens
+  if (tier === TIERS.at(-1)!.id && isShort) return 'too high'
+
+  return null
+}
+
+/** What `/pignon mark` and the pane take besides a tier's name, and how each reads. */
+export const MARKS = { low: 'too low', ok: 'right', high: 'too high' } as const
+export type MarkWord = keyof typeof MARKS
+
+export function isMarkWord(word: string): word is MarkWord {
+  return Object.hasOwn(MARKS, word)
+}
+
+/** How a mark reads: `too low` for `low`, a tier's name as it is. */
+export function markLabel(said: string): string {
+  return isMarkWord(said) ? MARKS[said] : said
+}
+
+/**
+ * The tiers a mark accepts: a tier by name, or relative to `reference`, the tier
+ * the turn ran on or would have (`low`: every tier above it). Null when the mark
+ * cannot apply: a relative mark with no reference, `low` on the top tier, `high`
+ * on the bottom one, or an unknown word.
+ */
+export function acceptedTiers(said: string, reference: string | null): string[] | null {
+  if (rankOf(said) >= 0) return [said]
+  if (!isMarkWord(said) || reference === null || rankOf(reference) < 0) return null
+  const rank = rankOf(reference)
+  const ids = TIERS.map(t => t.id)
+  const accepted = { ok: [reference], low: ids.slice(rank + 1), high: ids.slice(0, rank) }[said]
+
+  return accepted.length > 0 ? accepted : null
+}
+
+/** Whether a judge's verdict names a tier the mark accepts. */
+export function isAccepted(mark: Pick<Mark, 'accepted'>, decision: Decision | null): boolean {
+  const tier = effectiveTier(decision)
+
+  return tier !== null && mark.accepted.includes(tier)
+}
+
+/** The tier whose model a session model is: `hard` for Opus. Null for a model no tier runs (Fable). */
+export function tierOfModel(model: string): string | null {
+  return TIERS[rankOfModel(model)]?.id ?? null
+}
+
+/**
+ * The tier a prompt's turn ran on: the one in force in live mode, else the
+ * session's own model. Null when that model is no tier's.
+ */
+export function ranOn(entry: { mode: 'live' | 'shadow'; tier: string | null; model: string }): string | null {
+  return entry.mode === 'live' && entry.tier !== null ? entry.tier : tierOfModel(entry.model)
+}
+
+/**
+ * The tier the decision's line names: the one switched to, would be switched to,
+ * or kept (the session's model when none). What a relative mark is taken against,
+ * since it is what the person read: in live mode, also what ran.
+ */
+export function shownTier(entry: { tier: string | null; model: string }): string | null {
+  return entry.tier ?? tierOfModel(entry.model)
+}
+
+/**
+ * Whether a prompt opens by saying the last answer was wrong ("no, the other
+ * file", "that's not it", "wait, it still fails", "pas ça", "ça marche toujours
+ * pas"): the previous turn's decision is then suspect. A bare "no" does not
+ * count, being as often the answer to a question; nor does "no, that's fine", nor
+ * "no tests cover this", nor "revert commit abc", a task of its own.
+ */
+export function isCorrection(text: string): boolean {
+  return CORRECTION.test(text.trim().toLowerCase().replace(/[’`]/g, "'"))
+}
+
+// The end of a word, accented letters included (`\b` only knows ASCII).
+const END = '(?![\\p{L}\\p{N}])'
+// What follows a "no" that answers a question rather than corrects.
+const AGREEING =
+  `(?!(?:(?:that|it|this)(?:'s| is)\\s+)?(?:fine|ok|okay|good|alright|all good|great|perfect|go ahead|thanks|thank you|need|problem|worries|merci|c'est bon|ça va|ca va|pas de (?:souci|problème|probleme)|pas besoin|parfait|nickel)${END})`
+// A word to think with before the correction: "wait, that's wrong".
+const LEAD_IN = `(?:(?:wait|hmm+|hm+|hum+|euh+|ah|oh|well|attends?)\\s*[,.!…]*\\s+)?`
+const CORRECTION = new RegExp(
+  '^' +
+    LEAD_IN +
+    '(?:' +
+    [
+      // a no, then a pause and more, or "that": not a bare one
+      `(?:no|nope|non|nan)\\s*[,.!;:]+\\s*${AGREEING}\\S`,
+      `(?:no|nope|non|nan)\\s+${AGREEING}(?:that|this|it|pas|not)${END}`,
+      `not (?:that|this|it|quite|what)${END}`,
+      `wrong${END}`,
+      `(?:that|this|it)(?:'s| is| was) (?:wrong|incorrect|not (?:it|right|what|correct|working))${END}`,
+      `(?:(?:that|this|it) )?(?:still )?(?:doesn't|does not|didn't|did not) work`,
+      `(?:it )?still (?:fails|failing|broken|doesn't|does not)${END}`,
+      `you (?:broke|misunderstood|got it wrong)${END}`,
+      `(?:revert|undo) (?:that|this|it|your|what you|the last|these|those)${END}`,
+      `non mais${END}`,
+      `pas (?:ça|ca|comme ça|comme ca|ce que)${END}`,
+      `(?:c'est|ce n'est|c'était) (?:faux|pas (?:ça|ca|bon|ce que|correct))${END}`,
+      `faux${END}`,
+      `(?:ça|ca) (?:ne )?(?:marche|fonctionne) (?:toujours )?(?:pas|plus)${END}`,
+      `toujours pas${END}`,
+      `tu as (?:cassé|mal compris)${END}`,
+      `annule (?:ça|ca|ce que|tes?|la dernière|le dernier)${END}`,
+    ].join('|') +
+    ')',
+  'u',
+)
 
 /** The decider's reply, `{"tier":..,"explore":..,"confidence":..}`, or null. */
 export function parseDecision(text: string): Decision | null {

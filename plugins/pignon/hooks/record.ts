@@ -1,5 +1,5 @@
-import type { DecisionRecord, LogEntry } from '../types'
-import { THRESHOLDS, TIERS, effectiveTier, isUnderRouted } from './policy'
+import type { Decision, DecisionRecord, LogEntry, Mark, TurnOutcome } from '../types'
+import { LOCAL_PROMPT_CHARS, THRESHOLDS, TIERS, effectiveTier, isAccepted, isUnderRouted, ranOn, verdictSignal } from './policy'
 import { usd } from './prices'
 
 // A session file holds this many records at most; the oldest go first.
@@ -7,21 +7,28 @@ export const MAX_RECORDS = 3_000
 export const KEEP_DAYS = 90
 const REASON_CHARS = 80
 
+/** What a record holds beyond its log entry: the session, the settings, the state before the decision. */
 export type RecordContext = {
   session: string
   project: string
-  mode: 'live' | 'shadow'
   chosen: 'haiku' | 'laya'
   daemon: 'session' | 'shared' | null
-  promptChars: number
   was: string | null
-  model: string
   contextTokens: number
+}
+
+/** A judge's opinion once it has answered, without the flag that it is still asked; undefined while it is. */
+export function settled<T extends { isPending?: boolean }>(opinion: T | undefined): Omit<T, 'isPending'> | undefined {
+  if (!opinion || opinion.isPending) return undefined
+  const { isPending: _, ...answered } = opinion
+
+  return answered
 }
 
 // What a log entry leaves in the file: everything but the words of the prompt.
 export function recordOf(entry: LogEntry, context: RecordContext): DecisionRecord {
-  const second = entry.second && !entry.second.isPending ? { decision: entry.second.decision, ms: entry.second.ms } : undefined
+  const second = settled(entry.second)
+  const oracle = settled(entry.oracle)
 
   return {
     v: 1,
@@ -29,14 +36,17 @@ export function recordOf(entry: LogEntry, context: RecordContext): DecisionRecor
     n: entry.id,
     at: entry.at,
     project: context.project,
-    mode: context.mode,
+    mode: entry.mode,
     chosen: context.chosen,
     daemon: context.daemon,
     decider: entry.decider,
-    promptChars: context.promptChars,
+    promptChars: entry.promptChars,
     ...(entry.tiers && { tiers: entry.tiers }),
     decision: entry.decision,
     ...(second && { second }),
+    ...(oracle && { oracle }),
+    ...(entry.corrected && { corrected: entry.corrected }),
+    ...(entry.mark && { mark: entry.mark }),
     ...(entry.fallback && { fallback: entry.fallback }),
     ms: entry.ms,
     ...(entry.daemonMs !== undefined && { daemonMs: entry.daemonMs }),
@@ -44,7 +54,7 @@ export function recordOf(entry: LogEntry, context: RecordContext): DecisionRecor
     was: context.was,
     tier: entry.tier,
     reason: entry.reason.slice(0, REASON_CHARS),
-    model: context.model,
+    model: entry.model,
     contextTokens: context.contextTokens,
     ...(entry.turn && { turn: entry.turn }),
   }
@@ -83,7 +93,7 @@ function percentile(values: readonly number[], p: number): number {
   return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] ?? 0
 }
 
-function share(part: number, whole: number): string {
+export function share(part: number, whole: number): string {
   return whole === 0 ? 'n/a' : `${Math.round((part / whole) * 100)}%`
 }
 
@@ -166,9 +176,172 @@ export function summarize(records: readonly DecisionRecord[], sessions: number):
     lines.push(`live: switched ${live.filter(r => r.action === 'switched').length} of ${live.length}`)
   }
 
+  lines.push(...judgeLines(records))
   lines.push(...costLines(records))
 
   return lines.join('\n')
+}
+
+export type JudgeId = 'laya' | 'haiku' | 'opus'
+const JUDGES: readonly JudgeId[] = ['laya', 'haiku', 'opus']
+
+/** What a prompt's judges said and what came of it: a record on disk, or a log entry of this session. */
+export type Judged = {
+  decider: DecisionRecord['decider']
+  decision: Decision | null
+  second?: { decision: Decision | null }
+  oracle?: { decision: Decision | null }
+  mark?: Mark
+  turn?: TurnOutcome
+  corrected?: true
+  mode: 'live' | 'shadow'
+  /** The tier in force after the decision, or the one it would switch to in shadow mode. */
+  tier: string | null
+  /** The session's own model. */
+  model: string
+  promptChars: number
+}
+
+// One judge's opinion on one prompt: the decider's, Haiku's second opinion, or
+// the oracle's. Haiku is one judge whether it decided or was asked.
+type Verdict = { judge: JudgeId; decision: Decision; tier: string; of: Judged }
+
+export function verdictsOf(items: readonly Judged[]): Verdict[] {
+  const verdicts: Verdict[] = []
+  const add = (judge: JudgeId, decision: Decision | null | undefined, of: Judged) => {
+    const tier = effectiveTier(decision ?? null)
+    if (decision && tier !== null) verdicts.push({ judge, decision, tier, of })
+  }
+  for (const item of items) {
+    if (item.decider === 'laya' || item.decider === 'haiku') add(item.decider, item.decision, item)
+    add('haiku', item.second?.decision, item)
+    add('opus', item.oracle?.decision, item)
+  }
+
+  return verdicts
+}
+
+/** A part and its whole: `3 of 4`. */
+export type Tally = { part: number; whole: number }
+
+/**
+ * How a judge's verdicts fare. Each tally counts only the verdicts it can say
+ * something about: too low among trivial verdicts, too high among hard ones,
+ * corrected among those whose tier is the one the turn ran on.
+ */
+export type Score = {
+  verdicts: number
+  /** Trivial verdicts whose turn has ended, and of them those whose turn ran a long loop. */
+  tooLow: Tally
+  /** Hard verdicts whose turn has ended, and of them those whose turn was short. */
+  tooHigh: Tally
+  /** Verdicts whose tier ran, and of them those the next prompt corrected. */
+  corrected: Tally
+  /** Verdicts on a prompt you marked, and of them those on a tier you accepted. */
+  right: Tally
+  /** Verdicts on a prompt the oracle answered, and of them those on its tier; never the oracle's own. */
+  asOracle: Tally
+  /** The same on prompts the local model read whole: its input then was the oracle's. */
+  asOracleSameInput: Tally
+}
+
+function tally<T>(list: readonly T[], isPart: (item: T) => boolean): Tally {
+  return { part: list.filter(isPart).length, whole: list.length }
+}
+
+export function scoreOf(verdicts: readonly Verdict[]): Score {
+  const ended = verdicts.filter(v => v.of.turn)
+  const vsOracle = verdicts.flatMap(v => {
+    const reference = v.judge === 'opus' ? null : effectiveTier(v.of.oracle?.decision ?? null)
+    return reference === null ? [] : [{ ...v, reference }]
+  })
+  const marked = verdicts.flatMap(v => (v.of.mark ? [{ ...v, mark: v.of.mark }] : []))
+
+  return {
+    verdicts: verdicts.length,
+    tooLow: tally(ended.filter(v => v.tier === TIERS[0]!.id), v => verdictSignal(v.decision, v.of.turn) === 'too low'),
+    tooHigh: tally(ended.filter(v => v.tier === TIERS.at(-1)!.id), v => verdictSignal(v.decision, v.of.turn) === 'too high'),
+    corrected: tally(ended.filter(v => v.tier === ranOn(v.of)), v => v.of.corrected === true),
+    right: tally(marked, v => isAccepted(v.mark, v.decision)),
+    asOracle: tally(vsOracle, v => v.tier === v.reference),
+    asOracleSameInput: tally(vsOracle.filter(v => v.of.promptChars <= LOCAL_PROMPT_CHARS), v => v.tier === v.reference),
+  }
+}
+
+/** Each judge that gave a verdict, with its score. */
+export function scoreByJudge(items: readonly Judged[]): { judge: JudgeId; verdicts: Verdict[]; score: Score }[] {
+  const verdicts = verdictsOf(items)
+
+  return JUDGES.flatMap(judge => {
+    const mine = verdicts.filter(v => v.judge === judge)
+    return mine.length === 0 ? [] : [{ judge, verdicts: mine, score: scoreOf(mine) }]
+  })
+}
+
+const cell = (label: string, t: Tally, of = '') => (t.whole === 0 ? [] : [`${label} ${share(t.part, t.whole)} of ${t.whole}${of}`])
+
+/**
+ * A judge's score on one line: what `/pignon stats` prints per judge and per
+ * confidence band, and `/pignon compare` for the session. Tallies with nothing
+ * to count are left out.
+ */
+export function scoreCells(judge: JudgeId, s: Score): string[] {
+  const sameInput =
+    judge === 'laya' && s.asOracleSameInput.whole > 0 && s.asOracleSameInput.whole < s.asOracle.whole
+      ? ` (${share(s.asOracleSameInput.part, s.asOracleSameInput.whole)} of ${s.asOracleSameInput.whole} within its ${LOCAL_PROMPT_CHARS} characters)`
+      : ''
+
+  return [
+    ...cell('too low', s.tooLow, ' trivial'),
+    ...cell('too high', s.tooHigh, ' hard'),
+    ...cell('corrected', s.corrected, ' that ran'),
+    ...cell('right', s.right, ' marked'),
+    ...cell('same as opus', s.asOracle, sameInput),
+  ]
+}
+
+// What the judges' verdicts are worth: the outcome signals (free, weak), your
+// marks (exact, few), and agreement with the oracle (Opus on the same input), by
+// judge and by its confidence. The table the bars are tuned on.
+function judgeLines(records: readonly DecisionRecord[]): string[] {
+  const lines: string[] = []
+  for (const { judge, verdicts, score } of scoreByJudge(records)) {
+    lines.push(`  ${judge.padEnd(6)} ${[`${score.verdicts} verdict${score.verdicts === 1 ? '' : 's'}`, ...scoreCells(judge, score)].join(' · ')}`)
+    for (const band of BANDS) {
+      const inBand = verdicts.filter(v => v.decision.confidence >= band.from && v.decision.confidence < band.to)
+      const cells = inBand.length === 0 ? [] : scoreCells(judge, scoreOf(inBand))
+      if (cells.length > 0) lines.push(`         ${band.label.padEnd(13)} ${cells.join(' · ')}`)
+    }
+  }
+  if (lines.length === 0) return []
+
+  const oracleCost = sum(records.flatMap(r => (r.oracle?.cost === undefined ? [] : [r.oracle.cost])))
+  const asked = records.filter(r => r.oracle).length
+
+  return [
+    '',
+    'judges, scored on outcomes, your marks and the oracle:',
+    ...lines,
+    `  too low: a trivial verdict whose turn ran ${THRESHOLDS.longTurnSteps}+ steps · too high: a hard verdict whose turn answered in ${THRESHOLDS.shortTurnSteps} requests or fewer, under ${THRESHOLDS.shortTurnOutputTokens.toLocaleString('en-US')} output tokens and ${THRESHOLDS.shortTurnMs / 1000} s · corrected: the next prompt said the answer was wrong`,
+    ...(asked > 0 ? [`  oracle: opus asked ${asked} time${asked === 1 ? '' : 's'}, ${usd(oracleCost)} at list price`] : []),
+    ...correctionLines(records),
+  ]
+}
+
+// How often the next prompt was a correction, by the tier the turn ran on: in
+// shadow mode the session's model ran, whatever the verdict, which makes it the baseline.
+function correctionLines(records: readonly DecisionRecord[]): string[] {
+  const ended = records.filter(r => r.turn)
+  if (!ended.some(r => r.corrected)) return []
+  const parts = [...TIERS.map(t => t.id), null].flatMap(tier => {
+    const mine = ended.filter(r => ranOn(r) === tier)
+    if (mine.length === 0) return []
+    const corrected = mine.filter(r => r.corrected).length
+
+    return [`${corrected} of ${mine.length} on ${tier ?? 'a model of no tier'} (${share(corrected, mine.length)})`]
+  })
+
+  return [`corrected, by the tier the turn ran on: ${parts.join(' · ')}`]
 }
 
 const sum = (values: readonly number[]) => values.reduce((total, value) => total + value, 0)
