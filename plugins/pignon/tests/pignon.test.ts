@@ -1,9 +1,10 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { HttpInit, On, ProcessSpawnRequest, TurnStepInput } from 'claude-code'
+import type { HttpInit, On, ProcessSpawnRequest, TurnStepInput, TurnUsage } from 'claude-code'
 
-import type { DecisionRecord, LogEntry } from '../types'
-import { decide, decisionFromTiers, isFollowUp, parseDecision } from '../hooks/policy'
+import type { DecisionRecord, LogEntry, TurnOutcome } from '../types'
+import { decide, decisionFromTiers, isFollowUp, isUnderRouted, parseDecision } from '../hooks/policy'
+import { priceOf, turnCost, usd } from '../hooks/prices'
 import { parseRecords, recordOf, serialize, summarize } from '../hooks/record'
 
 const OPUS = 'claude-opus-5-5'
@@ -141,9 +142,9 @@ describe('policy: the local model\'s answer', () => {
 })
 
 // Stands for the engine beneath the mod: a decider that answers `reply`, and
-// a model that records each request it is sent.
-function engine(on: On, reply: string | (() => Promise<string>), sent: TurnStepInput[], mode = 'shadow') {
-  const clock = mock.clock(on)
+// a model that records each request it is sent and answers with `usage`.
+function engine(on: On, reply: string | (() => Promise<string>), sent: TurnStepInput[], mode = 'shadow', options: { usage?: TurnUsage; now?: number } = {}) {
+  const clock = mock.clock(on, { now: options.now ?? 0 })
   const calls = { model: 0, clock }
   mock.store(on, { mode })
   on('command.register', () => ({ value: { command: 'pignon' } }))
@@ -163,8 +164,9 @@ function engine(on: On, reply: string | (() => Promise<string>), sent: TurnStepI
   })
   on('turn.step', async function* (_, e) {
     sent.push(e)
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: options.usage ?? null }
   })
+  on('turn.complete', (_, e) => ({ text: e.answer }))
   return calls
 }
 
@@ -1650,5 +1652,380 @@ describe('the decision log: in a session', () => {
     })
 
     expect(text).toContain('No decisions recorded yet')
+  })
+})
+
+// The cost and the under-routing signal, in dollars at list price.
+describe('prices', () => {
+  const million = { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0 }
+
+  test('each family has a price, by alias or full id, and an unknown model has none', async () => {
+    expect(priceOf(million, 'haiku')).toBe(0.1)
+    expect(priceOf(million, 'claude-sonnet-5-5')).toBe(2)
+    expect(priceOf(million, 'claude-opus-5-5')).toBe(4)
+    expect(priceOf({ input: 0, output: 1_000_000, cacheRead: 0, cacheWrite: 0 }, 'opus')).toBe(20)
+    expect(priceOf({ input: 0, output: 0, cacheRead: 1_000_000, cacheWrite: 1_000_000 }, 'opus')).toBe(5.2)
+    expect(priceOf(million, 'claude-fable-5-1')).toBe(null)
+    expect(priceOf(million, 'gpt-9')).toBe(null)
+  })
+
+  test('a turn is priced on the model that answered, on the session model and on the tier', async () => {
+    const usage = { ...million, model: 'claude-haiku-5-5' }
+
+    expect(turnCost(usage, OPUS, 'trivial')).toEqual({ actual: 0.1, onSessionModel: 4, onTier: 0.1 })
+    expect(turnCost({ ...million, model: OPUS }, OPUS, 'trivial')).toEqual({ actual: 4, onSessionModel: 4, onTier: 0.1 })
+    expect(turnCost(usage, OPUS, null)).toEqual({ actual: 0.1, onSessionModel: 4, onTier: 4 })
+    expect(turnCost(usage, 'claude-fable-5-1', 'trivial')).toBe(null)
+  })
+
+  test('dollars are written to the cent, or to the tenth of a cent under a dollar', async () => {
+    expect(usd(0.0123)).toBe('$0.012')
+    expect(usd(4.126)).toBe('$4.13')
+  })
+})
+
+describe('policy: a cold cache', () => {
+  const standard = { tier: 'standard', explore: true, confidence: 0.95 }
+  const hard = { tier: 'hard', explore: true, confidence: 0.95 }
+
+  test('lifts both guards: a downgrade past 60k and an upgrade past 100k go through, and say why', async () => {
+    const down = decide({ ...base, contextTokens: 120_000, decision: standard, isCacheCold: true })
+    expect(down.target).toBe('standard')
+    expect(down.reason).toContain('cache cold')
+
+    const up = decide({ ...base, current: 'standard', contextTokens: 110_000, decision: hard, isCacheCold: true })
+    expect(up.target).toBe('hard')
+    expect(up.reason).toContain('cache cold')
+  })
+
+  test('lifts the cooldown', async () => {
+    expect(decide({ ...base, current: 'hard', promptsSinceSwitch: 1, decision: standard, isCacheCold: true }).target).toBe('standard')
+  })
+
+  test('keeps the confidence bars', async () => {
+    expect(decide({ ...base, decision: { tier: 'trivial', explore: false, confidence: 0.6 }, isCacheCold: true }).target).toBe(null)
+  })
+
+  test('a warm cache is the default', async () => {
+    expect(decide({ ...base, contextTokens: 120_000, decision: standard }).reason).toContain('cache protected')
+  })
+})
+
+describe('policy: under-routing', () => {
+  const turn = (over: Partial<TurnOutcome> = {}): TurnOutcome => ({ steps: 3, reason: 'answer', durationMs: 1_000, ...over })
+
+  test('a trivial turn that ran a long tool loop, however it was decided', async () => {
+    expect(isUnderRouted({ tier: 'trivial', action: 'switched', turn: turn({ steps: 8 }) })).toBe(true)
+    expect(isUnderRouted({ tier: 'trivial', action: 'would switch', turn: turn({ steps: 12 }) })).toBe(true)
+    expect(isUnderRouted({ tier: 'trivial', action: 'switched', turn: turn({ steps: 7 }) })).toBe(false)
+    expect(isUnderRouted({ tier: 'standard', action: 'switched', turn: turn({ steps: 30 }) })).toBe(false)
+  })
+
+  test('a switched turn that ended in an error or a refusal, not an unrouted one', async () => {
+    expect(isUnderRouted({ tier: 'standard', action: 'switched', turn: turn({ reason: 'error' }) })).toBe(true)
+    expect(isUnderRouted({ tier: 'standard', action: 'switched', turn: turn({ reason: 'refusal' }) })).toBe(true)
+    expect(isUnderRouted({ tier: 'standard', action: 'switched', turn: turn({ reason: 'aborted' }) })).toBe(false)
+    expect(isUnderRouted({ tier: null, action: 'kept', turn: turn({ reason: 'error' }) })).toBe(false)
+    expect(isUnderRouted({ tier: 'trivial', action: 'switched' })).toBe(false)
+  })
+})
+
+// What each routed turn cost: filled in on its entry when the turn ends.
+const MILLION_IN: TurnUsage = { input_tokens: 1_000_000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'claude-haiku-5-5' }
+
+async function complete($: Engine, turnId: string, over: Partial<{ durationMs: number; usage: TurnUsage; agentId: string; reason: 'answer' | 'aborted' | 'error' }> = {}) {
+  const { reason = 'answer', ...rest } = over
+  await $.turn.complete({ turnId, answer: 'done', durationMs: 12_000, isAborted: false, reason, usage: MILLION_IN, ...rest })
+}
+
+async function logText($: Engine): Promise<string> {
+  const { text = '' } = await $.command.run({ command: 'pignon', args: 'log', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+
+  return text
+}
+
+describe("a turn's end", () => {
+  test('adds its steps, its time and its cost against the session model to the entry', async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', 'rename foo')
+    for (const index of [1, 2]) for await (const _ of $.turn.step({ turnId: 't1', index, model: OPUS, effort: 'high', messageCount: 3 }));
+    expect(await logText($)).not.toContain('steps')
+    await complete($, 't1')
+
+    expect(await logText($)).toContain('3 steps · 12 s · $0.100 (session model $4.00)')
+  })
+
+  test('in shadow mode, says what the tier would have cost', async ($, on) => {
+    engine(on, TRIVIAL, [], 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', 'rename foo')
+    await complete($, 't1', { usage: { ...MILLION_IN, model: OPUS } })
+
+    expect(await logText($)).toContain('1 step · 12 s · $4.00 (would be $0.100 on trivial)')
+  })
+
+  test('says how the turn ended when it was not an answer, and leaves out a cost it cannot price', async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', 'rename foo')
+    await complete($, 't1', { reason: 'error', usage: { ...MILLION_IN, model: 'claude-fable-5-1' } })
+
+    expect(await logText($)).toContain('1 step · 12 s · error · under-routed')
+  })
+
+  test("a subagent's end, or an unrouted turn's, changes nothing", async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', 'rename foo')
+    await complete($, 't1', { agentId: 'a1' })
+    await complete($, 't9')
+
+    expect(await logText($)).not.toContain('steps')
+  })
+
+  test('goes on the record too, when the log is kept', { options: { record: 'on' } }, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    const writes: { path: string; text: string }[] = []
+    mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+    on('process.run', () => ({ value: OK }))
+    on('session.cwd', () => ({ value: '/work/api' }))
+    on('fs.write', (_, e) => {
+      writes.push(e)
+
+      return { value: undefined }
+    })
+    const last = () => parseRecords(writes.at(-1)?.text ?? '')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', SECRET)
+    await settle()
+    expect(last()[0]?.turn).toBeUndefined()
+    await complete($, 't1')
+    await settle()
+
+    expect(last()[0]?.turn).toMatchObject({ steps: 1, reason: 'answer', durationMs: 12_000, cost: { actual: 0.1, onSessionModel: 4, onTier: 0.1 } })
+    expect(writes.every(w => !w.text.includes('SECRETWORD'))).toBe(true)
+  })
+
+  test('the pane draws it, in warning colour when the tier fell short', LOCAL, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    withDaemon(on, () => ({ status: 200, ok: true, headers: {}, text: JSON.stringify({ tiers: { trivial: 0.9, standard: 0.07, hard: 0.03 }, latencyMs: 9 }) }))
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', 'rename foo to bar in utils.ts')
+    for (let index = 1; index < 8; index++) for await (const _ of $.turn.step({ turnId: 't1', index, model: OPUS, effort: 'high', messageCount: 3 }));
+    await complete($, 't1')
+
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, surface: 'terminal' })
+    const line = await ui.find({ type: 'Text', text: /steps/ })
+    expect(line?.text).toBe('8 steps · 12 s · $0.100 (session model $4.00) · under-routed')
+    expect(line?.props.color).toBe('warning')
+    await ui.unmount()
+  })
+
+  test('/pignon sums the session', async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const status = async () => (await $.command.run({ command: 'pignon', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })).text ?? ''
+
+    expect(await status()).toContain('this session: no turn priced yet')
+    await prompt($, 't1', 'rename foo')
+    await complete($, 't1')
+
+    expect(await status()).toContain('this session: spent $0.100 · saved $3.90')
+  })
+})
+
+describe('the decision log: the cost', () => {
+  const cost = { actual: 0.1, onSessionModel: 4, onTier: 0.1 }
+  const ended = (over: Partial<TurnOutcome> = {}): TurnOutcome => ({ steps: 2, reason: 'answer', durationMs: 5_000, cost, ...over })
+
+  test('sums what was spent and saved live, and what shadow mode would have saved', async () => {
+    const records = [
+      recordOf(entry({ id: 1, action: 'switched', turn: ended() }), { ...CONTEXT, mode: 'live' }),
+      recordOf(entry({ id: 2, action: 'switched', turn: ended({ steps: 9 }) }), { ...CONTEXT, mode: 'live' }),
+      recordOf(entry({ id: 3, turn: ended({ cost: { actual: 4, onSessionModel: 4, onTier: 0.1 } }) }), CONTEXT),
+      recordOf(entry({ id: 4, turn: ended({ cost: undefined }) }), CONTEXT),
+    ]
+
+    const text = summarize(records, 1)
+
+    expect(text).toContain('cost (estimated at list price): 3 turns priced')
+    expect(text).toContain('live:   spent $0.200 · $8.00 on the session model · saved $7.80 (98%)')
+    expect(text).toContain('shadow: would have saved $3.90 of $4.00')
+    expect(text).toContain('by tier: trivial 3 turns $0.300')
+    expect(text).toContain('under-routed: 1 trivial turn ran 8+ steps')
+  })
+
+  test('counts switched turns that ended badly, and says nothing when no turn has ended', async () => {
+    const text = summarize([recordOf(entry({ action: 'switched', tier: 'standard', turn: ended({ reason: 'error' }) }), { ...CONTEXT, mode: 'live' })], 1)
+    expect(text).toContain('under-routed: 1 switched turn ended in an error or a refusal')
+
+    const none = summarize([recordOf(entry(), CONTEXT)], 1)
+    expect(none).not.toContain('cost')
+    expect(none).not.toContain('under-routed')
+  })
+})
+
+// The cache guard, lifted when the cache is cold anyway.
+describe('a cold cache', () => {
+  const HARD = '{"tier":"hard","explore":true,"confidence":0.9}'
+  // A step answered over 150k tokens of context, past both guards.
+  const BIG: TurnUsage = { input_tokens: 1_000, output_tokens: 100, cache_read_input_tokens: 150_000, cache_creation_input_tokens: 0, model: 'claude-haiku-5-5' }
+  const NOON = Date.UTC(2026, 9, 30, 12, 0, 0)
+  // A compaction leaves at least one message.
+  const KEPT = { role: 'user' as const, text: 'summary', toolUses: [] }
+
+  // Trivial first, then hard on every prompt after: the upgrade the guard holds.
+  function replies() {
+    const queue = [TRIVIAL]
+    return () => Promise.resolve(queue.shift() ?? HARD)
+  }
+
+  async function guarded($: Engine, sent: TurnStepInput[]) {
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await prompt($, 't1', 'rename foo')
+    await prompt($, 't2', 'find why the build fails')
+    expect(sent.map(e => e.model)).toEqual(['haiku', 'haiku'])
+  }
+
+  test('after a compaction, the next prompt may switch past the guard', async ($, on) => {
+    const sent: TurnStepInput[] = []
+    engine(on, replies(), sent, 'live', { usage: BIG, now: NOON })
+    on('session.compact', () => ({ messages: [KEPT], tokensBefore: 150_000, tokensAfter: 20_000 }))
+    await guarded($, sent)
+
+    await $.session.compact({ trigger: 'manual', messages: [KEPT] })
+    await prompt($, 't3', 'find why the build fails')
+
+    expect(sent[2]?.model).toBe('opus')
+    expect(await logText($)).toContain('(cache cold)')
+  })
+
+  test('a precomputed or a skipped compaction lifts nothing', async ($, on) => {
+    const sent: TurnStepInput[] = []
+    engine(on, replies(), sent, 'live', { usage: BIG, now: NOON })
+    let answer: { messages: (typeof KEPT)[]; tokensAfter: number } | { skip: string } = { messages: [KEPT], tokensAfter: 20_000 }
+    on('session.compact', () => answer)
+    await guarded($, sent)
+
+    await $.session.compact({ trigger: 'precompute', messages: [KEPT] })
+    await prompt($, 't3', 'find why the build fails')
+    answer = { skip: 'off' }
+    await $.session.compact({ trigger: 'auto', messages: [KEPT] })
+    await prompt($, 't4', 'find why the build fails')
+
+    expect(sent.slice(2).map(e => e.model)).toEqual(['haiku', 'haiku'])
+  })
+
+  test("a subagent's compaction lifts nothing", async ($, on) => {
+    const sent: TurnStepInput[] = []
+    engine(on, replies(), sent, 'live', { usage: BIG, now: NOON })
+    on('session.compact', () => ({ messages: [KEPT], tokensAfter: 20_000 }))
+    await guarded($, sent)
+
+    await $.session.compact({ trigger: 'auto', messages: [KEPT], agentId: 'a1' })
+    await prompt($, 't3', 'find why the build fails')
+
+    expect(sent[2]?.model).toBe('haiku')
+  })
+
+  test('an idle gap past the 5-minute TTL lifts the guard, and every request warms the cache again', { options: { cacheTtl: '5m' } }, async ($, on) => {
+    const sent: TurnStepInput[] = []
+    const calls = engine(on, replies(), sent, 'live', { usage: BIG, now: NOON })
+    await guarded($, sent)
+
+    // Just under the TTL since the last request: still warm, and this request restarts the clock.
+    await calls.clock.advance(5 * 60_000 - 1)
+    await prompt($, 't3', 'find why the build fails')
+    expect(sent[2]?.model).toBe('haiku')
+    await calls.clock.advance(5 * 60_000 - 1)
+    await prompt($, 't4', 'find why the build fails')
+    expect(sent[3]?.model).toBe('haiku')
+    await calls.clock.advance(5 * 60_000 + 1)
+    await prompt($, 't5', 'find why the build fails')
+    expect(sent[4]?.model).toBe('opus')
+    expect(await logText($)).toContain('(cache cold)')
+  })
+
+  test('with nothing set, the one-hour cache is assumed: five minutes idle is not cold but an hour is', async ($, on) => {
+    const sent: TurnStepInput[] = []
+    const calls = engine(on, replies(), sent, 'live', { usage: BIG, now: NOON })
+    await guarded($, sent)
+
+    await calls.clock.advance(6 * 60_000)
+    await prompt($, 't3', 'find why the build fails')
+    expect(sent[2]?.model).toBe('haiku')
+    await calls.clock.advance(61 * 60_000)
+    await prompt($, 't4', 'find why the build fails')
+    expect(sent[3]?.model).toBe('opus')
+  })
+
+  // The lifetime as `/pignon` reports it, with where it was read.
+  async function ttlOf($: Engine): Promise<string> {
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const { text = '' } = await $.command.run({ command: 'pignon', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+
+    return /ttl ([^·]+) ·/.exec(text)?.[1]?.trim() ?? text
+  }
+
+  test('reads the lifetime where the engine reads it: the env var, else the setting, else the 1h switch', async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    mock.env(on, { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m', ENABLE_PROMPT_CACHING_1H: '1' })
+    on('settings.read', () => ({ value: { promptCacheTtl: '1h' } }))
+
+    expect(await ttlOf($)).toBe('5m (CLAUDE_CODE_PROMPT_CACHE_TTL)')
+  })
+
+  test('the setting, then ENABLE_PROMPT_CACHING_1H, then the assumption', async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    let settings: Record<string, unknown> = { promptCacheTtl: '5m' }
+    let env: Record<string, string> = {}
+    on('settings.read', () => ({ value: settings }))
+    on('env.get', (_, e) => ({ value: env[e.name] }))
+
+    expect(await ttlOf($)).toBe('5m (promptCacheTtl setting)')
+    settings = {}
+    env = { ENABLE_PROMPT_CACHING_1H: '1' }
+    expect(await ttlOf($)).toBe('1h (ENABLE_PROMPT_CACHING_1H)')
+    env = {}
+    expect(await ttlOf($)).toBe('1h (assumed)')
+  })
+
+  test('FORCE_PROMPT_CACHING_5M beats them all, and the option beats the engine', { options: { cacheTtl: '1h' } }, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    mock.env(on, { FORCE_PROMPT_CACHING_5M: '1', CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' })
+
+    expect(await ttlOf($)).toBe('1h (option)')
+  })
+
+  test('FORCE_PROMPT_CACHING_5M beats the env var and the setting', async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    mock.env(on, { FORCE_PROMPT_CACHING_5M: '1', CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' })
+    on('settings.read', () => ({ value: { promptCacheTtl: '1h' } }))
+
+    expect(await ttlOf($)).toBe('5m (FORCE_PROMPT_CACHING_5M)')
+  })
+
+  test('/pignon says whether the cache is warm, cold or not yet written', { options: { cacheTtl: '5m' } }, async ($, on) => {
+    const calls = engine(on, TRIVIAL, [], 'live', { usage: BIG, now: NOON })
+    on('session.compact', () => ({ messages: [KEPT], tokensAfter: 20_000 }))
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const status = async () => (await $.command.run({ command: 'pignon', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })).text ?? ''
+
+    expect(await status()).toContain('context 0k · cache no request yet, ttl 5m (option)')
+    await prompt($, 't1', 'rename foo')
+    await calls.clock.advance(30_000)
+    expect(await status()).toContain('context 151k · cache warm (last request 30 s ago), ttl 5m (option)')
+    await calls.clock.advance(12 * 60_000 - 30_000)
+    expect(await status()).toContain('cache cold (idle 12 min)')
+    await $.session.compact({ trigger: 'manual', messages: [KEPT] })
+    expect(await status()).toContain('context 20k · cache cold (compacted)')
   })
 })

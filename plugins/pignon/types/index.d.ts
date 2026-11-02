@@ -10,6 +10,18 @@ export type Decision = {
   confidence: number
 }
 
+/** What a routed turn did once it ended: how many requests, why it stopped, what the API counted. */
+export type TurnOutcome = {
+  /** Model requests the main loop made for the turn. */
+  steps: number
+  reason: 'answer' | 'aborted' | 'refusal' | 'error'
+  durationMs: number
+  /** The API's counts summed over the turn, and the model that answered; absent when nothing counted. */
+  usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; model: string }
+  /** `usage` priced at list price when the turn ended, on the model that answered, on the session's and on the tier's; absent when one has no price. */
+  cost?: { actual: number; onSessionModel: number; onTier: number }
+}
+
 /** One routed prompt, as `/pignon log` lists it. */
 export type LogEntry = {
   /** Counts up through the session, so a late answer finds its entry. */
@@ -35,6 +47,8 @@ export type LogEntry = {
   /** The tier in force after the decision, null for the session's own model. */
   tier: string | null
   reason: string
+  /** Filled in when the turn ends. */
+  turn?: TurnOutcome
 }
 
 /**
@@ -77,6 +91,8 @@ export type DecisionRecord = {
   /** The session's own model. */
   model: string
   contextTokens: number
+  /** Added once the turn has ended. */
+  turn?: TurnOutcome
 }
 
 declare module 'claude-code' {
@@ -94,6 +110,10 @@ declare module 'claude-code' {
       isPinned: boolean
       /** The id the next log entry takes. */
       nextId: number
+      /** When the last main-loop request was answered, so an idle gap past the cache TTL is known; 0 before the first. */
+      lastRequestAt: number
+      /** True from a compaction until the next request: the cached prefix is gone. */
+      isCompacted: boolean
       log: Shaped<LogEntry[]>
     }
   }

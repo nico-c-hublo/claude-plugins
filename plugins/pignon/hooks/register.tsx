@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Decision, DecisionRecord, Effort, LogEntry } from '../types'
+import type { Decision, DecisionRecord, Effort, LogEntry, TurnOutcome } from '../types'
 import type { DeciderId } from './policy'
 import { KEEP_DAYS, MAX_RECORDS, parseRecords, recordOf, serialize, summarize } from './record'
 import {
@@ -12,9 +12,11 @@ import {
   decisionFromTiers,
   effectiveTier,
   isFollowUp,
+  isUnderRouted,
   parseDecision,
   tierOf,
 } from './policy'
+import { turnCost, usd } from './prices'
 
 type Mode = 'live' | 'shadow' | 'off'
 const MODES: readonly Mode[] = ['live', 'shadow', 'off']
@@ -24,8 +26,10 @@ const promptsSinceSwitch = atom({ plugin: 'pignon', key: 'promptsSinceSwitch' } 
 const contextTokens = atom({ plugin: 'pignon', key: 'contextTokens' } as const, 0)
 const base = atom({ plugin: 'pignon', key: 'base' } as const, null as string | null)
 const isPinned = atom({ plugin: 'pignon', key: 'isPinned' } as const, false)
-const log = atom({ plugin: 'pignon', key: 'log' } as const, [] as LogEntry[], { shape: 'log-4' })
+const log = atom({ plugin: 'pignon', key: 'log' } as const, [] as LogEntry[], { shape: 'log-5' })
 const nextId = atom({ plugin: 'pignon', key: 'nextId' } as const, 0)
+const lastRequestAt = atom({ plugin: 'pignon', key: 'lastRequestAt' } as const, 0)
+const isCompacted = atom({ plugin: 'pignon', key: 'isCompacted' } as const, false)
 
 const PANE = 'decisions'
 // What the local model reads of a prompt; the pane shows as much.
@@ -43,6 +47,33 @@ const LAUNCH_TIMEOUT_MS = 130_000
 const AUDIT_EVERY_MS = 5 * 60_000
 // lsof takes tens of milliseconds; one that hangs would stall every prompt, and counts as a failed check.
 const LSOF_TIMEOUT_MS = 2_000
+
+// How long the API keeps a cached prefix without a request: past it, a switch costs nothing.
+type CacheTtl = '5m' | '1h'
+const CACHE_TTL_MS: Record<CacheTtl, number> = { '5m': 5 * 60_000, '1h': 60 * 60_000 }
+
+// The main conversation's cache lifetime, read where the engine reads it and in
+// its order: FORCE_PROMPT_CACHING_5M, the env var, the setting, then
+// ENABLE_PROMPT_CACHING_1H. Past those the engine's default depends on the login
+// (an hour on a subscription within its plan, five minutes on an API key or a
+// cloud provider, five again once in overage) and it may renew the cache itself,
+// none of which a mod can see. The guess is then an hour: a cache called cold
+// while warm costs a re-cache of the context; one called warm while cold only
+// forgoes a free switch.
+async function resolveCacheTtl($: EngineInterface, option: unknown): Promise<{ ttl: CacheTtl; source: string }> {
+  if (option === '5m' || option === '1h') return { ttl: option, source: 'option' }
+  const isOn = (value: string | undefined) => value !== undefined && value !== '' && value !== '0' && value !== 'false'
+  // Each read on its own: one that fails (an unset variable in a mocked engine) must not hide the rest.
+  const unset = () => undefined
+  if (isOn(await $.env.get('FORCE_PROMPT_CACHING_5M').catch(unset))) return { ttl: '5m', source: 'FORCE_PROMPT_CACHING_5M' }
+  const env = await $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL').catch(unset)
+  if (env === '5m' || env === '1h') return { ttl: env, source: 'CLAUDE_CODE_PROMPT_CACHE_TTL' }
+  const setting = await $.settings.read({ key: 'promptCacheTtl' }).catch(unset)
+  if (setting === '5m' || setting === '1h') return { ttl: setting, source: 'promptCacheTtl setting' }
+  if (isOn(await $.env.get('ENABLE_PROMPT_CACHING_1H').catch(unset))) return { ttl: '1h', source: 'ENABLE_PROMPT_CACHING_1H' }
+
+  return { ttl: '1h', source: 'assumed' }
+}
 
 // Shadow until the person has watched a few decisions and says `/pignon live`.
 async function modeOf($: EngineInterface): Promise<Mode> {
@@ -274,6 +305,43 @@ async function recordSecond($: EngineInterface, id: number, second: { decision: 
   })
 }
 
+// So does the turn's end.
+async function recordTurn($: EngineInterface, id: number, turn: TurnOutcome): Promise<void> {
+  await keep($, list => {
+    const record = list.find(r => r.session === sessionId() && r.n === id)
+    if (record) record.turn = turn
+  })
+}
+
+// A routed turn still running: which entry it is, how many requests it has made
+// and the session's model, for the cost comparison when it ends.
+type RunningTurn = { id: number; steps: number; model: string }
+
+// The turn has ended: what it did goes on its entry, and on the record when kept.
+async function finishTurn(
+  $: EngineInterface,
+  turn: RunningTurn,
+  e: { reason: TurnOutcome['reason']; durationMs: number; usage?: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number; model: string } },
+  isRecording: boolean,
+): Promise<void> {
+  const entry = (await read($, log)).find(item => item.id === turn.id)
+  if (!entry) return
+  const u = e.usage
+  const usage = u
+    ? { input: u.input_tokens, output: u.output_tokens, cacheRead: u.cache_read_input_tokens, cacheWrite: u.cache_creation_input_tokens, model: u.model }
+    : undefined
+  const cost = usage ? turnCost(usage, turn.model, entry.tier) : null
+  const outcome: TurnOutcome = {
+    steps: turn.steps,
+    reason: e.reason,
+    durationMs: e.durationMs,
+    ...(usage && { usage }),
+    ...(cost && { cost }),
+  }
+  await update($, log, list => list.map(item => (item.id === turn.id ? { ...item, turn: outcome } : item)))
+  if (isRecording) await recordTurn($, turn.id, outcome)
+}
+
 async function pruneLog($: EngineInterface): Promise<void> {
   const dir = await decisionsDir($)
   await $.process.run(['find', dir, '-name', '*.jsonl', '-mtime', `+${KEEP_DAYS}`, '-delete']).catch(() => null)
@@ -413,7 +481,36 @@ function entryLines(entry: LogEntry): string[] {
     ...(secondLine(entry) ? [secondLine(entry)!] : []),
     outcomeLine(entry),
     entry.reason,
+    ...(turnLine(entry) ? [turnLine(entry)!] : []),
   ]
+}
+
+// What the turn did once it ended: its requests, its time, what it cost against
+// the session model (or would have, in shadow mode), and whether the tier held.
+function turnLine(entry: LogEntry): string | undefined {
+  const turn = entry.turn
+  if (!turn) return undefined
+  const cost = turn.cost
+  const money = !cost
+    ? ''
+    : entry.action === 'switched'
+      ? ` · ${usd(cost.actual)} (session model ${usd(cost.onSessionModel)})`
+      : entry.action === 'would switch'
+        ? ` · ${usd(cost.actual)} (would be ${usd(cost.onTier)} on ${entry.tier})`
+        : ` · ${usd(cost.actual)}`
+  const ended = turn.reason === 'answer' ? '' : ` · ${turn.reason}`
+
+  return `${turn.steps} step${turn.steps === 1 ? '' : 's'} · ${Math.round(turn.durationMs / 1000)} s${money}${ended}${isUnderRouted(entry) ? ' · under-routed' : ''}`
+}
+
+// This session's spend and savings, from the entries whose turn was priced.
+function sessionSavings(entries: readonly LogEntry[], mode: Mode): string {
+  const priced = entries.filter(entry => entry.turn?.cost)
+  if (priced.length === 0) return 'this session: no turn priced yet'
+  const total = (pick: (cost: NonNullable<TurnOutcome['cost']>) => number) => priced.reduce((sum, entry) => sum + pick(entry.turn!.cost!), 0)
+  if (mode === 'live') return `this session: spent ${usd(total(c => c.actual))} · saved ${usd(total(c => c.onSessionModel - c.actual))} (estimated at list price)`
+
+  return `this session: would have saved ${usd(total(c => c.onSessionModel - c.onTier))} of ${usd(total(c => c.onSessionModel))} (estimated at list price)`
 }
 
 // Haiku's opinion on a prompt the local model decided, and whether they agree
@@ -546,10 +643,14 @@ async function route(
   daemon: LocalDaemon,
   isShared: boolean,
   isRecording: boolean,
-) {
+  cacheTtlMs: number,
+): Promise<number> {
   const was = await read($, current)
   const startedAt = await $.clock.now()
   const contextSize = await read($, contextTokens)
+  // A compaction dropped the cached prefix, or the TTL has: the guards are moot.
+  const lastAt = await read($, lastRequestAt)
+  const isCacheCold = (await read($, isCompacted)) || (lastAt > 0 && startedAt - lastAt > cacheTtlMs)
   let decider: DeciderId = 'laya'
   // An acknowledgement needs no judge: it keeps the tier, whoever would have been asked.
   const isAcknowledgement = isFollowUp(text)
@@ -588,6 +689,7 @@ async function route(
     decider,
     contextTokens: contextSize,
     promptsSinceSwitch: await read($, promptsSinceSwitch),
+    isCacheCold,
   })
   const isLive = mode === 'live'
   const action = target === null ? 'kept' : isLive ? 'switched' : 'would switch'
@@ -642,6 +744,24 @@ async function route(
   const outcome = action === 'kept' ? `kept ${describe(now)}` : `${action} to ${describe(target)}`
   $.ui.log(`pignon ${verdict}  ${icon} ${outcome} (${reason})`)
   $.ui.status(`pignon ${mode}: ${describe(now)}`)
+
+  return id
+}
+
+// Whether the person picked a model or effort by hand: the request names the
+// session's model until a hook rewrites it, so a change here is theirs, and wins.
+async function hasPinned($: EngineInterface, e: { model: string; effort?: unknown }): Promise<boolean> {
+  const seen = `${e.model}|${e.effort ?? ''}`
+  const known = await read($, base)
+  await update($, base, () => seen)
+  if (known !== null && known !== seen && !(await read($, isPinned))) {
+    await update($, isPinned, () => true)
+    await update($, current, () => null)
+    $.ui.toast(`pignon paused: you picked ${e.model}. /pignon unpin to resume.`)
+    $.ui.status('pignon pinned')
+  }
+
+  return read($, isPinned)
 }
 
 export const register: Register = (on, options) => {
@@ -651,6 +771,10 @@ export const register: Register = (on, options) => {
   const prompts = new Map<string, string>()
   const isShared = decider === 'laya' && options.daemon === 'shared'
   const isRecording = options.record === 'on'
+  // Resolved at session start; the conservative guess until then.
+  let cache: { ttl: CacheTtl; source: string } = { ttl: '1h', source: 'assumed' }
+  // The routed turns still running, by turn id, until `turn.complete`.
+  const turns = new Map<string, RunningTurn>()
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -659,6 +783,7 @@ export const register: Register = (on, options) => {
       argumentHint: '[live|shadow|off|unpin|log|compare|stats|watch|setup]',
       immediate: true,
     })
+    cache = await resolveCacheTtl($, options.cacheTtl).catch(() => cache)
     if (isRecording) void pruneLog($)
     if (isShared) void connectShared($, daemon)
     else if (decider === 'laya') void launchDaemon($, daemon)
@@ -677,40 +802,49 @@ export const register: Register = (on, options) => {
     const mode = await modeOf($)
     const text = prompts.get(e.turnId)
     prompts.delete(e.turnId)
-    if (mode === 'off') return yield* next(e)
 
-    // The request names the session's model until a hook rewrites it, so a
-    // change here is the person's `/model` or `/effort`: theirs wins.
-    const seen = `${e.model}|${e.effort ?? ''}`
-    const known = await read($, base)
-    await update($, base, () => seen)
-    if (known !== null && known !== seen && !(await read($, isPinned))) {
-      await update($, isPinned, () => true)
-      await update($, current, () => null)
-      $.ui.toast(`pignon paused: you picked ${e.model}. /pignon unpin to resume.`)
-      $.ui.status('pignon pinned')
-    }
-    if (await read($, isPinned)) return yield* next(e)
-
-    if (e.index === 0 && text !== undefined) {
-      await route(
-        $,
-        text,
-        e.model,
-        e.effort as Effort | undefined,
-        mode,
-        decider === 'laya',
-        daemon,
-        isShared,
-        isRecording,
-      )
+    let request = e
+    if (mode !== 'off' && !(await hasPinned($, e))) {
+      if (e.index === 0 && text !== undefined) {
+        const id = await route($, text, e.model, e.effort as Effort | undefined, mode, decider === 'laya', daemon, isShared, isRecording, CACHE_TTL_MS[cache.ttl])
+        turns.set(e.turnId, { id, steps: 1, model: e.model })
+      } else {
+        const running = turns.get(e.turnId)
+        if (running) running.steps = Math.max(running.steps, e.index + 1)
+      }
+      const tier = mode === 'live' ? tierOf(await read($, current)) : undefined
+      if (tier) request = { ...e, model: tier.model, effort: tier.effort }
     }
 
-    const tier = mode === 'live' ? tierOf(await read($, current)) : undefined
-    const result = yield* next(tier ? { ...e, model: tier.model, effort: tier.effort } : e)
+    const result = yield* next(request)
     if (result.usage) {
       const u = result.usage
+      const now = await $.clock.now()
       await update($, contextTokens, () => u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
+      // A request went out on whatever runs now: its prefix is cached from here.
+      await update($, lastRequestAt, () => now)
+      await update($, isCompacted, () => false)
+    }
+
+    return result
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      const running = turns.get(e.turnId)
+      turns.delete(e.turnId)
+      if (running) await finishTurn($, running, e, isRecording).catch(() => undefined)
+    }
+
+    return next(e)
+  })
+
+  // Compacting drops the cached prefix: the next decision may switch freely.
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && e.trigger !== 'precompute' && result.skip === undefined) {
+      await update($, contextTokens, () => result.tokensAfter ?? 0)
+      await update($, isCompacted, () => true)
     }
 
     return result
@@ -747,6 +881,7 @@ export const register: Register = (on, options) => {
               {secondLine(entry) && <Text color={secondColor(entry)}>{secondLine(entry)}</Text>}
               <Text color={ACTION_COLOR[entry.action]}>{outcomeLine(entry)}</Text>
               <Text dimColor>{entry.reason}</Text>
+              {turnLine(entry) && <Text color={isUnderRouted(entry) ? 'warning' : 'inactive'}>{turnLine(entry)}</Text>}
             </Box>
           )
         })}
@@ -805,7 +940,8 @@ export const register: Register = (on, options) => {
           .map(l => {
             const d = l.decision
             const verdict = d ? `${d.tier}${d.explore ? '/explore' : ''} p=${d.confidence.toFixed(2)}` : 'none'
-            return `${l.action.padEnd(12)} ${(l.decider ?? 'haiku').padEnd(6)} ${verdict.padEnd(24)} ${String(l.ms).padStart(5)} ms  ${l.reason}\n    “${l.prompt}”`
+            const turn = turnLine(l)
+            return `${l.action.padEnd(12)} ${(l.decider ?? 'haiku').padEnd(6)} ${verdict.padEnd(24)} ${String(l.ms).padStart(5)} ms  ${l.reason}\n    “${l.prompt}”${turn ? `\n    ${turn}` : ''}`
           })
           .join('\n'),
       }
@@ -816,6 +952,15 @@ export const register: Register = (on, options) => {
       t => `  ${t.id.padEnd(9)} ${`${t.model}/${t.effort}`.padEnd(14)} ${t.canExplore ? '' : '(no exploration) '}${t.criteria}`,
     ).join('\n')
     const guard = `cache guard ${THRESHOLDS.cacheGuardTokens / 1000}k tokens (${THRESHOLDS.upgradeGuardTokens / 1000}k for upgrades), cooldown ${THRESHOLDS.minPromptsBetweenSwitches} prompts`
+    const lastAt = await read($, lastRequestAt)
+    const idleMs = (await $.clock.now()) - lastAt
+    const cacheState = (await read($, isCompacted))
+      ? 'cold (compacted)'
+      : lastAt === 0
+        ? 'no request yet'
+        : idleMs > CACHE_TTL_MS[cache.ttl]
+          ? `cold (idle ${Math.round(idleMs / 60_000)} min)`
+          : `warm (last request ${Math.round(idleMs / 1000)} s ago)`
 
     return {
       text: [
@@ -829,7 +974,8 @@ export const register: Register = (on, options) => {
                 ? 'laya (starting: Haiku decides until the model has loaded)'
                 : 'laya (not running: Haiku decides; /pignon setup builds it)'
         }`,
-        `context ${Math.round((await read($, contextTokens)) / 1000)}k · ${guard}`,
+        `context ${Math.round((await read($, contextTokens)) / 1000)}k · cache ${cacheState}, ttl ${cache.ttl} (${cache.source}) · ${guard}`,
+        sessionSavings(await read($, log), mode),
         table,
         `decision log: ${isRecording ? `on (${kept.length} this session; /pignon stats sums them)` : 'off'}`,
         'Commands: /pignon live | shadow | off | unpin | log | compare | stats | watch | setup',
