@@ -1,5 +1,5 @@
 import type { Decision, DecisionRecord, LogEntry, Mark, TurnOutcome } from '../types'
-import { LOCAL_PROMPT_CHARS, THRESHOLDS, TIERS, effectiveTier, hybridDecision, isAccepted, isUnderRouted, ranOn, tierOfModel, verdictSignal } from './policy'
+import { LOCAL_PROMPT_CHARS, THRESHOLDS, TIERS, effectiveTier, failedAfterSwitch, hybridDecision, isAccepted, ranLongOnTrivial, ranOn, tierOfModel, verdictSignal } from './policy'
 import { usd } from './prices'
 
 // A session file holds this many records at most; the oldest go first.
@@ -384,8 +384,8 @@ function costLines(records: readonly DecisionRecord[]): string[] {
   }
 
   const ended = records.filter(r => r.turn)
-  const long = ended.filter(r => isUnderRouted(r) && r.tier === TIERS[0]!.id && r.turn!.steps >= THRESHOLDS.longTurnSteps)
-  const failed = ended.filter(r => isUnderRouted(r) && r.action === 'switched' && r.turn!.reason !== 'answer')
+  const long = ended.filter(ranLongOnTrivial)
+  const failed = ended.filter(failedAfterSwitch)
   const parts = [
     ...(long.length > 0 ? [`${long.length} trivial turn${long.length === 1 ? '' : 's'} ran ${THRESHOLDS.longTurnSteps}+ steps`] : []),
     ...(failed.length > 0 ? [`${failed.length} switched turn${failed.length === 1 ? '' : 's'} ended in an error or a refusal`] : []),

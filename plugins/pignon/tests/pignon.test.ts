@@ -1889,6 +1889,10 @@ describe('the decision log: the cost', () => {
     const text = summarize([recordOf(entry({ action: 'switched', tier: 'standard', turn: ended({ reason: 'error' }), mode: 'live' }), CONTEXT)], 1)
     expect(text).toContain('under-routed: 1 switched turn ended in an error or a refusal')
 
+    const aborted = summarize([recordOf(entry({ action: 'switched', tier: 'trivial', turn: ended({ steps: 9, reason: 'aborted' }), mode: 'live' }), CONTEXT)], 1)
+    expect(aborted).toContain('under-routed: 1 trivial turn ran 8+ steps')
+    expect(aborted).not.toContain('error or a refusal')
+
     const none = summarize([recordOf(entry(), CONTEXT)], 1)
     expect(none).not.toContain('cost')
     expect(none).not.toContain('under-routed')
