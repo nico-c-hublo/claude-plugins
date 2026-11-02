@@ -206,17 +206,25 @@ function short(model: string): string {
   return familyOf(model) ?? model
 }
 
+type Routed = { tier: string | null; action: LogEntry['action']; turn?: TurnOutcome }
+
+/** A trivial turn that ran a long tool loop. False until the turn has ended. */
+export function ranLongOnTrivial(entry: Routed): boolean {
+  return entry.tier === TIERS[0]!.id && entry.turn !== undefined && entry.turn.steps >= THRESHOLDS.longTurnSteps
+}
+
+/** A switched turn that ended in an error or a refusal. False until the turn has ended. */
+export function failedAfterSwitch(entry: Routed): boolean {
+  return entry.action === 'switched' && (entry.turn?.reason === 'error' || entry.turn?.reason === 'refusal')
+}
+
 /**
  * Whether the tier fell short of the task: a trivial turn that ran a long tool
  * loop, or a turn that was switched and ended in an error or a refusal. The
  * quality signal the savings are weighed against. False until the turn has ended.
  */
-export function isUnderRouted(entry: { tier: string | null; action: LogEntry['action']; turn?: TurnOutcome }): boolean {
-  const turn = entry.turn
-  if (!turn) return false
-  if (entry.tier === TIERS[0]!.id && turn.steps >= THRESHOLDS.longTurnSteps) return true
-
-  return entry.action === 'switched' && (turn.reason === 'error' || turn.reason === 'refusal')
+export function isUnderRouted(entry: Routed): boolean {
+  return ranLongOnTrivial(entry) || failedAfterSwitch(entry)
 }
 
 /**
