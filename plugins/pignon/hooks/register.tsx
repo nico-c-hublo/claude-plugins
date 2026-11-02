@@ -865,6 +865,7 @@ async function route(
     at: startedAt,
     mode: isLive ? 'live' : 'shadow',
     model,
+    was,
     prompt: text.slice(0, 80).replace(/\s+/g, ' '),
     promptChars: text.length,
     sent: isAcknowledgement ? '' : text.slice(0, LOCAL_PROMPT_CHARS),
@@ -887,7 +888,6 @@ async function route(
       project: await $.session.cwd(),
       chosen: wantsLocal ? ('laya' as const) : ('haiku' as const),
       daemon: wantsLocal ? (isShared ? ('shared' as const) : ('session' as const)) : null,
-      was,
       contextTokens: contextSize,
     }
     void recordDecision($, recordOf(entry, context))

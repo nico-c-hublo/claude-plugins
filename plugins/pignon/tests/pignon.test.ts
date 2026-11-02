@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { HttpInit, On, ProcessSpawnRequest, TurnStepInput, TurnUsage } from 'claude-code'
 
 import type { DecisionRecord, LogEntry, TurnOutcome } from '../types'
-import { acceptedTiers, decide, decisionFromTiers, isCorrection, isFollowUp, isUnderRouted, parseDecision, verdictSignal } from '../hooks/policy'
+import { acceptedTiers, decide, decisionFromTiers, hybridDecision, isCorrection, isFollowUp, isUnderRouted, parseDecision, verdictSignal } from '../hooks/policy'
 import { priceOf, turnCost, usd } from '../hooks/prices'
 import { parseRecords, recordOf, serialize, summarize } from '../hooks/record'
 
@@ -1413,6 +1413,7 @@ function entry(over: Partial<LogEntry> = {}): LogEntry {
     at: Date.UTC(2026, 9, 30, 12, 0, 0),
     mode: 'shadow',
     model: OPUS,
+    was: null,
     prompt: SECRET.slice(0, 80),
     promptChars: SECRET.length,
     sent: SECRET,
@@ -1434,7 +1435,6 @@ const CONTEXT = {
   project: '/work/api',
   chosen: 'laya' as const,
   daemon: 'shared' as const,
-  was: null,
   contextTokens: 12_000,
 }
 
@@ -2169,6 +2169,38 @@ describe('policy: what a mark accepts', () => {
   })
 })
 
+describe('policy: the hybrid judge', () => {
+  const say = (tier: string, confidence = 0.8, explore = false) => ({ tier, explore, confidence })
+
+  test("laya's verdict stands when it keeps the tier or moves up, whatever Haiku says", async () => {
+    expect(hybridDecision(say('hard', 0.6), say('trivial'), 'hard')).toEqual(say('hard', 0.6))
+    expect(hybridDecision(say('hard', 0.6), null, 'trivial')).toEqual(say('hard', 0.6))
+    expect(hybridDecision(say('standard', 0.7), say('trivial'), 'trivial')).toEqual(say('standard', 0.7))
+  })
+
+  test('a downgrade goes no lower than the more capable of the two verdicts', async () => {
+    expect(hybridDecision(say('trivial', 0.9), say('trivial'), 'hard')).toEqual(say('trivial', 0.9))
+    expect(hybridDecision(say('trivial', 0.9), say('standard'), 'hard')).toEqual(say('standard', 0.9))
+    expect(hybridDecision(say('standard', 0.9), say('hard'), 'hard')).toEqual(say('hard', 0.9))
+    // Haiku saying trivial but explore runs on standard
+    expect(hybridDecision(say('trivial', 0.9), say('trivial', 0.8, true), 'hard')).toEqual(say('standard', 0.9))
+  })
+
+  test('a downgrade Haiku contests by asking for more goes to what Haiku asked', async () => {
+    expect(hybridDecision(say('trivial', 0.9), say('hard'), 'standard')).toEqual(say('hard', 0.9))
+  })
+
+  test('no downgrade without an answer from Haiku', async () => {
+    expect(hybridDecision(say('trivial', 0.9), null, 'hard')).toEqual(say('hard', 0.9))
+  })
+
+  test("laya's verdict on a model of no tier, and nothing without laya's verdict", async () => {
+    expect(hybridDecision(say('trivial', 0.9), say('hard'), null)).toEqual(say('trivial', 0.9))
+    expect(hybridDecision(null, say('hard'), 'hard')).toBe(null)
+    expect(hybridDecision(say('same', 1), say('hard'), 'hard')).toBe(null)
+  })
+})
+
 describe('the decision log: judging the judges', () => {
   const ended = (steps: number, output = 400): TurnOutcome => ({
     steps,
@@ -2224,6 +2256,42 @@ describe('the decision log: judging the judges', () => {
     expect(text).toMatch(/0\.70 to 0\.85\s+right 100% of 1 marked/)
     expect(text).toMatch(/p ≥ 0\.85\s+too low 100% of 1 trivial · right 0% of 1 marked · same as opus 0% of 1/)
     expect(text).toContain('oracle: opus asked 2 times, $0.020 at list price')
+  })
+
+  test('simulates the hybrid wherever laya decided and Haiku answered beside it, and scores it like the others', async () => {
+    // shadow mode on Opus: the tier in force is hard
+    const both = (id: number, laya: string, haiku: string | null, oracle?: string) =>
+      recordOf(
+        entry({
+          id,
+          decision: opinion(laya, 0.9),
+          second: haiku === null ? undefined : { decision: opinion(haiku), ms: 600 },
+          ...(oracle && { oracle: { decision: opinion(oracle), ms: 1 } }),
+        }),
+        CONTEXT,
+      )
+    const records = [
+      both(1, 'trivial', 'trivial', 'trivial'), // confirmed: trivial
+      both(2, 'trivial', 'standard', 'standard'), // Haiku holds it at standard
+      both(3, 'hard', 'trivial', 'hard'), // no downgrade proposed: hard
+      both(4, 'trivial', null), // Haiku not asked: no hybrid verdict
+    ]
+
+    const text = summarize(records, 1)
+
+    expect(text).toContain('laya   4 verdicts · same as opus 67% of 3')
+    expect(text).toContain('hybrid 3 verdicts · same as opus 100% of 3')
+    expect(text).toContain('hybrid: simulated, not run')
+  })
+
+  test('the hybrid is measured against the tier that was in force, in live mode', async () => {
+    // on trivial, laya's standard is an upgrade: laya's verdict stands, though Haiku said trivial
+    const record = recordOf(
+      entry({ mode: 'live', was: 'trivial', decision: opinion('standard', 0.7), second: { decision: opinion('trivial'), ms: 1 }, oracle: { decision: opinion('standard'), ms: 1 } }),
+      CONTEXT,
+    )
+
+    expect(summarize([record], 1)).toContain('hybrid 1 verdict · same as opus 100% of 1')
   })
 
   test("splits the local model's agreement with opus by whether it read the whole prompt", async () => {

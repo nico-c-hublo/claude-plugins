@@ -1,5 +1,5 @@
 import type { Decision, DecisionRecord, LogEntry, Mark, TurnOutcome } from '../types'
-import { LOCAL_PROMPT_CHARS, THRESHOLDS, TIERS, effectiveTier, isAccepted, isUnderRouted, ranOn, verdictSignal } from './policy'
+import { LOCAL_PROMPT_CHARS, THRESHOLDS, TIERS, effectiveTier, hybridDecision, isAccepted, isUnderRouted, ranOn, tierOfModel, verdictSignal } from './policy'
 import { usd } from './prices'
 
 // A session file holds this many records at most; the oldest go first.
@@ -13,7 +13,6 @@ export type RecordContext = {
   project: string
   chosen: 'haiku' | 'laya'
   daemon: 'session' | 'shared' | null
-  was: string | null
   contextTokens: number
 }
 
@@ -51,7 +50,7 @@ export function recordOf(entry: LogEntry, context: RecordContext): DecisionRecor
     ms: entry.ms,
     ...(entry.daemonMs !== undefined && { daemonMs: entry.daemonMs }),
     action: entry.action,
-    was: context.was,
+    was: entry.was,
     tier: entry.tier,
     reason: entry.reason.slice(0, REASON_CHARS),
     model: entry.model,
@@ -182,14 +181,15 @@ export function summarize(records: readonly DecisionRecord[], sessions: number):
   return lines.join('\n')
 }
 
-export type JudgeId = 'laya' | 'haiku' | 'opus'
-const JUDGES: readonly JudgeId[] = ['laya', 'haiku', 'opus']
+/** Who judged: the two deciders, the hybrid simulated from them, the oracle. */
+export type JudgeId = 'laya' | 'haiku' | 'hybrid' | 'opus'
+const JUDGES: readonly JudgeId[] = ['laya', 'haiku', 'hybrid', 'opus']
 
 /** What a prompt's judges said and what came of it: a record on disk, or a log entry of this session. */
 export type Judged = {
   decider: DecisionRecord['decider']
   decision: Decision | null
-  second?: { decision: Decision | null }
+  second?: { decision: Decision | null; isPending?: boolean }
   oracle?: { decision: Decision | null }
   mark?: Mark
   turn?: TurnOutcome
@@ -199,11 +199,15 @@ export type Judged = {
   tier: string | null
   /** The session's own model. */
   model: string
+  /** The tier in force before the decision, null for the session's own model. */
+  was: string | null
   promptChars: number
 }
 
-// One judge's opinion on one prompt: the decider's, Haiku's second opinion, or
-// the oracle's. Haiku is one judge whether it decided or was asked.
+// One judge's opinion on one prompt: the decider's, Haiku's second opinion, the
+// hybrid's, or the oracle's. Haiku is one judge whether it decided or was asked.
+// The hybrid is simulated wherever laya decided and Haiku answered beside it (in
+// shadow mode): what it would have said, from their two verdicts.
 type Verdict = { judge: JudgeId; decision: Decision; tier: string; of: Judged }
 
 export function verdictsOf(items: readonly Judged[]): Verdict[] {
@@ -215,6 +219,9 @@ export function verdictsOf(items: readonly Judged[]): Verdict[] {
   for (const item of items) {
     if (item.decider === 'laya' || item.decider === 'haiku') add(item.decider, item.decision, item)
     add('haiku', item.second?.decision, item)
+    if (item.decider === 'laya' && item.second && !item.second.isPending) {
+      add('hybrid', hybridDecision(item.decision, item.second.decision, item.was ?? tierOfModel(item.model)), item)
+    }
     add('opus', item.oracle?.decision, item)
   }
 
@@ -305,7 +312,8 @@ export function scoreCells(judge: JudgeId, s: Score): string[] {
 // judge and by its confidence. The table the bars are tuned on.
 function judgeLines(records: readonly DecisionRecord[]): string[] {
   const lines: string[] = []
-  for (const { judge, verdicts, score } of scoreByJudge(records)) {
+  const scores = scoreByJudge(records)
+  for (const { judge, verdicts, score } of scores) {
     lines.push(`  ${judge.padEnd(6)} ${[`${score.verdicts} verdict${score.verdicts === 1 ? '' : 's'}`, ...scoreCells(judge, score)].join(' · ')}`)
     for (const band of BANDS) {
       const inBand = verdicts.filter(v => v.decision.confidence >= band.from && v.decision.confidence < band.to)
@@ -322,6 +330,9 @@ function judgeLines(records: readonly DecisionRecord[]): string[] {
     '',
     'judges, scored on outcomes, your marks and the oracle:',
     ...lines,
+    ...(scores.some(s => s.judge === 'hybrid')
+      ? [`  hybrid: simulated, not run: laya's verdict, except that a move below the tier in force needs Haiku and goes no lower than the more capable of the two`]
+      : []),
     `  too low: a trivial verdict whose turn ran ${THRESHOLDS.longTurnSteps}+ steps · too high: a hard verdict whose turn answered in ${THRESHOLDS.shortTurnSteps} requests or fewer, under ${THRESHOLDS.shortTurnOutputTokens.toLocaleString('en-US')} output tokens and ${THRESHOLDS.shortTurnMs / 1000} s · corrected: the next prompt said the answer was wrong`,
     ...(asked > 0 ? [`  oracle: opus asked ${asked} time${asked === 1 ? '' : 's'}, ${usd(oracleCost)} at list price`] : []),
     ...correctionLines(records),
