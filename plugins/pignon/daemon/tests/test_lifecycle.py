@@ -200,6 +200,17 @@ class SharedDaemonTest(unittest.TestCase):
         # Detached: adopted by launchd, in a session of its own.
         self.assertEqual(subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True).stdout.strip(), "1")
 
+    def test_the_daemon_is_a_new_process_not_a_fork_of_the_launcher(self):
+        """A fork cannot reach MTLCompilerService, and MLX fails there with a cold shader cache."""
+        done = self.launch(scorer="FreshProcessScorer")
+
+        self.assertEqual(done.returncode, 0, done.stdout)
+        pid = int(done.stdout.split()[1])
+        # As the launch read, so `/pignon daemon stop` and status find it with `ps`.
+        command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+        self.assertIn(" --shared", command)
+        self.assertIn(f"--socket {self.socket_path}", command)
+
     def test_a_second_launch_finds_the_daemon_and_loads_nothing(self):
         first = self.launch()
 

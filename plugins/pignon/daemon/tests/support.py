@@ -45,6 +45,23 @@ class SlowLoadScorer(FakeScorer):
         time.sleep(1.5)
 
 
+# The process that imported this module: a forked child inherits the module, and the parent's pid with it.
+IMPORTED_BY = os.getpid()
+
+
+class FreshProcessScorer(FakeScorer):
+    """Loads only in a process of its own making, not in a fork of the launcher.
+
+    The real model needs this: a forked child cannot reach macOS XPC services,
+    so MLX could not compile its Metal kernels there.
+    """
+
+    def __init__(self):
+        if IMPORTED_BY != os.getpid():
+            raise RuntimeError("loaded in a forked child")
+        super().__init__()
+
+
 class FailingScorer:
     """A model that cannot be loaded."""
 
