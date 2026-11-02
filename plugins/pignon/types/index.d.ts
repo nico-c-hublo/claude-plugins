@@ -22,13 +22,40 @@ export type TurnOutcome = {
   cost?: { actual: number; onSessionModel: number; onTier: number }
 }
 
+/**
+ * Your verdict on a decision, from `/pignon mark` or the pane: which tiers would
+ * have been right. A judge is scored right when the tier it would run is one of them.
+ */
+export type Mark = {
+  /** What you said: `low` (too low), `ok`, `high` (too high), or a tier by name. */
+  said: string
+  /** The tier a relative mark was taken against: the one the decision's line named, which ran in live mode. */
+  of: string | null
+  /** The tiers it accepts: `ok` that one, `low` every tier above it, `high` every one below, a name itself. */
+  accepted: string[]
+}
+
+/** The reference judge's opinion, asked in shadow mode when the oracle is on. */
+export type OracleOpinion = {
+  decision: Decision | null
+  ms: number
+  /** What the call cost at list price; absent when it was not answered. */
+  cost?: number
+}
+
 /** One routed prompt, as `/pignon log` lists it. */
 export type LogEntry = {
   /** Counts up through the session, so a late answer finds its entry. */
   id: number
   /** When it was decided, in milliseconds since the epoch. */
   at: number
+  /** The mode it was decided in: in live mode the tier ran, in shadow mode the session's model did. */
+  mode: 'live' | 'shadow'
+  /** The session's own model. */
+  model: string
   prompt: string
+  /** Characters in the prompt: the local model reads the first 400 of them. */
+  promptChars: number
   /** The start of the prompt as a decider read it; empty when a rule decided. */
   sent: string
   /** The local model's probability for each tier, when it answered. */
@@ -39,6 +66,12 @@ export type LogEntry = {
   fallback?: string
   /** Haiku's opinion on the same prompt, asked in shadow mode for comparison. */
   second?: { decision: Decision | null; ms: number; isPending?: boolean }
+  /** Opus's opinion on the same prompt, asked in shadow mode when the oracle is on. */
+  oracle?: OracleOpinion & { isPending?: boolean }
+  /** True once the next prompt read as a correction of this turn's answer ("no, ...", "pas ça"). */
+  corrected?: true
+  /** Your verdict, from `/pignon mark` or the pane. */
+  mark?: Mark
   /** Who decided: Haiku, the model on this Mac, or a rule (an acknowledgement). */
   decider: 'haiku' | 'laya' | 'rule'
   decision: Decision | null
@@ -78,6 +111,12 @@ export type DecisionRecord = {
   decision: Decision | null
   /** Haiku's opinion in shadow mode, once it has answered (or failed to). */
   second?: { decision: Decision | null; ms: number }
+  /** Opus's opinion when the oracle is on, once it has answered (or failed to). */
+  oracle?: OracleOpinion
+  /** Added when the next prompt read as a correction of this turn's answer. */
+  corrected?: true
+  /** Added when you marked the decision. */
+  mark?: Mark
   /** Why the local model, though chosen, did not decide. */
   fallback?: string
   /** What the decision took, from the mod's clock. */

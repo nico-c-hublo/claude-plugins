@@ -1,22 +1,30 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Decision, DecisionRecord, Effort, LogEntry, TurnOutcome } from '../types'
+import type { Decision, DecisionRecord, Effort, LogEntry, Mark, OracleOpinion, TurnOutcome } from '../types'
 import type { DeciderId } from './policy'
-import { KEEP_DAYS, MAX_RECORDS, parseRecords, recordOf, serialize, summarize } from './record'
+import { KEEP_DAYS, MAX_RECORDS, parseRecords, recordOf, scoreByJudge, scoreCells, serialize, settled, summarize } from './record'
 import {
   DECIDER_SYSTEM,
+  LOCAL_PROMPT_CHARS,
+  MARKS,
   THRESHOLDS,
   TIERS,
+  acceptedTiers,
   decide,
   decisionFromTiers,
   effectiveTier,
+  isAccepted,
+  isCorrection,
   isFollowUp,
+  isMarkWord,
   isUnderRouted,
+  markLabel,
   parseDecision,
+  shownTier,
   tierOf,
 } from './policy'
-import { turnCost, usd } from './prices'
+import { priceOf, turnCost, usd } from './prices'
 
 type Mode = 'live' | 'shadow' | 'off'
 const MODES: readonly Mode[] = ['live', 'shadow', 'off']
@@ -32,11 +40,14 @@ const lastRequestAt = atom({ plugin: 'pignon', key: 'lastRequestAt' } as const, 
 const isCompacted = atom({ plugin: 'pignon', key: 'isCompacted' } as const, false)
 
 const PANE = 'decisions'
-// What the local model reads of a prompt; the pane shows as much.
-const SENT_CHARS = 400
 
-const DECIDER_MODEL = 'haiku'
-const DECIDER_TIMEOUT_MS = 5_000
+// A judge reads the same blind input: the system prompt, the tier in force, the start of the prompt.
+type Judge = { model: string; effort: Effort; maxTokens: number; timeoutMs: number }
+const HAIKU: Judge = { model: 'haiku', effort: 'low', maxTokens: 100, timeoutMs: 5_000 }
+// The reference the others are scored against, in shadow mode when the oracle is
+// on: the strongest model, asked once the turn has ended so it never competes with
+// it. Medium effort, and room enough that thinking does not eat the answer.
+const ORACLE: Judge = { model: 'opus', effort: 'medium', maxTokens: 4_096, timeoutMs: 60_000 }
 const PROMPT_CHARS = 4_000
 // The daemon answers in about 10 ms; this is for one that is stuck.
 const LOCAL_TIMEOUT_MS = 1_500
@@ -81,17 +92,34 @@ async function modeOf($: EngineInterface): Promise<Mode> {
   return MODES.includes(mode as Mode) ? (mode as Mode) : 'shadow'
 }
 
-async function ask($: EngineInterface, text: string, tier: string | null): Promise<Decision | null> {
+// A judge's verdict on the prompt, and what asking cost at list price.
+async function askJudge($: EngineInterface, judge: Judge, text: string, tier: string | null): Promise<{ decision: Decision | null; cost?: number }> {
   const reply = await $.model.complete({
-    model: DECIDER_MODEL,
+    model: judge.model,
     system: DECIDER_SYSTEM,
     prompt: `Current tier: ${tier ?? 'none'}\n\n<prompt>\n${text.slice(0, PROMPT_CHARS)}\n</prompt>`,
-    maxTokens: 100,
-    effort: 'low',
-    timeoutMs: DECIDER_TIMEOUT_MS,
+    maxTokens: judge.maxTokens,
+    effort: judge.effort,
+    timeoutMs: judge.timeoutMs,
   })
+  const usage = reply.usage
+  const cost = usage
+    ? priceOf(
+        { input: usage.input_tokens, output: usage.output_tokens, cacheRead: usage.cache_read_input_tokens, cacheWrite: usage.cache_creation_input_tokens },
+        judge.model,
+      )
+    : null
 
-  return reply.isAnswered ? parseDecision(reply.text) : null
+  return { decision: reply.isAnswered ? parseDecision(reply.text) : null, ...(cost !== null && { cost }) }
+}
+
+// What lands on an entry after its decision (Haiku's and the oracle's opinions,
+// the turn's end, a correction, your mark), and on its record when the log is kept.
+type Amendment = Partial<Pick<LogEntry, 'second' | 'oracle' | 'turn' | 'corrected' | 'mark'>>
+
+async function amendEntry($: EngineInterface, id: number, fields: Amendment, isRecording: boolean): Promise<void> {
+  await update($, log, list => list.map(entry => (entry.id === id ? { ...entry, ...fields } : entry)))
+  if (isRecording) await amendRecord($, id, fields)
 }
 
 // Haiku's opinion on a prompt the local model decided, for comparison. Shadow
@@ -104,11 +132,67 @@ async function secondOpinion(
   isRecording: boolean,
 ): Promise<void> {
   const startedAt = await $.clock.now()
-  const decision = await ask($, text, tier).catch(() => null)
+  const decision = await askJudge($, HAIKU, text, tier).then(answer => answer.decision, () => null)
   const ms = Math.round((await $.clock.now()) - startedAt)
 
-  await update($, log, list => list.map(entry => (entry.id === id ? { ...entry, second: { decision, ms } } : entry)))
-  if (isRecording) await recordSecond($, id, { decision, ms })
+  await amendEntry($, id, { second: { decision, ms } }, isRecording)
+}
+
+// Opus's opinion on a judged prompt, the reference the judges are scored against.
+// Asked when its turn has ended, in the background: shadow mode switches nothing.
+async function oracleOpinion(
+  $: EngineInterface,
+  id: number,
+  text: string,
+  tier: string | null,
+  isRecording: boolean,
+): Promise<void> {
+  const startedAt = await $.clock.now()
+  const answer = await askJudge($, ORACLE, text, tier).catch(() => ({ decision: null }) as { decision: null; cost?: number })
+  const oracle: OracleOpinion = {
+    decision: answer.decision,
+    ms: Math.round((await $.clock.now()) - startedAt),
+    ...(answer.cost !== undefined && { cost: answer.cost }),
+  }
+
+  await amendEntry($, id, { oracle }, isRecording)
+}
+
+// The entry a mark applies to: the newest a judge decided (an acknowledgement has no verdict to mark).
+function markable(entries: readonly LogEntry[]): LogEntry | undefined {
+  return entries.findLast(entry => entry.decider !== 'rule')
+}
+
+// What a decision's line said, the reference a relative mark is taken against:
+// `kept hard (laya said trivial)`.
+function shownLine(entry: LogEntry): string {
+  const shown = shownTier(entry) ?? 'the session model'
+  const said = effectiveTier(entry.decision)
+  const outcome = entry.action === 'kept' ? `kept ${shown}` : `${entry.action} to ${shown}`
+
+  return said === null || said === shown ? `${entry.decider} said ${said ?? 'nothing'}, ${outcome}` : `${outcome}, ${entry.decider} said ${said}`
+}
+
+// Your verdict on entry `id`: which tiers would have been right. A relative mark
+// is taken against the tier the decision's line named, which ran in live mode,
+// not against a verdict a bar or the cache guard set aside. Says what was marked, or why not.
+async function markEntry($: EngineInterface, id: number, said: string, isRecording: boolean): Promise<string> {
+  const entry = (await read($, log)).find(item => item.id === id)
+  if (!entry) return 'That decision is no longer in the log.'
+  const of = shownTier(entry)
+  const accepted = acceptedTiers(said, of)
+  if (!accepted) {
+    return of === null
+      ? `“${entry.prompt}” ran on a model of no tier: name the right tier (/pignon mark ${TIERS.map(t => t.id).join('|')}).`
+      : `Nothing is ${said === 'low' ? 'above' : 'below'} ${of}: mark it ok, or name the right tier.`
+  }
+  const mark: Mark = { said, of: isMarkWord(said) ? of : null, accepted }
+  await amendEntry($, id, { mark }, isRecording)
+
+  return (
+    `Marked #${id} “${entry.prompt}” (${shownLine(entry)}): the right tier is ${accepted.join(' or ')}.` +
+    (isRecording ? '' : ' The decision log is off, so the mark counts in /pignon compare for this session only; turn the log on to count marks in /pignon stats.')
+  )
 }
 
 // What the local model's daemon answered, or why there is no answer.
@@ -297,25 +381,27 @@ async function recordDecision($: EngineInterface, record: DecisionRecord): Promi
   })
 }
 
-// Haiku's opinion lands after the decision: it fills in the record already kept.
-async function recordSecond($: EngineInterface, id: number, second: { decision: Decision | null; ms: number }): Promise<void> {
+// What lands after the decision (Haiku's and the oracle's opinions, the turn's
+// end, a correction, your mark) fills in the record already kept.
+async function amendRecord($: EngineInterface, id: number, fields: Amendment): Promise<void> {
+  const { second, oracle, ...rest } = fields
   await keep($, list => {
     const record = list.find(r => r.session === sessionId() && r.n === id)
-    if (record) record.second = second
-  })
-}
-
-// So does the turn's end.
-async function recordTurn($: EngineInterface, id: number, turn: TurnOutcome): Promise<void> {
-  await keep($, list => {
-    const record = list.find(r => r.session === sessionId() && r.n === id)
-    if (record) record.turn = turn
+    if (!record) return
+    // A pending opinion is not kept: the record waits for the answer.
+    Object.assign(record, rest, settled(second) && { second: settled(second) }, settled(oracle) && { oracle: settled(oracle) })
   })
 }
 
 // A routed turn still running: which entry it is, how many requests it has made
 // and the session's model, for the cost comparison when it ends.
-type RunningTurn = { id: number; steps: number; model: string }
+type RunningTurn = {
+  id: number
+  steps: number
+  model: string
+  /** What the oracle is asked once the turn has ended, when it is on. */
+  oracle?: OracleInput
+}
 
 // The turn has ended: what it did goes on its entry, and on the record when kept.
 async function finishTurn(
@@ -338,8 +424,8 @@ async function finishTurn(
     ...(usage && { usage }),
     ...(cost && { cost }),
   }
-  await update($, log, list => list.map(item => (item.id === turn.id ? { ...item, turn: outcome } : item)))
-  if (isRecording) await recordTurn($, turn.id, outcome)
+  await amendEntry($, turn.id, { turn: outcome }, isRecording)
+  if (turn.oracle) void oracleOpinion($, turn.id, turn.oracle.text, turn.oracle.tier, isRecording)
 }
 
 async function pruneLog($: EngineInterface): Promise<void> {
@@ -443,22 +529,26 @@ async function launchDaemon($: EngineInterface, daemon: LocalDaemon): Promise<vo
     cwd: `${$.plugin.root}/daemon`,
   })
   let isReady = false
-  for await (const piece of child) {
-    const pid = piece.stream === 'stdout' ? /^ready (\d+)/m.exec(piece.text)?.[1] : undefined
-    if (pid === undefined) continue
-    const problem = await socketProblem($, pid)
-    if (problem !== null) {
-      $.ui.toast(`pignon: the local model ${problem}, so it is stopped. Haiku decides.`)
-      break // leaving the loop kills the child
+  try {
+    for await (const piece of child) {
+      const pid = piece.stream === 'stdout' ? /^ready (\d+)/m.exec(piece.text)?.[1] : undefined
+      if (pid === undefined) continue
+      const problem = await socketProblem($, pid)
+      if (problem !== null) {
+        $.ui.toast(`pignon: the local model ${problem}, so it is stopped. Haiku decides.`)
+        break // leaving the loop kills the child
+      }
+      daemon.auditedPid = Number(pid)
+      daemon.auditedAt = await $.clock.now()
+      daemon.socketPath = `${directory}/s.sock`
+      isReady = true
     }
-    daemon.auditedPid = Number(pid)
-    daemon.auditedAt = await $.clock.now()
-    daemon.socketPath = `${directory}/s.sock`
-    isReady = true
+  } finally {
+    // However the child ended, even by a stream that failed, it is not asked again.
+    daemon.socketPath = null
+    daemon.auditedPid = null
+    if (isReady) $.ui.toast('pignon: the local model stopped. Haiku decides until you restart the session.')
   }
-  daemon.socketPath = null
-  daemon.auditedPid = null
-  if (isReady) $.ui.toast('pignon: the local model stopped. Haiku decides until you restart the session.')
 }
 
 // The daemon's code is audited and its environment stripped; this checks the
@@ -479,11 +569,56 @@ function entryLines(entry: LogEntry): string[] {
     ...(entry.fallback ? [`laya unavailable: ${entry.fallback}`] : []),
     entry.tiers ? TIERS.map(tier => tierBar(entry, tier.id)).join('  ') : verdictLine(entry),
     ...(secondLine(entry) ? [secondLine(entry)!] : []),
+    ...(oracleLine(entry) ? [oracleLine(entry)!] : []),
     outcomeLine(entry),
     entry.reason,
     ...(turnLine(entry) ? [turnLine(entry)!] : []),
+    ...(judgedLine(entry) ? [judgedLine(entry)!] : []),
   ]
 }
+
+// The verdict's labels: the correction that followed it, your mark and whether
+// the judge's tier is one it accepts ("you marked hard right · the judge said trivial").
+function judgedLine(entry: LogEntry): string | undefined {
+  const mark = entry.mark
+  const parts = [
+    ...(entry.corrected ? ['the next prompt was a correction'] : []),
+    ...(mark ? [`you marked ${mark.of === null ? `${mark.said} as the right tier` : `${mark.of} ${markLabel(mark.said)}`}`] : []),
+    ...(mark ? [isAccepted(mark, entry.decision) ? 'the judge was right' : `the judge said ${effectiveTier(entry.decision) ?? 'nothing'}`] : []),
+  ]
+
+  return parts.length > 0 ? parts.join(' · ') : undefined
+}
+
+// A second judge's opinion on the prompt, against the judge that decided: Haiku's
+// beside the local model, Opus's when the oracle is on.
+type Opinion = { decision: Decision | null; ms: number; isPending?: boolean }
+
+function opinionLine(judge: string, opinion: Opinion | undefined, entry: LogEntry, pending = 'asking...'): string | undefined {
+  if (!opinion) return undefined
+  if (opinion.isPending) return `${judge}: ${pending}`
+  const d = opinion.decision
+  if (!d) return `${judge}: no answer`
+
+  return `${judge} ${sameTier(d, entry.decision) ? 'agrees' : 'differs'}: ${d.tier}${d.explore ? '/explore' : ''} p=${d.confidence.toFixed(2)} · ${opinion.ms} ms`
+}
+
+// Green when it agrees, yellow when it differs, dim while it has not answered.
+function opinionColor(opinion: Opinion | undefined, entry: LogEntry): string {
+  if (!opinion?.decision) return 'inactive'
+
+  return sameTier(opinion.decision, entry.decision) ? 'success' : 'warning'
+}
+
+// Whether two judges would run the same tier.
+function sameTier(a: Decision | null, b: Decision | null): boolean {
+  const tier = effectiveTier(a)
+
+  return tier !== null && tier === effectiveTier(b)
+}
+
+const secondLine = (entry: LogEntry) => opinionLine('haiku', entry.second, entry)
+const oracleLine = (entry: LogEntry) => opinionLine('opus', entry.oracle, entry, 'asked when the turn ends')
 
 // What the turn did once it ended: its requests, its time, what it cost against
 // the session model (or would have, in shadow mode), and whether the tier held.
@@ -513,31 +648,34 @@ function sessionSavings(entries: readonly LogEntry[], mode: Mode): string {
   return `this session: would have saved ${usd(total(c => c.onSessionModel - c.onTier))} of ${usd(total(c => c.onSessionModel))} (estimated at list price)`
 }
 
-// Haiku's opinion on a prompt the local model decided, and whether they agree
-// on the tier that would run.
-function secondLine(entry: LogEntry): string | undefined {
-  const second = entry.second
-  if (!second) return undefined
-  if (second.isPending) return 'haiku: asking...'
-  const opinion = second.decision
-  if (!opinion) return 'haiku: no answer'
-
-  return `haiku ${agrees(entry) ? 'agrees' : 'differs'}: ${opinion.tier}${opinion.explore ? '/explore' : ''} p=${opinion.confidence.toFixed(2)} · ${second.ms} ms`
-}
-
 // Whether Haiku would run the same tier as the judge that decided.
-function agrees(entry: LogEntry): boolean {
-  const opinion = effectiveTier(entry.second?.decision ?? null)
+const agrees = (entry: LogEntry) => sameTier(entry.second?.decision ?? null, entry.decision)
 
-  return opinion !== null && opinion === effectiveTier(entry.decision)
+// `/pignon compare`: how often the two judges would run the same tier and where
+// they differ, then how each fares against the oracle and your marks.
+function compareReport(entries: readonly LogEntry[]): string {
+  const sections = [judgesReport(entries), referenceReport(entries)].filter(section => section !== '')
+  if (sections.length === 0) {
+    return 'No comparisons yet. Choose laya as the decider, stay in shadow mode (/pignon shadow) and send a few prompts: Haiku is then asked for a second opinion on each. With the oracle on, Opus is asked too; /pignon mark adds your own verdict.'
+  }
+
+  return sections.join('\n')
 }
 
-// `/pignon compare`: how often the two judges would run the same tier, and where they differ.
-function compareReport(entries: readonly LogEntry[]): string {
+// Each judge on the outcomes, the oracle and your marks, this session: the line
+// /pignon stats prints for it across sessions.
+function referenceReport(entries: readonly LogEntry[]): string {
+  const lines = scoreByJudge(entries).flatMap(({ judge, score }) => {
+    const cells = scoreCells(judge, score)
+    return cells.length === 0 ? [] : [`  ${judge.padEnd(6)} ${cells.join(' · ')}`]
+  })
+
+  return lines.length === 0 ? '' : ['Judges this session:', ...lines].join('\n')
+}
+
+function judgesReport(entries: readonly LogEntry[]): string {
   const asked = entries.filter(entry => entry.second)
-  if (asked.length === 0) {
-    return 'No comparisons yet. Choose laya as the decider, stay in shadow mode (/pignon shadow) and send a few prompts: Haiku is then asked for a second opinion on each.'
-  }
+  if (asked.length === 0) return ''
   const answered = asked.filter(entry => entry.second?.decision)
   const differ = answered.filter(entry => !agrees(entry))
   const noAnswer = asked.filter(entry => !entry.second?.isPending && !entry.second?.decision).length
@@ -567,33 +705,41 @@ function leadingTier(entry: LogEntry): string | undefined {
   return Object.entries(entry.tiers ?? {}).sort((a, b) => b[1] - a[1])[0]?.[0]
 }
 
-// Green when Haiku agrees, yellow when it differs, dim while it has not answered.
-function secondColor(entry: LogEntry): string {
-  if (!entry.second?.decision) return 'inactive'
-
-  return agrees(entry) ? 'success' : 'warning'
-}
-
 function tierBar(entry: LogEntry, id: string): string {
   const probability = entry.tiers?.[id] ?? 0
 
   return `${id} ${bar(probability)} ${probability.toFixed(2)}`
 }
 
-// Rows an entry takes at `columns` wide: each line wraps, and a gap follows.
-function entryRows(entry: LogEntry, columns: number): number {
-  return entryLines(entry).reduce((rows, line) => rows + Math.max(1, Math.ceil(line.length / columns)), 1)
+// The pane's mark buttons, under the newest judged entry until it is marked: the
+// relative marks that apply to the tier its line named, or the tiers by name when none did.
+function markButtons(entry: LogEntry): { said: string; hotkey: string; label: string }[] {
+  const of = shownTier(entry)
+  const choices = of === null ? TIERS.map(t => t.id) : Object.keys(MARKS).filter(said => acceptedTiers(said, of) !== null)
+
+  return choices.map((said, i) => ({ said, hotkey: String(i + 1), label: markLabel(said) }))
+}
+
+function hasMarkButtons(entry: LogEntry, entries: readonly LogEntry[]): boolean {
+  return !entry.mark && entry.id === markable(entries)?.id
+}
+
+// Rows an entry takes at `columns` wide: each line wraps, a row of mark buttons may follow, then a gap.
+function entryRows(entry: LogEntry, columns: number, entries: readonly LogEntry[]): number {
+  const buttons = hasMarkButtons(entry, entries) ? 1 : 0
+
+  return entryLines(entry).reduce((rows, line) => rows + Math.max(1, Math.ceil(line.length / columns)), 1 + buttons)
 }
 
 // The newest entries that fit `rows`, leaving one row for the note on the rest.
 function newestThatFit(entries: readonly LogEntry[], rows: number, columns: number): readonly LogEntry[] {
-  const total = entries.reduce((sum, entry) => sum + entryRows(entry, columns), 0)
+  const total = entries.reduce((sum, entry) => sum + entryRows(entry, columns, entries), 0)
   if (total <= rows) return entries
 
   const fit: LogEntry[] = []
   let used = 1
   for (const entry of [...entries].reverse()) {
-    used += entryRows(entry, columns)
+    used += entryRows(entry, columns, entries)
     if (used > rows && fit.length > 0) break
     fit.unshift(entry)
   }
@@ -633,18 +779,27 @@ function describe(id: string | null): string {
   return tier ? `${tier.id} · ${tier.model}/${tier.effort}` : 'session model'
 }
 
+// What the oracle reads: the prompt and the tier in force, as the judges did.
+type OracleInput = { text: string; tier: string | null }
+
+// What a session was set up with, for each prompt it routes.
+type Settings = {
+  wantsLocal: boolean
+  daemon: LocalDaemon
+  isShared: boolean
+  isRecording: boolean
+  cacheTtlMs: number
+  hasOracle: boolean
+}
+
 async function route(
   $: EngineInterface,
   text: string,
   model: string,
   effort: Effort | undefined,
   mode: Mode,
-  wantsLocal: boolean,
-  daemon: LocalDaemon,
-  isShared: boolean,
-  isRecording: boolean,
-  cacheTtlMs: number,
-): Promise<number> {
+  { wantsLocal, daemon, isShared, isRecording, cacheTtlMs, hasOracle }: Settings,
+): Promise<{ id: number; oracle?: OracleInput }> {
   const was = await read($, current)
   const startedAt = await $.clock.now()
   const contextSize = await read($, contextTokens)
@@ -677,7 +832,7 @@ async function route(
   if (!decision) {
     // No daemon, or it failed: Haiku, so a prompt is never left undecided.
     decider = 'haiku'
-    decision = await ask($, text, was).catch(() => null)
+    decision = await askJudge($, HAIKU, text, was).then(answer => answer.decision, () => null)
   }
   const ms = Math.round((await $.clock.now()) - startedAt)
 
@@ -702,17 +857,22 @@ async function route(
   }
   const now = isLive && target !== null ? target : was
   const source = isAcknowledgement ? 'rule' : decider
+  const asksOracle = mode === 'shadow' && hasOracle && !isAcknowledgement
   const id = await read($, nextId)
   await update($, nextId, n => n + 1)
   const entry: LogEntry = {
     id,
     at: startedAt,
+    mode: isLive ? 'live' : 'shadow',
+    model,
     prompt: text.slice(0, 80).replace(/\s+/g, ' '),
-    sent: isAcknowledgement ? '' : text.slice(0, SENT_CHARS),
+    promptChars: text.length,
+    sent: isAcknowledgement ? '' : text.slice(0, LOCAL_PROMPT_CHARS),
     tiers: local?.tiers,
     daemonMs: local?.daemonMs,
     fallback,
     second: mode === 'shadow' && local ? { decision: null, ms: 0, isPending: true } : undefined,
+    oracle: asksOracle ? { decision: null, ms: 0, isPending: true } : undefined,
     decider: source,
     decision,
     ms,
@@ -725,12 +885,9 @@ async function route(
     const context = {
       session: sessionId(),
       project: await $.session.cwd(),
-      mode: mode === 'live' ? ('live' as const) : ('shadow' as const),
       chosen: wantsLocal ? ('laya' as const) : ('haiku' as const),
       daemon: wantsLocal ? (isShared ? ('shared' as const) : ('session' as const)) : null,
-      promptChars: text.length,
       was,
-      model,
       contextTokens: contextSize,
     }
     void recordDecision($, recordOf(entry, context))
@@ -745,7 +902,7 @@ async function route(
   $.ui.log(`pignon ${verdict}  ${icon} ${outcome} (${reason})`)
   $.ui.status(`pignon ${mode}: ${describe(now)}`)
 
-  return id
+  return { id, ...(asksOracle && { oracle: { text, tier: was } }) }
 }
 
 // Whether the person picked a model or effort by hand: the request names the
@@ -771,22 +928,27 @@ export const register: Register = (on, options) => {
   const prompts = new Map<string, string>()
   const isShared = decider === 'laya' && options.daemon === 'shared'
   const isRecording = options.record === 'on'
+  const hasOracle = options.oracle === 'on'
   // Resolved at session start; the conservative guess until then.
   let cache: { ttl: CacheTtl; source: string } = { ttl: '1h', source: 'assumed' }
   // The routed turns still running, by turn id, until `turn.complete`.
   const turns = new Map<string, RunningTurn>()
+  // The entry of the last main-loop prompt, null when it was not routed (off,
+  // pinned): the turn a correction speaks of, which must not fall on an older prompt.
+  let lastEntryId: number | null = null
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'pignon',
-      description: 'Model router: status, live, shadow, off, unpin, log, compare, stats, watch, setup',
-      argumentHint: '[live|shadow|off|unpin|log|compare|stats|watch|setup]',
+      description: 'Model router: status, live, shadow, off, unpin, log, compare, mark, stats, watch, setup',
+      argumentHint: '[live|shadow|off|unpin|log|compare|mark|stats|watch|setup]',
       immediate: true,
     })
     cache = await resolveCacheTtl($, options.cacheTtl).catch(() => cache)
     if (isRecording) void pruneLog($)
     if (isShared) void connectShared($, daemon)
-    else if (decider === 'laya') void launchDaemon($, daemon)
+    // A launch that fails (no folder, a spawn refused) leaves the socket unset: Haiku decides.
+    else if (decider === 'laya') void launchDaemon($, daemon).catch(() => undefined)
 
     return next(e)
   })
@@ -803,11 +965,26 @@ export const register: Register = (on, options) => {
     const text = prompts.get(e.turnId)
     prompts.delete(e.turnId)
 
+    const isNewPrompt = e.index === 0 && text !== undefined
+    if (isNewPrompt) {
+      // Off the prompt's path: the record's rewrite must not hold the turn.
+      if (lastEntryId !== null && isCorrection(text)) void amendEntry($, lastEntryId, { corrected: true }, isRecording)
+      lastEntryId = null
+    }
+
     let request = e
     if (mode !== 'off' && !(await hasPinned($, e))) {
-      if (e.index === 0 && text !== undefined) {
-        const id = await route($, text, e.model, e.effort as Effort | undefined, mode, decider === 'laya', daemon, isShared, isRecording, CACHE_TTL_MS[cache.ttl])
-        turns.set(e.turnId, { id, steps: 1, model: e.model })
+      if (isNewPrompt) {
+        const routed = await route($, text, e.model, e.effort as Effort | undefined, mode, {
+          wantsLocal: decider === 'laya',
+          daemon,
+          isShared,
+          isRecording,
+          cacheTtlMs: CACHE_TTL_MS[cache.ttl],
+          hasOracle,
+        })
+        lastEntryId = routed.id
+        turns.set(e.turnId, { id: routed.id, steps: 1, model: e.model, ...(routed.oracle && { oracle: routed.oracle }) })
       } else {
         const running = turns.get(e.turnId)
         if (running) running.steps = Math.max(running.steps, e.index + 1)
@@ -851,7 +1028,7 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
     const all = await read($, log)
     const list = newestThatFit(all, e.props.scroll.bodyRows, e.props.bodyColumns)
 
@@ -878,10 +1055,21 @@ export const register: Register = (on, options) => {
                 </Box>
               )}
               {!entry.tiers && <Text color={TIER_COLOR[effectiveTier(entry.decision) ?? '']}>{verdictLine(entry)}</Text>}
-              {secondLine(entry) && <Text color={secondColor(entry)}>{secondLine(entry)}</Text>}
+              {secondLine(entry) && <Text color={opinionColor(entry.second, entry)}>{secondLine(entry)}</Text>}
+              {oracleLine(entry) && <Text color={opinionColor(entry.oracle, entry)}>{oracleLine(entry)}</Text>}
               <Text color={ACTION_COLOR[entry.action]}>{outcomeLine(entry)}</Text>
               <Text dimColor>{entry.reason}</Text>
               {turnLine(entry) && <Text color={isUnderRouted(entry) ? 'warning' : 'inactive'}>{turnLine(entry)}</Text>}
+              {judgedLine(entry) && <Text color={entry.corrected || (entry.mark && !isAccepted(entry.mark, entry.decision)) ? 'warning' : 'success'}>{judgedLine(entry)}</Text>}
+              {hasMarkButtons(entry, all) && (
+                <Box gap={2}>
+                  {markButtons(entry).map(button => (
+                    <Button key={`mark-${button.said}`} hotkey={button.hotkey} plain dimColor onPress={() => void markEntry($, entry.id, button.said, isRecording)}>
+                      {button.label}
+                    </Button>
+                  ))}
+                </Box>
+              )}
             </Box>
           )
         })}
@@ -901,6 +1089,24 @@ export const register: Register = (on, options) => {
     }
 
     if (arg === 'compare') return { text: compareReport(await read($, log)) }
+
+    if (arg === 'mark' || arg.startsWith('mark ')) {
+      const [said = '', which] = arg.slice(4).trim().split(/\s+/)
+      const entries = await read($, log)
+      const number = which === undefined ? undefined : Number.parseInt(which.replace(/^#/, ''), 10)
+      const target = number === undefined ? markable(entries) : entries.find(entry => entry.id === number && entry.decider !== 'rule')
+      const words = [...Object.keys(MARKS), ...TIERS.map(t => t.id)]
+      if (!words.includes(said)) {
+        const about = target ? ` Without a number it labels the last judged prompt, #${target.id} “${target.prompt}” (${shownLine(target)}).` : ''
+
+        return { text: `/pignon mark ${words.join('|')} [#n]: too low, right, too high, or the tier it deserved; #n is a prompt's number in /pignon log.${about}` }
+      }
+      if (!target) {
+        return { text: number === undefined ? 'Nothing to mark yet: no prompt has been judged in this session.' : `No judged prompt #${which?.replace(/^#/, '')} in /pignon log.` }
+      }
+
+      return { text: await markEntry($, target.id, said, isRecording) }
+    }
 
     if (arg === 'stats' || arg.startsWith('stats ')) return { text: await statsReport($, arg.slice(5).trim()) }
 
@@ -941,7 +1147,8 @@ export const register: Register = (on, options) => {
             const d = l.decision
             const verdict = d ? `${d.tier}${d.explore ? '/explore' : ''} p=${d.confidence.toFixed(2)}` : 'none'
             const turn = turnLine(l)
-            return `${l.action.padEnd(12)} ${(l.decider ?? 'haiku').padEnd(6)} ${verdict.padEnd(24)} ${String(l.ms).padStart(5)} ms  ${l.reason}\n    “${l.prompt}”${turn ? `\n    ${turn}` : ''}`
+            const judged = judgedLine(l)
+            return `#${String(l.id).padEnd(4)} ${l.action.padEnd(12)} ${(l.decider ?? 'haiku').padEnd(6)} ${verdict.padEnd(24)} ${String(l.ms).padStart(5)} ms  ${l.reason}\n    “${l.prompt}”${turn ? `\n    ${turn}` : ''}${judged ? `\n    ${judged}` : ''}`
           })
           .join('\n'),
       }
@@ -977,8 +1184,8 @@ export const register: Register = (on, options) => {
         `context ${Math.round((await read($, contextTokens)) / 1000)}k · cache ${cacheState}, ttl ${cache.ttl} (${cache.source}) · ${guard}`,
         sessionSavings(await read($, log), mode),
         table,
-        `decision log: ${isRecording ? `on (${kept.length} this session; /pignon stats sums them)` : 'off'}`,
-        'Commands: /pignon live | shadow | off | unpin | log | compare | stats | watch | setup',
+        `decision log: ${isRecording ? `on (${kept.length} this session; /pignon stats sums them)` : 'off'} · oracle: ${hasOracle ? `${mode === 'shadow' ? 'on (Opus judges each prompt once its turn ends)' : 'on, idle outside shadow mode'}${isRecording ? '' : '; the log is off, so its answers are lost when the session ends'}` : 'off'}`,
+        'Commands: /pignon live | shadow | off | unpin | log | compare | mark | stats | watch | setup',
       ].join('\n'),
     }
   })

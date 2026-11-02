@@ -38,6 +38,16 @@
       ],
       "default": "off"
     },
+    "oracle": {
+      "type": "string",
+      "title": "Score the judges against Opus",
+      "description": "off: no reference judge (default). on: in shadow mode, Opus is also asked about each judged prompt once its turn has ended, with the input Haiku read; /pignon compare and /pignon stats then say how often Haiku and the local model pick its tier. One Opus call per prompt, about a cent at list price (at most about nine); the stats show what it cost. Turn the decision log on too, or its answers are lost when the session ends.",
+      "options": [
+        "off",
+        "on"
+      ],
+      "default": "off"
+    },
     "cacheTtl": {
       "type": "string",
       "title": "Prompt cache lifetime",

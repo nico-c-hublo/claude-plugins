@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { HttpInit, On, ProcessSpawnRequest, TurnStepInput, TurnUsage } from 'claude-code'
 
 import type { DecisionRecord, LogEntry, TurnOutcome } from '../types'
-import { decide, decisionFromTiers, isFollowUp, isUnderRouted, parseDecision } from '../hooks/policy'
+import { acceptedTiers, decide, decisionFromTiers, isCorrection, isFollowUp, isUnderRouted, parseDecision, verdictSignal } from '../hooks/policy'
 import { priceOf, turnCost, usd } from '../hooks/prices'
 import { parseRecords, recordOf, serialize, summarize } from '../hooks/record'
 
@@ -141,18 +141,23 @@ describe('policy: the local model\'s answer', () => {
   })
 })
 
+// What a judge was asked: which model, at what effort.
+type Asked = { model: string; effort?: unknown; maxTokens?: number }
+
 // Stands for the engine beneath the mod: a decider that answers `reply`, and
 // a model that records each request it is sent and answers with `usage`.
-function engine(on: On, reply: string | (() => Promise<string>), sent: TurnStepInput[], mode = 'shadow', options: { usage?: TurnUsage; now?: number } = {}) {
+function engine(on: On, reply: string | ((asked: Asked) => Promise<string>), sent: TurnStepInput[], mode = 'shadow', options: { usage?: TurnUsage; now?: number } = {}) {
   const clock = mock.clock(on, { now: options.now ?? 0 })
-  const calls = { model: 0, clock }
+  const calls = { model: 0, clock, asked: [] as Asked[] }
   mock.store(on, { mode })
   on('command.register', () => ({ value: { command: 'pignon' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
-  on('model.complete', async () => {
+  on('model.complete', async (_, e) => {
     calls.model++
-    const text = typeof reply === 'string' ? reply : await reply()
+    const asked = { model: e.model, effort: e.effort, maxTokens: e.maxTokens }
+    calls.asked.push(asked)
+    const text = typeof reply === 'string' ? reply : await reply(asked)
 
     return {
       value: {
@@ -567,6 +572,22 @@ describe('the local decider: its daemon', () => {
     expect(calls.model).toBe(1)
   })
 
+  test('a spawn the engine refuses leaves Haiku deciding, and nothing unhandled', LOCAL, async ($, on) => {
+    const calls = engine(on, TRIVIAL, [], 'shadow')
+    mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+    on('process.run', () => ({ value: OK }))
+    on('process.spawn', async function* () {
+      throw new Error('spawn refused')
+    })
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', 'rename foo to bar')
+
+    expect(calls.asked.map(a => a.model)).toEqual(['haiku'])
+    expect((await $.command.run({ command: 'pignon', args: '', ...COMMAND })).text).toContain('laya (not running')
+  })
+
   test('a daemon whose sockets cannot be checked is refused, not trusted', LOCAL, async ($, on) => {
     let fetched = 0
     const calls = engine(on, TRIVIAL, [], 'live')
@@ -977,8 +998,9 @@ describe('the decisions pane', () => {
       for await (const _ of $.turn.step({ turnId: `t${i}`, index: 0, model: OPUS, effort: 'high', messageCount: 1 }));
     }
 
-    // Each Haiku-decided entry takes 5 rows; 11 rows hold a note and two of them.
-    const props = { ...DECISIONS_PANE.props, scroll: { offset: 0, bodyRows: 11 } }
+    // Each Haiku-decided entry takes 5 rows, the newest one more for its mark
+    // buttons; 12 rows hold a note and two of them.
+    const props = { ...DECISIONS_PANE.props, scroll: { offset: 0, bodyRows: 12 } }
     const ui = await $.ui.mount({ ...DECISIONS_PANE, props, surface: 'terminal' })
 
     expect((await ui.find({ type: 'Text', text: /earlier/ }))?.text).toBe('2 earlier decisions not shown')
@@ -1389,7 +1411,10 @@ function entry(over: Partial<LogEntry> = {}): LogEntry {
   return {
     id: 0,
     at: Date.UTC(2026, 9, 30, 12, 0, 0),
+    mode: 'shadow',
+    model: OPUS,
     prompt: SECRET.slice(0, 80),
+    promptChars: SECRET.length,
     sent: SECRET,
     tiers: { trivial: 0.9, standard: 0.07, hard: 0.03 },
     daemonMs: 9,
@@ -1407,12 +1432,9 @@ function entry(over: Partial<LogEntry> = {}): LogEntry {
 const CONTEXT = {
   session: 'ab12cd34',
   project: '/work/api',
-  mode: 'shadow' as const,
   chosen: 'laya' as const,
   daemon: 'shared' as const,
-  promptChars: SECRET.length,
   was: null,
-  model: OPUS,
   contextTokens: 12_000,
 }
 
@@ -1848,8 +1870,8 @@ describe('the decision log: the cost', () => {
 
   test('sums what was spent and saved live, and what shadow mode would have saved', async () => {
     const records = [
-      recordOf(entry({ id: 1, action: 'switched', turn: ended() }), { ...CONTEXT, mode: 'live' }),
-      recordOf(entry({ id: 2, action: 'switched', turn: ended({ steps: 9 }) }), { ...CONTEXT, mode: 'live' }),
+      recordOf(entry({ id: 1, action: 'switched', turn: ended(), mode: 'live' }), CONTEXT),
+      recordOf(entry({ id: 2, action: 'switched', turn: ended({ steps: 9 }), mode: 'live' }), CONTEXT),
       recordOf(entry({ id: 3, turn: ended({ cost: { actual: 4, onSessionModel: 4, onTier: 0.1 } }) }), CONTEXT),
       recordOf(entry({ id: 4, turn: ended({ cost: undefined }) }), CONTEXT),
     ]
@@ -1864,7 +1886,7 @@ describe('the decision log: the cost', () => {
   })
 
   test('counts switched turns that ended badly, and says nothing when no turn has ended', async () => {
-    const text = summarize([recordOf(entry({ action: 'switched', tier: 'standard', turn: ended({ reason: 'error' }) }), { ...CONTEXT, mode: 'live' })], 1)
+    const text = summarize([recordOf(entry({ action: 'switched', tier: 'standard', turn: ended({ reason: 'error' }), mode: 'live' }), CONTEXT)], 1)
     expect(text).toContain('under-routed: 1 switched turn ended in an error or a refusal')
 
     const none = summarize([recordOf(entry(), CONTEXT)], 1)
@@ -2027,5 +2049,420 @@ describe('a cold cache', () => {
     expect(await status()).toContain('cache cold (idle 12 min)')
     await $.session.compact({ trigger: 'manual', messages: [KEPT] })
     expect(await status()).toContain('context 20k · cache cold (compacted)')
+  })
+})
+
+describe('policy: corrections', () => {
+  test('a prompt that says the last answer was wrong, in English or French', async () => {
+    for (const text of [
+      'no, the other file',
+      'nope, revert that',
+      "no that's not it",
+      'not that one, the parser',
+      'wrong file',
+      "that's wrong, use the v2 API",
+      'That’s not what I asked',
+      "it doesn't work",
+      "doesn't work",
+      'it still fails with the same error',
+      'still broken',
+      'you misunderstood: I meant the tests',
+      'revert it',
+      'undo the last change',
+      "wait, that's wrong",
+      'hmm no, the other one',
+      'non, pas comme ça',
+      'pas ça, l’autre fonction',
+      "non mais c'est pas ça",
+      "c'est faux",
+      'ça marche pas',
+      'ça ne marche toujours pas',
+      'ça ne fonctionne plus',
+      'toujours pas',
+      'tu as mal compris',
+      'annule ça',
+    ]) {
+      expect(isCorrection(text), text).toBe(true)
+    }
+  })
+
+  test('a bare no, a no that agrees, and a task that opens with a negative word are not', async () => {
+    for (const text of [
+      '',
+      'no',
+      'No.',
+      'non',
+      "no, that's fine",
+      'no thanks',
+      'No, go ahead',
+      'non, pas besoin',
+      'no tests cover the parser, add some',
+      'No problem. Now rename foo to bar',
+      'nothing happens when I click save',
+      'notify the user on failure',
+      'wrongly typed fields in the form: fix them',
+      'revert commit abc123 on main',
+      'undo history for the editor: implement it',
+      'annule la commande 42 dans la base',
+      'ça marche, merci',
+      'pastel colours for the theme',
+      'yes, go ahead',
+      'fix the failing test',
+    ]) {
+      expect(isCorrection(text), text).toBe(false)
+    }
+  })
+})
+
+describe('policy: what an outcome says of a verdict', () => {
+  const turn = (over: Partial<TurnOutcome> = {}): TurnOutcome => ({
+    steps: 1,
+    reason: 'answer',
+    durationMs: 1_000,
+    usage: { input: 1_000, output: 400, cacheRead: 0, cacheWrite: 0, model: OPUS },
+    ...over,
+  })
+  const verdict = (tier: string, explore = false) => ({ tier, explore, confidence: 0.8 })
+
+  test('a trivial verdict whose turn ran a long tool loop was too low', async () => {
+    expect(verdictSignal(verdict('trivial'), turn({ steps: 8 }))).toBe('too low')
+    expect(verdictSignal(verdict('trivial'), turn({ steps: 7 }))).toBe(null)
+    // trivial/explore runs on standard: a long loop there says nothing
+    expect(verdictSignal(verdict('trivial', true), turn({ steps: 12 }))).toBe(null)
+  })
+
+  test('a hard verdict whose turn answered in a request or two, briefly and quickly, was too high', async () => {
+    expect(verdictSignal(verdict('hard'), turn())).toBe('too high')
+    expect(verdictSignal(verdict('hard'), turn({ steps: 2 }))).toBe('too high')
+    expect(verdictSignal(verdict('hard'), turn({ steps: 3 }))).toBe(null)
+    expect(verdictSignal(verdict('hard'), turn({ usage: { input: 1, output: 1_500, cacheRead: 0, cacheWrite: 0, model: OPUS } }))).toBe(null)
+    expect(verdictSignal(verdict('hard'), turn({ reason: 'aborted' }))).toBe(null)
+    expect(verdictSignal(verdict('hard'), turn({ usage: undefined }))).toBe(null)
+    // two requests over minutes: the work went to a subagent, which the main loop does not count
+    expect(verdictSignal(verdict('hard'), turn({ steps: 2, durationMs: 180_000 }))).toBe(null)
+  })
+
+  test('says nothing of a standard verdict, a follow-up, or a turn still running', async () => {
+    expect(verdictSignal(verdict('standard'), turn({ steps: 30 }))).toBe(null)
+    expect(verdictSignal(verdict('standard'), turn())).toBe(null)
+    expect(verdictSignal(verdict('same'), turn({ steps: 30 }))).toBe(null)
+    expect(verdictSignal(verdict('trivial'), undefined)).toBe(null)
+    expect(verdictSignal(null, turn({ steps: 30 }))).toBe(null)
+  })
+})
+
+describe('policy: what a mark accepts', () => {
+  test('relative to the tier the line named, or a tier by name', async () => {
+    expect(acceptedTiers('ok', 'standard')).toEqual(['standard'])
+    expect(acceptedTiers('low', 'trivial')).toEqual(['standard', 'hard'])
+    expect(acceptedTiers('high', 'hard')).toEqual(['trivial', 'standard'])
+    expect(acceptedTiers('hard', 'trivial')).toEqual(['hard'])
+    expect(acceptedTiers('trivial', null)).toEqual(['trivial'])
+  })
+
+  test('nothing above the top, below the bottom, without a reference, or for an unknown word', async () => {
+    expect(acceptedTiers('low', 'hard')).toBe(null)
+    expect(acceptedTiers('high', 'trivial')).toBe(null)
+    expect(acceptedTiers('ok', null)).toBe(null)
+    expect(acceptedTiers('meh', 'standard')).toBe(null)
+    expect(acceptedTiers('toString', 'standard')).toBe(null)
+  })
+})
+
+describe('the decision log: judging the judges', () => {
+  const ended = (steps: number, output = 400): TurnOutcome => ({
+    steps,
+    reason: 'answer',
+    durationMs: 1_000,
+    usage: { input: 1_000, output, cacheRead: 0, cacheWrite: 0, model: OPUS },
+  })
+  const opinion = (tier: string, confidence = 0.8) => ({ tier, explore: false, confidence })
+
+  test('a record keeps the oracle once it has answered, the correction and the mark', async () => {
+    const mark = { said: 'low', of: 'trivial', accepted: ['standard', 'hard'] }
+    const done = recordOf(entry({ oracle: { decision: opinion('hard'), ms: 2_000, cost: 0.004 }, corrected: true, mark }), CONTEXT)
+    expect(done).toMatchObject({ oracle: { decision: opinion('hard'), ms: 2_000, cost: 0.004 }, corrected: true, mark })
+
+    const pending = recordOf(entry({ oracle: { decision: null, ms: 0, isPending: true } }), CONTEXT)
+    expect(pending.oracle).toBeUndefined()
+    expect(pending.corrected).toBeUndefined()
+    expect(pending.mark).toBeUndefined()
+  })
+
+  test('scores each judge where a tally can say something, then by its confidence', async () => {
+    // In shadow mode on Opus, every turn ran on hard.
+    const records = [
+      // laya trivial and the turn looped: too low; you marked trivial too low; haiku and opus said standard
+      recordOf(
+        entry({
+          id: 1,
+          decision: opinion('trivial', 0.9),
+          second: { decision: opinion('standard'), ms: 600 },
+          oracle: { decision: opinion('standard'), ms: 2_000, cost: 0.01 },
+          turn: ended(9),
+          mark: { said: 'low', of: 'trivial', accepted: ['standard', 'hard'] },
+        }),
+        CONTEXT,
+      ),
+      // laya hard, one short request: too high; the next prompt corrected it; opus said hard too, haiku trivial
+      recordOf(
+        entry({ id: 2, decision: opinion('hard', 0.6), second: { decision: opinion('trivial'), ms: 600 }, oracle: { decision: opinion('hard'), ms: 2_000, cost: 0.01 }, turn: ended(1), corrected: true }),
+        CONTEXT,
+      ),
+      // laya standard, you said ok; no oracle
+      recordOf(entry({ id: 3, decision: opinion('standard', 0.75), second: { decision: opinion('standard'), ms: 600 }, turn: ended(4), mark: { said: 'ok', of: 'standard', accepted: ['standard'] } }), CONTEXT),
+    ]
+
+    const text = summarize(records, 1)
+
+    expect(text).toContain('judges, scored on outcomes, your marks and the oracle:')
+    // a standard verdict counts in neither flag: each is out of the verdicts it can flag
+    expect(text).toContain('laya   3 verdicts · too low 100% of 1 trivial · too high 100% of 1 hard · corrected 100% of 1 that ran · right 50% of 2 marked · same as opus 50% of 2')
+    expect(text).toContain('haiku  3 verdicts · too low 0% of 1 trivial · right 100% of 2 marked · same as opus 50% of 2')
+    expect(text).toContain('opus   2 verdicts · too high 100% of 1 hard · corrected 100% of 1 that ran · right 100% of 1 marked')
+    expect(text).toMatch(/0\.50 to 0\.70\s+too high 100% of 1 hard · corrected 100% of 1 that ran · same as opus 100% of 1/)
+    expect(text).toMatch(/0\.70 to 0\.85\s+right 100% of 1 marked/)
+    expect(text).toMatch(/p ≥ 0\.85\s+too low 100% of 1 trivial · right 0% of 1 marked · same as opus 0% of 1/)
+    expect(text).toContain('oracle: opus asked 2 times, $0.020 at list price')
+  })
+
+  test("splits the local model's agreement with opus by whether it read the whole prompt", async () => {
+    const records = [
+      recordOf(entry({ id: 1, decision: opinion('trivial'), oracle: { decision: opinion('trivial'), ms: 1 } }), CONTEXT),
+      recordOf(entry({ id: 2, decision: opinion('trivial'), oracle: { decision: opinion('hard'), ms: 1 }, promptChars: 1_200 }), CONTEXT),
+    ]
+
+    expect(summarize(records, 1)).toContain('laya   2 verdicts · same as opus 50% of 2 (100% of 1 within its 400 characters)')
+  })
+
+  test('counts corrections by the tier the turn ran on: the session model in shadow mode', async () => {
+    const records = [
+      recordOf(entry({ id: 1, turn: ended(3), corrected: true, mode: 'live' }), CONTEXT),
+      recordOf(entry({ id: 2, turn: ended(3), mode: 'live' }), CONTEXT),
+      recordOf(entry({ id: 3, turn: ended(3), corrected: true }), CONTEXT),
+      recordOf(entry({ id: 4, turn: ended(3) }), CONTEXT),
+      recordOf(entry({ id: 5, turn: ended(3) }), CONTEXT),
+    ]
+
+    expect(summarize(records, 1)).toContain('corrected, by the tier the turn ran on: 1 of 2 on trivial (50%) · 1 of 3 on hard (33%)')
+  })
+
+  test('leaves out the line by tier when nothing was corrected', async () => {
+    expect(summarize([recordOf(entry({ turn: ended(3) }), CONTEXT)], 1)).not.toContain('corrected, by the tier')
+  })
+})
+
+describe('in a session: corrections, marks and the oracle', () => {
+  const opus = (tier: string) => `{"tier":"${tier}","explore":false,"confidence":0.9}`
+  // Haiku answers `haiku`; Opus answers `oracle`.
+  function judges(on: On, mode: string, oracle = 'hard', haiku = TRIVIAL) {
+    return engine(on, async asked => (asked.model === 'opus' ? opus(oracle) : haiku), [], mode)
+  }
+  const ORACLE = { options: { oracle: 'on' } }
+  const command = async ($: Engine, args: string) => (await $.command.run({ command: 'pignon', args, ...COMMAND })).text ?? ''
+
+  test('the oracle is Opus, asked once the turn has ended, so it never competes with it', ORACLE, async ($, on) => {
+    const calls = judges(on, 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, surface: 'terminal' })
+
+    await prompt($, 't1', 'rename foo to bar')
+    await settle()
+    expect(calls.asked.map(a => a.model)).toEqual(['haiku'])
+    expect((await ui.find({ type: 'Text', text: /^opus/ }))?.text).toBe('opus: asked when the turn ends')
+
+    await complete($, 't1')
+    await settle()
+    expect(calls.asked.map(a => `${a.model}/${a.effort}`)).toEqual(['haiku/low', 'opus/medium'])
+    expect((await ui.find({ type: 'Text', text: /^opus/ }))?.text).toBe('opus differs: hard p=0.90 · 0 ms')
+    await ui.unmount()
+  })
+
+  test('the oracle is not asked in live mode, nor for an acknowledgement', ORACLE, async ($, on) => {
+    const calls = judges(on, 'live')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', 'rename foo to bar')
+    await complete($, 't1')
+    await command($, 'shadow')
+    await prompt($, 't2', 'yes, go ahead')
+    await complete($, 't2')
+    await settle()
+
+    expect(calls.asked.map(a => a.model)).toEqual(['haiku'])
+  })
+
+  test('is off by default', async ($, on) => {
+    const calls = judges(on, 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', 'rename foo to bar')
+    await complete($, 't1')
+    await settle()
+
+    expect(calls.asked.map(a => a.model)).toEqual(['haiku'])
+    expect(await command($, '')).toContain('oracle: off')
+  })
+
+  test('/pignon says when the oracle answers are lost because the log is off', ORACLE, async ($, on) => {
+    judges(on, 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    expect(await command($, '')).toContain('oracle: on (Opus judges each prompt once its turn ends); the log is off, so its answers are lost when the session ends')
+  })
+
+  test('/pignon compare scores each judge as the stats do, this session', { options: { oracle: 'on', decider: 'laya' } }, async ($, on) => {
+    judges(on, 'shadow', 'trivial')
+    withDaemon(on, () => ({ status: 200, ok: true, headers: {}, text: JSON.stringify({ tiers: { trivial: 0.2, standard: 0.7, hard: 0.1 } }) }))
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', 'rename foo to bar')
+    await complete($, 't1')
+    await settle()
+    await command($, 'mark trivial')
+    const text = await command($, 'compare')
+
+    // laya said standard, haiku and opus trivial, and you named trivial
+    expect(text).toContain('Judges this session:')
+    expect(text).toContain('laya   right 0% of 1 marked · same as opus 0% of 1')
+    expect(text).toContain('haiku  too low 0% of 1 trivial · right 100% of 1 marked · same as opus 100% of 1')
+    expect(text).toContain('opus   too low 0% of 1 trivial · right 100% of 1 marked')
+  })
+
+  test('a correction marks the turn before it as suspect, in the log and the pane', async ($, on) => {
+    judges(on, 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', 'rename foo to bar')
+    await prompt($, 't2', 'no, the other foo')
+    await prompt($, 't3', 'now add a test')
+    await settle()
+
+    const log = await command($, 'log')
+    expect(log.match(/the next prompt was a correction/g)).toHaveLength(1)
+    expect(log).toMatch(/rename foo to bar”\n {4}the next prompt was a correction/)
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, surface: 'terminal' })
+    expect((await ui.find({ type: 'Text', text: /correction/ }))?.props.color).toBe('warning')
+    await ui.unmount()
+  })
+
+  test('a correction after a prompt that was not routed marks nothing older', async ($, on) => {
+    judges(on, 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', 'rename foo to bar')
+    await command($, 'off')
+    await prompt($, 't2', 'add a test for the parser') // not routed: no entry
+    await command($, 'shadow')
+    await prompt($, 't3', "that's wrong")
+    await settle()
+
+    expect(await command($, 'log')).not.toContain('correction')
+  })
+
+  test('/pignon mark labels the newest judged prompt, past an acknowledgement, or one by its number', async ($, on) => {
+    judges(on, 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await prompt($, 't1', 'rename foo to bar')
+    await prompt($, 't2', 'thanks')
+    await prompt($, 't3', 'add a test for the parser')
+
+    expect(await command($, 'mark low #0')).toBe(
+      'Marked #0 “rename foo to bar” (haiku said trivial, would switch to trivial): the right tier is standard or hard. The decision log is off, so the mark counts in /pignon compare for this session only; turn the log on to count marks in /pignon stats.',
+    )
+    expect(await command($, 'log')).toContain('you marked trivial too low · the judge said trivial')
+    expect(await command($, 'mark high 0')).toBe('Nothing is below trivial: mark it ok, or name the right tier.')
+    expect(await command($, 'mark ok 1')).toBe('No judged prompt #1 in /pignon log.') // the acknowledgement
+    expect(await command($, 'mark ok')).toContain('Marked #2 “add a test for the parser”')
+    expect(await command($, 'log')).toContain('you marked trivial right · the judge was right')
+  })
+
+  test('in live mode a mark is taken against the tier that ran, not a verdict the bars set aside', async ($, on) => {
+    judges(on, 'live', 'hard', '{"tier":"trivial","explore":false,"confidence":0.6}') // under the downgrade bar
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await prompt($, 't1', 'rename foo to bar')
+
+    expect(await command($, 'mark ok')).toContain('(kept hard, haiku said trivial): the right tier is hard.')
+    expect(await command($, 'log')).toContain('you marked hard right · the judge said trivial')
+  })
+
+  test('/pignon mark says how to use it, and when there is nothing to mark', async ($, on) => {
+    judges(on, 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    expect(await command($, 'mark ok')).toBe('Nothing to mark yet: no prompt has been judged in this session.')
+    await prompt($, 't1', 'rename foo to bar')
+    expect(await command($, 'mark')).toBe(
+      "/pignon mark low|ok|high|trivial|standard|hard [#n]: too low, right, too high, or the tier it deserved; #n is a prompt's number in /pignon log. Without a number it labels the last judged prompt, #0 “rename foo to bar” (haiku said trivial, would switch to trivial).",
+    )
+    expect(await command($, 'mark meh')).toContain('/pignon mark low|ok|high')
+    expect(await command($, 'log')).toMatch(/^#0 {4}would switch/)
+  })
+
+  test('the pane offers the marks that apply under the newest judged prompt, and a press marks it', async ($, on) => {
+    judges(on, 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await prompt($, 't1', 'rename foo to bar')
+    await prompt($, 't2', 'add a test for the parser')
+
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...DECISIONS_PANE, surface })
+      expect(await ui.find({ key: 'mark-low' })).toBeDefined()
+      expect(await ui.find({ key: 'mark-ok' })).toBeDefined()
+      expect(await ui.find({ key: 'mark-high' })).toBeUndefined() // nothing is below trivial
+      await ui.unmount()
+    }
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, surface: 'terminal' })
+    await ui.press({ key: 'mark-low' })
+    await settle()
+
+    expect((await ui.find({ type: 'Text', text: /marked/ }))?.text).toBe('you marked trivial too low · the judge said trivial')
+    expect(await ui.find({ key: 'mark-low' })).toBeUndefined()
+    expect(await command($, 'log')).toMatch(/add a test for the parser”\n {4}you marked trivial too low/)
+    await ui.unmount()
+  })
+
+  test('a judge that gave no verdict is marked against the tier that ran', async ($, on) => {
+    engine(on, 'no idea', [], 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await prompt($, 't1', 'rename foo to bar')
+
+    const ui = await $.ui.mount({ ...DECISIONS_PANE, surface: 'terminal' })
+    expect(await ui.find({ key: 'mark-low' })).toBeUndefined() // the session ran on Opus: nothing is above hard
+    await ui.press({ key: 'mark-high' })
+    await settle()
+
+    expect((await ui.find({ type: 'Text', text: /marked/ }))?.text).toBe('you marked hard too high · the judge said nothing')
+    await ui.unmount()
+  })
+
+  test('the oracle, the correction and the mark go on the records', { options: { oracle: 'on', record: 'on' } }, async ($, on) => {
+    judges(on, 'shadow')
+    const writes: string[] = []
+    mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg' })
+    on('process.run', () => ({ value: OK }))
+    on('session.cwd', () => ({ value: '/work/api' }))
+    on('fs.write', (_, e) => {
+      writes.push(e.text)
+      return { value: undefined }
+    })
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', 'rename foo to bar')
+    await complete($, 't1')
+    await settle()
+    await command($, 'mark hard')
+    await prompt($, 't2', "that's wrong")
+    await settle()
+
+    const [first, second] = parseRecords(writes.at(-1) ?? '')
+    expect(first).toMatchObject({
+      corrected: true,
+      mark: { said: 'hard', of: null, accepted: ['hard'] },
+      oracle: { decision: { tier: 'hard', explore: false, confidence: 0.9 } },
+    })
+    expect(Math.round((first?.oracle?.cost ?? 0) * 1_000_000)).toBe(4 + 20) // a token in and out at Opus's price
+    expect(second?.corrected).toBeUndefined()
   })
 })
