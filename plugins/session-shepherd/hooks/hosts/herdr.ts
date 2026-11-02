@@ -64,5 +64,17 @@ export async function herdr($: $): Promise<Host | null> {
       if (info?.result?.workspace?.tab_count !== 1) return
       await run('workspace', 'rename', workspace, `${basename(cwd)} - ${name}`)
     },
+
+    // Pane tokens $shepherd_needs and $shepherd_done, which herdr's agent sidebar rows can show.
+    report: async ({ needs, done }) => {
+      const pane = await $.env.get('HERDR_PANE_ID')
+      if (!pane) return
+      const args = ['pane', 'report-metadata', pane, '--source', 'session-shepherd', '--seq', String(await $.clock.now())]
+      for (const [token, value] of [['shepherd_needs', needs], ['shepherd_done', done]] as const) {
+        if (value === undefined) continue
+        args.push(...(value ? ['--token', `${token}=${value}`] : ['--clear-token', token]))
+      }
+      await $.process.run(['herdr', ...args])
+    },
   }
 }

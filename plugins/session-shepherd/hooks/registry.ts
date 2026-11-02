@@ -8,7 +8,7 @@ type $ = EngineInterface
 
 export type Location = { host: string; server: string; pane: string; pid: number | null }
 
-const isSafeId = (sessionId: string) => /^[\w-]+$/.test(sessionId)
+export const isSafeId = (sessionId: string) => /^[\w-]+$/.test(sessionId)
 
 async function file($: $, sessionId: string) {
   return `${await $.env.get('HOME')}/.claude/session-shepherd/live/${sessionId}.json`
