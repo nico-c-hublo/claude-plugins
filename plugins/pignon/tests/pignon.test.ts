@@ -1236,12 +1236,12 @@ function sharedDaemon(
   on('fs.list', (_, e) => ({ value: (e.path === '/cfg/pignon' ? state.runs : state.siblings).map(dir) }))
   on('process.run', async (_, e) => {
     const [command, ...rest] = e.argv
-    if (command === 'ps') {
+    if (command === '/bin/ps') {
       const lines = [...(state.isUp && state.socket ? [psLine(state.pid, state.socket)] : []), ...state.others.map(o => o.line)]
 
       return { value: { exitCode: 0, ...NO_OUTPUT, stdout: `${lines.join('\n')}\n` } }
     }
-    if (command === 'kill') {
+    if (command === '/bin/kill') {
       const pids = rest.slice(1).map(Number)
       state.killed.push(...pids)
       if (pids.includes(state.pid)) state.isUp = false
@@ -1261,7 +1261,7 @@ function sharedDaemon(
 
       return { value: OK }
     }
-    if (command === 'rm' || command === 'rmdir') {
+    if (command === '/bin/rm' || command === '/bin/rmdir') {
       for (const path of rest.filter(arg => !arg.startsWith('-'))) {
         state.files.delete(path)
         state.removed.push(path)

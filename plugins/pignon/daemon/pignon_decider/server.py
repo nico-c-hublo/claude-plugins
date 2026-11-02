@@ -93,13 +93,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = lambda self: self._refuse()
 
     def do_POST(self):
-        self.server.last_activity = time.monotonic()
         if self.path != "/decide":
             self._refuse()
             return
         parsed = self._parse_decide_request()
         if parsed is None:
             return
+        # Only a prompt is activity: a wrong path or a malformed body is not one.
+        self.server.last_activity = time.monotonic()
         prompt, context_tokens = parsed
         started = time.perf_counter()
         try:

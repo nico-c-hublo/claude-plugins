@@ -46,6 +46,15 @@ class HealthTest(unittest.TestCase):
         self.assertEqual(after["idleSeconds"], 0)
         self.assertLessEqual(after["uptimeSeconds"], round(time.monotonic() - server_started) + 1)
 
+    def test_a_post_that_is_not_a_prompt_does_not_count_as_one(self):
+        with running_daemon(FakeScorer()) as socket_path:
+            time.sleep(1.2)
+            request(socket_path, "POST", "/nope", {"prompt": "rename foo"})
+            request(socket_path, "POST", "/decide", {"text": "no prompt field"})
+            _, body = request(socket_path, "GET", "/health")
+
+        self.assertGreaterEqual(body["idleSeconds"], 1)
+
     def test_reports_the_idle_limit_it_was_given(self):
         directory = tempfile.mkdtemp(prefix="pd", dir="/tmp")
         self.addCleanup(shutil.rmtree, directory, ignore_errors=True)

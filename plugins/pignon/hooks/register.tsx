@@ -452,7 +452,8 @@ type SharedProcess = { pid: number; run: string; uptimeSeconds: number; rssKb: n
 async function sharedProcesses($: EngineInterface): Promise<SharedProcess[]> {
   const home = await dataHome($)
   // Without -a, ps lists only this user's processes; -x adds those with no terminal.
-  const listed = await $.process.run(['ps', '-xo', 'pid=,etime=,rss=,command=']).catch(() => null)
+  // Full paths, as for lsof: what ps prints decides what is signalled.
+  const listed = await $.process.run(['/bin/ps', '-xo', 'pid=,etime=,rss=,command=']).catch(() => null)
   if (listed === null || listed.exitCode !== 0) return []
   const prefix = `--socket ${home}/`
 
@@ -496,7 +497,7 @@ async function versionsByRun($: EngineInterface): Promise<Map<string, string>> {
 // Returns the pids still running.
 async function terminate($: EngineInterface, pids: readonly number[]): Promise<number[]> {
   if (pids.length === 0) return []
-  await $.process.run(['kill', '-TERM', ...pids.map(String)]).catch(() => null)
+  await $.process.run(['/bin/kill', '-TERM', ...pids.map(String)]).catch(() => null)
   const deadline = (await $.clock.now()) + STOP_WAIT_MS
   for (;;) {
     const running = new Set((await sharedProcesses($)).map(p => p.pid))
@@ -520,7 +521,7 @@ async function removeIdleRuns($: EngineInterface): Promise<void> {
     if (entry.kind !== 'dir' || !/^run-[0-9a-f]{8}$/.test(entry.name) || entry.name === sharedRun($)) continue
     const dir = `${home}/${entry.name}`
     const cleared = await $.process.run(['/usr/bin/lockf', '-s', '-t', '0', `${dir}/lock`, '/bin/rm', '-f', `${dir}/daemon.log`, `${dir}/s.sock`]).catch(() => null)
-    if (cleared?.exitCode === 0) await $.process.run(['rmdir', dir]).catch(() => null)
+    if (cleared?.exitCode === 0) await $.process.run(['/bin/rmdir', dir]).catch(() => null)
   }
 }
 
@@ -623,7 +624,7 @@ const STOP_HOLDS =
 
 // `/pignon daemon start`: lifts the stop and starts this version's daemon, or joins it.
 async function startShared($: EngineInterface, daemon: LocalDaemon): Promise<string> {
-  await $.process.run(['rm', '-f', `${await dataHome($)}/${STOPPED_FILE}`]).catch(() => null)
+  await $.process.run(['/bin/rm', '-f', `${await dataHome($)}/${STOPPED_FILE}`]).catch(() => null)
   await connectShared($, daemon)
   if (daemon.state !== 'up') return `The shared daemon is ${daemon.state}: Haiku decides. /pignon daemon says more.`
   const health = daemon.socketPath ? await healthOf($, daemon.socketPath) : null
