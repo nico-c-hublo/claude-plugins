@@ -165,7 +165,7 @@ def _serve_shared(args, load_scorer, directory, pipe):
     try:
         if load_scorer is None:
             from .mlx_scorer import load_scorer
-        daemon = serve(args.socket, load_scorer(args.model))
+        daemon = serve(args.socket, load_scorer(args.model), args.idle_seconds)
     except Exception as error:
         sys.stderr.write(f"pignon-decider: could not start: {type(error).__name__}\n")
         sys.stderr.flush()

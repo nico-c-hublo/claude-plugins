@@ -1175,7 +1175,14 @@ const TIERS_TRIVIAL = { trivial: 0.9, standard: 0.07, hard: 0.03 }
 
 // A shared daemon as the engine sees it: `isUp` says whether anything listens on its
 // socket, the launcher brings it up as `launchedPid`, and `listening` records each call.
-function sharedDaemon(on: On, init: { isUp: boolean; launchedPid?: number; launcherExit?: number; sockets?: string }) {
+// A process as `ps -xo pid=,etime=,rss=,command=` lists it.
+const psLine = (pid: number, socket: string, etime = '25:48', rssKb = 951_000) =>
+  `${String(pid).padStart(6)} ${etime.padStart(11)} ${String(rssKb).padStart(7)} /cfg/pignon/venv/bin/python -m pignon_decider --socket ${socket} --model /cfg/pignon/model --shared`
+
+function sharedDaemon(
+  on: On,
+  init: { isUp: boolean; launchedPid?: number; launcherExit?: number; sockets?: string; files?: string[]; health?: Record<string, unknown> },
+) {
   const state = {
     isUp: init.isUp,
     pid: 4242,
@@ -1184,9 +1191,47 @@ function sharedDaemon(on: On, init: { isUp: boolean; launchedPid?: number; launc
     sockets: init.sockets,
     decides: 0,
     fail: 0,
+    // The socket the mod asked on: this version's.
+    socket: '',
+    // Other daemons `ps` lists besides this version's: other versions, other config dirs.
+    others: [] as { pid: number; line: string }[],
+    killed: [] as number[],
+    removed: [] as string[],
+    files: new Set(init.files ?? []),
+    runs: [] as string[],
   }
   mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+  on('fs.exists', (_, e) => ({ value: state.files.has(e.path) }))
+  on('fs.write', (_, e) => {
+    state.files.add(e.path)
+    return { value: undefined }
+  })
+  on('fs.list', (_, e) =>
+    ({ value: e.path === '/cfg/pignon' ? state.runs.map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })) : [] }),
+  )
   on('process.run', (_, e) => {
+    const [command, ...rest] = e.argv
+    if (command === 'ps') {
+      const lines = [...(state.isUp && state.socket ? [psLine(state.pid, state.socket)] : []), ...state.others.map(o => o.line)]
+
+      return { value: { exitCode: 0, ...NO_OUTPUT, stdout: `${lines.join('\n')}\n` } }
+    }
+    if (command === 'kill') {
+      const pids = rest.slice(1).map(Number)
+      state.killed.push(...pids)
+      if (pids.includes(state.pid)) state.isUp = false
+      state.others = state.others.filter(o => !pids.includes(o.pid))
+
+      return { value: OK }
+    }
+    if (command === 'rm' || command === 'rmdir') {
+      for (const path of rest.filter(arg => !arg.startsWith('-'))) {
+        state.files.delete(path)
+        state.removed.push(path)
+      }
+
+      return { value: OK }
+    }
     if (e.argv[0] === '/usr/sbin/lsof') {
       state.audits.push(e.argv[3] ?? '')
 
@@ -1200,9 +1245,10 @@ function sharedDaemon(on: On, init: { isUp: boolean; launchedPid?: number; launc
     return { value: { exitCode: 0, ...NO_OUTPUT, stdout: `ready ${state.pid}\n` } }
   })
   on('http.fetch', (_, e) => {
+    state.socket = e.init?.socketPath ?? state.socket
     if (!state.isUp) throw new Error('connection refused')
     if (e.url.endsWith('/health')) {
-      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ status: 'ok', ready: true, pid: state.pid }) } }
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ status: 'ok', ready: true, pid: state.pid, ...init.health }) } }
     }
     if (state.fail > 0) {
       state.fail--
@@ -1381,6 +1427,203 @@ describe('the local decider: a shared daemon', () => {
     })
 
     expect(text).toContain('decider: laya (running) · shared daemon')
+  })
+
+  test('the status line says where the local model stands, from session start', SHARED, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    sharedDaemon(on, { isUp: true })
+    const shown: (string | undefined)[] = []
+    on('ui.status', (_, e) => {
+      shown.push(e.text)
+      return { value: undefined }
+    })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await prompt($, 't1', 'rename foo to bar in utils.ts')
+
+    expect(shown.slice(0, 3)).toEqual(['pignon live · laya starting', 'pignon live · laya starting', 'pignon live · laya up'])
+    expect(shown.at(-1)).toBe('pignon live: trivial · haiku/low · laya up')
+  })
+
+  test('the status line says when the local model is down and Haiku decides', SHARED, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    sharedDaemon(on, { isUp: false, launcherExit: 1 })
+    const shown: (string | undefined)[] = []
+    on('ui.status', (_, e) => {
+      shown.push(e.text)
+      return { value: undefined }
+    })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    expect(shown.at(-1)).toBe('pignon live · laya down → haiku')
+  })
+
+  test('a launcher that failed is tried again on a prompt a minute later', SHARED, async ($, on) => {
+    const calls = engine(on, TRIVIAL, [], 'live')
+    const daemon = sharedDaemon(on, { isUp: false, launcherExit: 1 })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await calls.clock.advance(61_000)
+    await prompt($, 't1', 'rename foo')
+    await settle()
+
+    expect(daemon.launches).toHaveLength(2)
+  })
+
+  test('a stop by hand holds at session start: nothing is launched or asked, and Haiku decides', SHARED, async ($, on) => {
+    const calls = engine(on, TRIVIAL, [], 'live')
+    const daemon = sharedDaemon(on, { isUp: false, files: ['/cfg/pignon/shared-stopped'] })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    await calls.clock.advance(10 * 60_000)
+    await prompt($, 't1', 'rename foo')
+    await settle()
+    const { text = '' } = await $.command.run({ command: 'pignon', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+
+    expect(daemon.launches).toEqual([])
+    expect(daemon.audits).toEqual([])
+    expect(calls.model).toBe(1)
+    expect(text).toContain('decider: laya (stopped by /pignon daemon stop: Haiku decides until /pignon daemon start)')
+  })
+
+  test('/pignon daemon stop stops every version of this config dir, and no prompt starts one again', SHARED, async ($, on) => {
+    const calls = engine(on, TRIVIAL, [], 'live')
+    const daemon = sharedDaemon(on, { isUp: true })
+    daemon.others = [
+      { pid: 3131, line: psLine(3131, '/cfg/pignon/run-0badc0de/s.sock') },
+      // Another config dir's daemon, and something else that runs python: not ours.
+      { pid: 7070, line: psLine(7070, '/cfg-other/pignon/run-0badc0de/s.sock') },
+      { pid: 8080, line: '  8080       01:00   1000 /usr/bin/python3 -m http.server' },
+    ]
+    daemon.runs = ['run-0badc0de', 'run-deadbeef']
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    const mine = daemon.socket.split('/')[3] ?? ''
+    daemon.runs.push(mine)
+    const { text = '' } = await $.command.run({ command: 'pignon', args: 'daemon stop', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+    await calls.clock.advance(10 * 60_000)
+    await prompt($, 't1', 'rename foo')
+    await settle()
+
+    expect(daemon.killed.sort()).toEqual([3131, 4242])
+    expect(daemon.files.has('/cfg/pignon/shared-stopped')).toBe(true)
+    expect(text).toContain('Stopped 2 shared daemons, about 1857 MiB freed.')
+    // The other versions' leftovers go; this version's directory stays.
+    expect(daemon.removed).toContain('/cfg/pignon/run-0badc0de')
+    expect(daemon.removed).toContain('/cfg/pignon/run-deadbeef')
+    expect(daemon.removed).not.toContain(`/cfg/pignon/${mine}`)
+    expect(daemon.launches).toEqual([])
+    expect(calls.model).toBe(1)
+  })
+
+  test('a session whose daemon was stopped elsewhere finds the stop when its connection drops', SHARED, async ($, on) => {
+    const calls = engine(on, TRIVIAL, [], 'live')
+    const daemon = sharedDaemon(on, { isUp: true })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    // Another session ran /pignon daemon stop.
+    daemon.files.add('/cfg/pignon/shared-stopped')
+    daemon.isUp = false
+    await prompt($, 't1', 'rename foo')
+    await settle()
+    await prompt($, 't2', 'rename bar')
+    await settle()
+
+    expect(daemon.launches).toEqual([])
+    expect(calls.model).toBe(2)
+  })
+
+  test('/pignon daemon start lifts the stop and starts the daemon; other sessions join on their next prompt', SHARED, async ($, on) => {
+    const calls = engine(on, TRIVIAL, [], 'live')
+    const daemon = sharedDaemon(on, { isUp: false, files: ['/cfg/pignon/shared-stopped'] })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    const { text = '' } = await $.command.run({ command: 'pignon', args: 'daemon start', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+    await prompt($, 't1', 'rename foo')
+
+    expect(daemon.files.has('/cfg/pignon/shared-stopped')).toBe(false)
+    expect(daemon.launches).toHaveLength(1)
+    expect(text).toContain('The shared daemon is up (pid 5151)')
+    expect(daemon.decides).toBe(1)
+    expect(calls.model).toBe(0)
+  })
+
+  test('a session stopped by hand joins once another session started the daemon again', SHARED, async ($, on) => {
+    const calls = engine(on, TRIVIAL, [], 'live')
+    const daemon = sharedDaemon(on, { isUp: false, files: ['/cfg/pignon/shared-stopped'] })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    // Another session ran /pignon daemon start.
+    daemon.files.delete('/cfg/pignon/shared-stopped')
+    daemon.isUp = true
+    await prompt($, 't1', 'rename foo')
+    await settle()
+    await prompt($, 't2', 'rename bar')
+
+    expect(calls.model).toBe(1) // the first prompt only
+    expect(daemon.decides).toBe(1)
+    expect(daemon.launches).toEqual([])
+  })
+
+  test('/pignon daemon restart stops the daemons, then starts this version', SHARED, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    const daemon = sharedDaemon(on, { isUp: true })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    const { text = '' } = await $.command.run({ command: 'pignon', args: 'daemon restart', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+
+    expect(daemon.killed).toEqual([4242])
+    expect(daemon.launches).toHaveLength(1)
+    expect(daemon.files.has('/cfg/pignon/shared-stopped')).toBe(false)
+    expect(text).toContain('The shared daemon is up (pid 5151)')
+  })
+
+  test('/pignon daemon lists the shared daemons, the idle time of this version and the others to stop', SHARED, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    const daemon = sharedDaemon(on, { isUp: true, health: { version: '0.1.7', uptimeSeconds: 1548, idleSeconds: 180, idleLimitSeconds: 1800 } })
+    daemon.others = [{ pid: 3131, line: psLine(3131, '/cfg/pignon/run-0badc0de/s.sock', '1:02:03', 948_000) }]
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    const { text = '' } = await $.command.run({ command: 'pignon', args: 'daemon', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+
+    expect(text).toContain('This session: laya, shared daemon, up (pid 4242).')
+    expect(text).toContain('pid 4242 · 0.1.7 (this version) · up 26 min · last prompt 3 min ago, leaves in 27 min · 929 MiB')
+    expect(text).toContain('pid 3131 · unknown version (another version: its sessions use it until they restart) · up 1 h 2 min · leaves after 30 min without a prompt · 926 MiB')
+    expect(text).toContain('Commands: /pignon daemon stop | start | restart')
+  })
+
+  test('stop and start say they act on the shared daemon when the session runs its own', LOCAL, async ($, on) => {
+    engine(on, TRIVIAL, [], 'live')
+    mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
+    const runs: (readonly string[])[] = []
+    on('process.run', (_, e) => {
+      runs.push(e.argv)
+      return { value: OK }
+    })
+    on('process.spawn', async function* () {
+      yield { stream: 'stdout' as const, text: 'ready 4242\n' }
+      await forever
+      return { value: { code: 0, signal: null } }
+    })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+    const before = runs.length
+    const { text = '' } = await $.command.run({ command: 'pignon', args: 'daemon stop', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+
+    expect(text).toContain('acts on the shared daemon, and this session runs its own copy, which stops with it')
+    expect(runs.slice(before).filter(argv => argv[0] === 'kill')).toEqual([])
   })
 
   test('the per-session daemon stays the default when laya is chosen', LOCAL, async ($, on) => {

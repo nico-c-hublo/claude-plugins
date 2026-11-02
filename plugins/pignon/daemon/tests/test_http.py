@@ -7,9 +7,10 @@ import socket
 import stat
 import tempfile
 import threading
+import time
 import unittest
 
-from pignon_decider.server import serve
+from pignon_decider.server import MANIFEST, serve
 from tests.support import ExplodingScorer, FakeScorer, OverlapProbeScorer, raw_exchange, request, running_daemon
 
 
@@ -19,7 +20,47 @@ class HealthTest(unittest.TestCase):
             status, body = request(socket_path, "GET", "/health")
 
         self.assertEqual(status, 200)
-        self.assertEqual(body, {"status": "ok", "ready": True, "pid": os.getpid()})
+        self.assertEqual(
+            body,
+            {
+                "status": "ok",
+                "ready": True,
+                "pid": os.getpid(),
+                "version": json.load(open(MANIFEST))["version"],
+                "uptimeSeconds": 0,
+                "idleSeconds": 0,
+                "idleLimitSeconds": None,
+            },
+        )
+
+    def test_says_how_long_since_the_last_prompt_and_is_not_one_itself(self):
+        with running_daemon(FakeScorer()) as socket_path:
+            server_started = time.monotonic()
+            time.sleep(1.2)
+            _, before = request(socket_path, "GET", "/health")
+            request(socket_path, "POST", "/decide", {"prompt": "rename foo"})
+            _, after = request(socket_path, "GET", "/health")
+
+        self.assertGreaterEqual(before["idleSeconds"], 1)
+        self.assertGreaterEqual(before["uptimeSeconds"], 1)
+        self.assertEqual(after["idleSeconds"], 0)
+        self.assertLessEqual(after["uptimeSeconds"], round(time.monotonic() - server_started) + 1)
+
+    def test_reports_the_idle_limit_it_was_given(self):
+        directory = tempfile.mkdtemp(prefix="pd", dir="/tmp")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        os.chmod(directory, 0o700)
+        server = serve(f"{directory}/s.sock", FakeScorer(), idle_seconds=1800)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            _, body = request(f"{directory}/s.sock", "GET", "/health")
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+        self.assertEqual(body["idleLimitSeconds"], 1800)
 
 
 class DecideTest(unittest.TestCase):
