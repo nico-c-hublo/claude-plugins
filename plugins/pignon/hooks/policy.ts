@@ -240,6 +240,28 @@ export function verdictSignal(decision: Decision | null, turn: TurnOutcome | und
   return null
 }
 
+/**
+ * The hybrid judge's verdict: the local model decides, and a move below the tier
+ * in force needs Haiku. Laya's verdict stands when it keeps or moves up (a wrong
+ * upgrade only costs money); a downgrade goes no lower than the more capable of
+ * the two verdicts, and none happens without Haiku's answer. The confidence is
+ * laya's, whose call it was to ask. Null without a verdict from laya; laya's own
+ * verdict when the tier in force is no tier's.
+ *
+ * Verdicts, not the policy's targets: the judges are scored on what they said,
+ * before the bars, the cooldown and the cache guard.
+ */
+export function hybridDecision(laya: Decision | null, haiku: Decision | null, current: string | null): Decision | null {
+  const proposed = effectiveTier(laya)
+  if (laya === null || proposed === null) return null
+  const now = current === null ? -1 : rankOf(current)
+  if (now < 0 || rankOf(proposed) >= now) return laya
+  const confirmed = effectiveTier(haiku)
+  const rank = Math.max(rankOf(proposed), confirmed === null ? now : rankOf(confirmed))
+
+  return { tier: TIERS[rank]!.id, explore: false, confidence: laya.confidence }
+}
+
 /** What `/pignon mark` and the pane take besides a tier's name, and how each reads. */
 export const MARKS = { low: 'too low', ok: 'right', high: 'too high' } as const
 export type MarkWord = keyof typeof MARKS

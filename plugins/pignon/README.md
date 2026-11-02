@@ -80,13 +80,19 @@ The cost is one small Haiku call per decided prompt, in shadow mode only. Live m
 
 ## Scoring the judges
 
-Agreement says whether two judges see a prompt the same way, not whether either is right. Three sources of labels say that, from free to paid. `/pignon stats` puts them in one table per judge (`laya`, `haiku`, `opus`), and by the judge's confidence, which is what the confidence bars should be tuned on; `/pignon compare` gives the session's share.
+Agreement says whether two judges see a prompt the same way, not whether either is right. Three sources of labels say that, from free to paid. `/pignon stats` puts them in one table per judge (`laya`, `haiku`, the simulated [`hybrid`](#the-hybrid-simulated), `opus`), and by the judge's confidence, which is what the confidence bars should be tuned on; `/pignon compare` gives the session's share.
 
 - **Outcomes, free and weak.** Once a turn has ended, a trivial verdict is flagged **too low** when the turn ran 8 or more requests, and a hard verdict **too high** when the turn answered in one or two requests, under 1,500 output tokens (thinking included) and within a minute; the minute keeps out a turn that handed the work to a subagent, whose requests the main loop does not count. Each rate is out of the verdicts it can flag, too low out of the trivial ones and too high out of the hard ones, so a judge that says standard a lot gains nothing by it. It holds whichever model ran the turn, so shadow mode measures it too; in live mode it measures the judge and the tier's model together (a Haiku turn that loops is flagged whichever was at fault). A prompt that opens by saying the last answer was wrong (`no, the other file`, `that's not it`, `wait, it still fails`, `revert that`, `non mais`, `pas ça`, `ça marche pas`, …) marks the turn before it as **corrected**, if that turn was routed. A bare `no`, a `no, that's fine` and a `revert commit abc` do not count: the first two answer a question, the last is a task. A judge is charged with a correction only when its tier is the one the turn ran on: in shadow mode, where the session's model ran, that is a judge that agreed with it. The stats also count corrections by that tier, so trivial turns can be set against the rest.
 - **Your marks, exact and few.** `/pignon mark low`, `ok` or `high` labels the last judged prompt (`/pignon mark low #12` an earlier one, by its number in `/pignon log`): the tier its line named, `switched to`, `would switch to` or `kept`, was too low, right, or too high. In live mode that is the tier that ran, so a mark speaks of the answer you got, and a verdict a confidence bar or the cache guard set aside is scored against it like any other judge's. `low` on trivial accepts standard and hard, so a judge that said either is scored right; name the tier (`/pignon mark standard`) to be exact. The pane's buttons do the same. A few dozen marks over a week are enough to tell a judge that is right four times in five from one that is right half the time, and whether its confidence means anything: a 0.9 should be right more often than a 0.6. Mark prompts as they come, the ordinary ones too, not only those that surprise you, or the score measures your surprise. Marks reach `/pignon stats` only with the [decision log](#keeping-a-decision-log) on, so turn it on first.
 - **The oracle, paid.** See below.
 
 The judges read the first 4,000 characters of the prompt and the tier in force, without the codebase or the conversation; the local model reads only the first 400. A wrong verdict may come from the input as much as from the judge, and the oracle tells the two apart: for the local model the stats also give its agreement on the prompts it read whole (`within its 400 characters`), where its input was Opus's.
+
+### The hybrid, simulated
+
+Laya answers in about 10 ms and Haiku in about half a second; a hybrid would keep most of laya's speed and ask Haiku only where a wrong verdict costs most. The rule: laya decides, and its verdict stands when it keeps the tier or moves up, since a wrong upgrade only costs money. A move below the tier in force needs Haiku, who can also say that the task must explore the codebase, which laya cannot. The move then goes no lower than the more capable of the two verdicts, and does not happen without Haiku's answer.
+
+It is not a decider yet: the stats simulate it. Wherever laya decided and Haiku answered beside it (laya chosen, shadow mode), the `hybrid` line scores what it would have said, on the same outcomes, marks and oracle as the others. If it beats laya and comes close to Haiku, it is worth running; if laya alone does as well, it would only add latency. What the simulation cannot say is how often the hybrid would ask Haiku: in shadow mode the session's model stays in force, so on Opus nearly every verdict is a move down. Only a live hybrid would show that.
 
 ### The oracle: Opus as the reference
 
@@ -133,7 +139,10 @@ judges, scored on outcomes, your marks and the oracle:
          p ≥ 0.85      too low 4% of 25 trivial · too high 10% of 20 hard · right 83% of 6 marked · same as opus 78% of 9
   haiku  321 verdicts · too low 5% of 60 trivial · too high 25% of 70 hard · corrected 3% of 140 that ran · right 82% of 28 marked · same as opus 85% of 40
          ...
+  hybrid 301 verdicts · too low 4% of 45 trivial · too high 21% of 60 hard · corrected 3% of 120 that ran · right 80% of 27 marked · same as opus 82% of 38
+         ...
   opus    40 verdicts · too low 0% of 8 trivial · too high 10% of 10 hard · corrected 2% of 30 that ran · right 90% of 10 marked
+  hybrid: simulated, not run: laya's verdict, except that a move below the tier in force needs Haiku and goes no lower than the more capable of the two
   too low: a trivial verdict whose turn ran 8+ steps · too high: a hard verdict whose turn answered in 2 requests or fewer, under 1,500 output tokens and 60 s · corrected: the next prompt said the answer was wrong
   oracle: opus asked 40 times, $0.31 at list price
 corrected, by the tier the turn ran on: 6 of 60 on trivial (10%) · 3 of 90 on standard (3%) · 9 of 230 on hard (4%)

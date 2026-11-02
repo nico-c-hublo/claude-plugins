@@ -53,6 +53,8 @@ export type LogEntry = {
   mode: 'live' | 'shadow'
   /** The session's own model. */
   model: string
+  /** The tier in force before the decision, null for the session's own model. */
+  was: string | null
   prompt: string
   /** Characters in the prompt: the local model reads the first 400 of them. */
   promptChars: number
