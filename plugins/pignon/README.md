@@ -32,7 +32,7 @@ pignon 0.1.5 is in a measurement phase. It routes, but nobody has yet checked it
    { "pluginConfigs": { "pignon": { "options": { "decider": "laya", "record": "on", "oracle": "on" } } } }
    ```
 
-   The log is what `/pignon stats` reads. Without it, your marks and the oracle's answers are lost when the session ends. The oracle costs about a cent per prompt (see [The oracle](#the-oracle-opus-as-the-reference)).
+   The log is what `/pignon stats` reads. Without it, your marks and the oracle's answers are lost when the session ends. The oracle costs about a cent per prompt (see [The oracle](#the-oracle-opus-as-the-reference)). To train a local judge later, add `"corpus": "on"`: the prompts themselves are then kept on this Mac (see [Keeping the prompts](#keeping-the-prompts-to-train-a-local-judge)).
 3. Stay in shadow mode (`/pignon shadow`). Haiku's second opinion, the oracle and the hybrid only run there.
 4. Check `/pignon`: it should say `decider: laya (running)`, `decision log: on` and `oracle: on (Opus judges each prompt once its turn ends)`.
 5. Work as usual, and [mark](#scoring-the-judges) prompts as they come with `/pignon mark` or the [pane](#watching-the-decisions)'s buttons. Mark the ordinary prompts too, not only the surprising ones.
@@ -188,7 +188,7 @@ It is off by default: each call costs, at list price, about a cent for a typical
 
 `/pignon compare` and the pane only see the current session, and forget it when it ends. To judge the local model over days and across projects, set *Keep a decision log* to `on` (the `record` option, in `/config` or `"record": "on"` in the same `pluginConfigs` block as `decider`). It is off by default.
 
-Each decision then adds one JSON line to a file for the session in `$CLAUDE_CONFIG_DIR/pignon/decisions/` (`~/.claude/pignon/decisions/` by default), a folder only you can enter. **No word of a prompt is kept**, only its length. A line holds:
+Each decision then adds one JSON line to a file for the session in `$CLAUDE_CONFIG_DIR/pignon/decisions/` (`~/.claude/pignon/decisions/` by default), a folder only you can enter. **No word of a prompt is kept**, only its length; the prompts go to [the corpus](#keeping-the-prompts-to-train-a-local-judge), a separate folder, and only when you ask for it. A line holds:
 
 - when, and the session's working directory;
 - who was chosen in the settings and who answered (`laya`, `haiku` or `rule`), and how the local model ran (`session` or `shared`);
@@ -246,7 +246,31 @@ When a turn ends, its token counts are priced three ways on the same numbers: on
 
 The savings are weighed against one quality signal, **under-routed** turns: a prompt judged `trivial` whose turn made 8 or more model requests (a trivial task does not loop that long, whichever model ran it), and a turn that was switched and ended in an error or a refusal. The watch pane and `/pignon log` flag them, and `/pignon stats` counts them. Read them with the savings: a routing that saves a third and under-routes one prompt in fifty is a different proposition from one that under-routes one in five.
 
-Files are rewritten whole on each decision (the engine has no append, and two sessions sharing a file would lose lines), capped at 3,000 decisions each. A file older than 90 days is deleted when a session starts with the log on; delete the folder to clear everything. The file also holds your project paths, so mind it when sharing.
+Files are rewritten whole on each decision (the engine has no append, and two sessions sharing a file would lose lines), capped at 3,000 decisions each. A file older than 90 days is deleted at each session start, with the log on or off; delete the folder to clear everything. The file also holds your project paths, so mind it when sharing.
+
+## Keeping the prompts, to train a local judge
+
+On the first prompts Opus's verdict could score, laya picked Opus's tier 10 times out of 38, and Haiku 28 times out of 37 (one prompt had no answer from Haiku). Laya's probabilities hardly follow Opus's ranking, so recalibrating them gives no more than always answering `standard`; see [below](#what-the-first-measurement-said). A judge of laya's speed that does better has to be trained on prompts like yours, labelled by Opus. The decision log holds the labels but, by design, not the prompts. The corpus holds the prompts.
+
+Set *Keep the prompts, to train a local judge* to `on` (the `corpus` option, in `/config` or `"corpus": "on"` in the same `pluginConfigs` block as `decider`), with the decision log and the oracle on, in shadow mode, or the prompts get no labels (`/pignon` says so). They are kept all the same, so they can still be labelled later. It is off by default.
+
+- **What is kept.** The text of each judged prompt, up to 32,000 characters (its full length is noted), in its own file `$CLAUDE_CONFIG_DIR/pignon/corpus/<session>-<n>.json`. `session` and `n` are the keys of its line in the decision log, where the tiers, the judges' answers, the oracle's verdict, the turn's outcome and your mark are. A `/clear` starts a new `session`. Like the log, a session keeps its newest 3,000 prompts. Acknowledgements are not kept, nor prompts that were not routed (pignon off or pinned).
+- **Where it stays.** In a folder only you can enter, on this Mac; pignon sets its rights again before each prompt it keeps. Nothing reads it but you and a training run on this Mac; pignon sends it nowhere. A file older than 90 days is deleted at each session start, with the corpus on or off, as long as pignon is enabled; delete the folder to clear everything. Prompts hold whatever you typed or pasted, secrets included: mind the folder in backups and when sharing.
+- **How much it takes.** At about a cent per oracle label, a few hundred labelled prompts cost a few dollars and some weeks of ordinary work. The judge is trained, and checked on prompts it was not trained on, once there are enough.
+
+### What the first measurement said
+
+On 2026-11-02, 115 decisions were logged, 45 with laya's probabilities and Opus's verdict beside them; on 7, Opus said to keep the tier, which scores nothing, leaving 38. All ran on Opus sessions. Out of 38 (37 for the judges that need Haiku's answer), with a margin of about ±16 points:
+
+| Judge | Picks Opus's tier |
+| --- | --- |
+| Haiku | 28 of 37 (76%) |
+| laya, recalibrated (a temperature and a bias per tier, each prompt scored by a fit on the 37 others) | 21 of 38 (55%) |
+| always `standard` | 20 of 38 (53%) |
+| the hybrid | 14 of 37 (38%) |
+| laya | 10 of 38 (26%) |
+
+Laya said `hard` 26 times, and Opus agreed 4 times. On an Opus session the hybrid's downgrades go no lower than laya's verdict, so it inherits that lean. Haiku's confidence ran from 0.4 to 0.7, its misses spread across that range, so it says nothing of when Haiku is wrong, and it never reaches the 0.85 downgrade bar.
 
 ## Limits
 

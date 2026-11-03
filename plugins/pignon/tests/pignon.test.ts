@@ -2017,13 +2017,13 @@ describe('the decision log: in a session', () => {
   }
 
   // The engine below the mod: a daemon that answers, a disk that records what is written.
-  function disk(on: On, options: { failWrites?: boolean } = {}) {
+  function disk(on: On, options: { failWrites?: boolean; folders?: string[]; failsPrivate?: boolean } = {}) {
     const seen = { writes: [] as { path: string; text: string }[], runs: [] as (readonly string[])[] }
     mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
     on('process.run', (_, e) => {
       seen.runs.push(e.argv)
 
-      return { value: OK }
+      return { value: options.failsPrivate && e.argv[0] === 'install' ? { ...OK, exitCode: 1 } : OK }
     })
     on('process.spawn', async function* () {
       yield { stream: 'stdout' as const, text: 'ready 4242\n' }
@@ -2032,6 +2032,7 @@ describe('the decision log: in a session', () => {
     })
     on('http.fetch', () => ({ value: LAYA }))
     on('session.cwd', () => ({ value: '/work/api' }))
+    on('fs.exists', (_, e) => ({ value: (options.folders ?? []).includes(e.path) }))
     on('fs.write', (_, e) => {
       if (options.failWrites) throw new Error('disk full')
       seen.writes.push(e)
@@ -2068,7 +2069,7 @@ describe('the decision log: in a session', () => {
     await prompt($, 't2', 'add a test for the parser')
     await settle()
 
-    expect(seen.runs).toContainEqual(['mkdir', '-p', '-m', '700', '/cfg/pignon/decisions'])
+    expect(seen.runs).toContainEqual(['install', '-d', '-m', '700', '/cfg/pignon/decisions'])
     const paths = new Set(seen.writes.map(w => w.path))
     expect(paths.size).toBe(1) // one file for the session, rewritten as it grows
     expect([...paths][0]).toMatch(/^\/cfg\/pignon\/decisions\/\d{8}T\d{6}-[0-9a-f]{8}\.jsonl$/)
@@ -2102,9 +2103,9 @@ describe('the decision log: in a session', () => {
     expect(last(seen)[0]).toMatchObject({ chosen: 'haiku', daemon: null, decider: 'haiku', mode: 'live' })
   })
 
-  test('removes logs older than 90 days when the session starts', RECORDING, async ($, on) => {
+  test('removes logs older than 90 days when the session starts, with the log on or off', LOCAL, async ($, on) => {
     engine(on, TRIVIAL, [], 'shadow')
-    const seen = disk(on)
+    const seen = disk(on, { folders: ['/cfg/pignon/decisions'] })
 
     await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
     await settle()
@@ -2167,6 +2168,215 @@ describe('the decision log: in a session', () => {
 
     expect(text).toContain('No decisions recorded yet')
   })
+
+  // The corpus: the prompts themselves, kept apart from the log, for training a local judge.
+  const CORPUS = { options: { decider: 'laya', record: 'on', corpus: 'on' } }
+  const corpusWrites = (seen: { writes: { path: string; text: string }[] }) => seen.writes.filter(w => w.path.includes('/corpus/'))
+
+  test('keeps no prompt unless asked to', RECORDING, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    const seen = disk(on)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', SECRET)
+    await settle()
+
+    expect(corpusWrites(seen)).toEqual([])
+    expect(seen.runs.some(argv => argv.join(' ').includes('/corpus'))).toBe(false)
+  })
+
+  test('keeps each judged prompt in its own file, in a private folder, under the key of its record', CORPUS, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    const seen = disk(on)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', SECRET)
+    await settle()
+    await prompt($, 't2', 'add a test for the parser')
+    await settle()
+
+    expect(seen.runs).toContainEqual(['install', '-d', '-m', '700', '/cfg/pignon/corpus'])
+    const kept = corpusWrites(seen)
+    expect(kept).toHaveLength(2)
+    const records = last({ writes: seen.writes.filter(w => w.path.includes('/decisions/')) })
+    for (const [i, write] of kept.entries()) {
+      const item = JSON.parse(write.text)
+      expect(write.path).toBe(`/cfg/pignon/corpus/${records[i]!.session}-${records[i]!.n}.json`)
+      expect(item).toMatchObject({ v: 1, session: records[i]!.session, n: records[i]!.n, at: records[i]!.at })
+    }
+    expect(JSON.parse(kept[0]!.text).text).toBe(SECRET)
+    expect(JSON.parse(kept[1]!.text).text).toBe('add a test for the parser')
+    // The log itself still holds no word of a prompt.
+    expect(seen.writes.filter(w => w.path.includes('/decisions/')).every(w => !w.text.includes('SECRETWORD'))).toBe(true)
+  })
+
+  test('keeps no acknowledgement, and cuts a long prompt', CORPUS, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    const seen = disk(on)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', 'x'.repeat(40_000))
+    await settle()
+    await prompt($, 't2', 'yes')
+    await settle()
+
+    const kept = corpusWrites(seen)
+    expect(kept).toHaveLength(1)
+    expect(JSON.parse(kept[0]!.text)).toMatchObject({ text: 'x'.repeat(32_000), chars: 40_000 })
+  })
+
+  test('removes kept prompts older than 90 days when the session starts, with the corpus on or off', LOCAL, async ($, on) => {
+    engine(on, TRIVIAL, [], 'shadow')
+    const seen = disk(on, { folders: ['/cfg/pignon/corpus'] })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    expect(seen.runs).toContainEqual(['find', '/cfg/pignon/corpus', '-name', '*.json', '-mtime', '+90', '-delete'])
+  })
+
+  test('a /clear starts new keys, so no prompt of the last conversation is overwritten', CORPUS, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    const seen = disk(on)
+    on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', 'first conversation')
+    await settle()
+    // A /clear: the session ends, the process goes on, and no session.start fires.
+    await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
+    await prompt($, 't2', 'second conversation')
+    await settle()
+
+    const kept = corpusWrites(seen)
+    expect(kept).toHaveLength(2)
+    expect(new Set(kept.map(w => w.path)).size).toBe(2)
+    const [first, second] = kept.map(w => JSON.parse(w.text))
+    expect(first.session).not.toBe(second.session)
+    // Each conversation's records go to a file of their own, under the same key as its prompts.
+    const logs = [...new Set(seen.writes.filter(w => w.path.includes('/decisions/')).map(w => w.path))]
+    expect(logs).toHaveLength(2)
+    expect(logs[1]).toContain(second.session)
+  })
+
+  test('keeps no prompt that was not routed: pignon off, the model pinned, or a subagent', CORPUS, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    const seen = disk(on)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await $.turn.start({ turnId: 'a', text: 'a subagent task', agentId: 'a1' })
+    for await (const _ of $.turn.step({ turnId: 'a', index: 0, model: OPUS, effort: 'high', messageCount: 1, agentId: 'a1' }));
+    await prompt($, 't1', 'routed')
+    // Picking another model pins routing: the prompts after it are not judged.
+    await $.turn.start({ turnId: 't2', text: 'pinned' })
+    for await (const _ of $.turn.step({ turnId: 't2', index: 0, model: 'claude-sonnet-5-5', effort: 'high', messageCount: 3 }));
+    await settle()
+
+    expect(corpusWrites(seen).map(w => JSON.parse(w.text).text)).toEqual(['routed'])
+  })
+
+  test('keeps nothing while pignon is off', CORPUS, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'off')
+    const seen = disk(on)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', SECRET)
+    await settle()
+
+    expect(corpusWrites(seen)).toEqual([])
+  })
+
+  test('never cuts a long prompt in the middle of a character', CORPUS, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    const seen = disk(on)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    // The emoji's two halves sit at 31,999 and 32,000: the cut falls between them.
+    await prompt($, 't1', 'x'.repeat(31_999) + '😀' + 'y'.repeat(100))
+    await settle()
+
+    const { text } = JSON.parse(corpusWrites(seen)[0]!.text)
+    expect(text).toBe('x'.repeat(31_999))
+  })
+
+  test('a corpus folder made private on every prompt, not only when it is created', CORPUS, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    const seen = disk(on)
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', 'one')
+    await settle()
+    await prompt($, 't2', 'two')
+    await settle()
+
+    const made = seen.runs.filter(argv => argv.join(' ') === 'install -d -m 700 /cfg/pignon/corpus')
+    expect(made).toHaveLength(2)
+  })
+
+  test('a folder that cannot be made private keeps no prompt', CORPUS, async ($, on) => {
+    engine(on, HAIKU_SAYS_STANDARD, [], 'shadow')
+    const seen = disk(on, { failsPrivate: true })
+    const toasts: string[] = []
+    on('ui.toast', (_, e) => {
+      toasts.push(e.text)
+      return { value: undefined }
+    })
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', SECRET)
+    await settle()
+
+    expect(corpusWrites(seen)).toEqual([])
+    expect(toasts).toContain('pignon: a prompt could not be kept in the corpus.')
+  })
+
+  test('a disk that fails costs no prompt', CORPUS, async ($, on) => {
+    const sent: TurnStepInput[] = []
+    engine(on, HAIKU_SAYS_STANDARD, sent, 'live')
+    disk(on, { failWrites: true })
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await settle()
+
+    await prompt($, 't1', SECRET)
+    await prompt($, 't2', 'add a test')
+    await settle()
+
+    expect(sent).toHaveLength(2)
+  })
+
+  const LABELS: [options: Record<string, string>, mode: string, says: string | null][] = [
+    [{ corpus: 'on' }, 'shadow', 'the log is off, so the kept prompts get no labels'],
+    [{ corpus: 'on', record: 'on' }, 'shadow', 'the oracle is off, so the kept prompts get no labels'],
+    [{ corpus: 'on', record: 'on', oracle: 'on' }, 'live', 'the oracle only runs in shadow mode, so the kept prompts get no labels'],
+    [{ corpus: 'on', record: 'on', oracle: 'on' }, 'shadow', null],
+  ]
+  for (const [options, mode, says] of LABELS) {
+    test(`/pignon says the corpus is on, and whether its prompts get labels: ${JSON.stringify(options)} in ${mode}`, { options: { decider: 'laya', ...options } }, async ($, on) => {
+      engine(on, HAIKU_SAYS_STANDARD, [], mode)
+      disk(on)
+      await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+      const { text = '' } = await $.command.run({
+        command: 'pignon',
+        args: '',
+        origin: { kind: 'composer' },
+        presentation: { isFullscreen: false, columns: 80 },
+      })
+
+      expect(text).toContain('corpus: on (0 prompts kept this session')
+      if (says) expect(text).toContain(says)
+      else expect(text).not.toContain('no labels')
+    })
+  }
 })
 
 // The cost and the under-routing signal, in dollars at list price.

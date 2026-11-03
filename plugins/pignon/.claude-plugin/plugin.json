@@ -1,6 +1,6 @@
 {
   "name": "pignon",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "author": {
     "name": "nico-c-hublo"
   },
@@ -31,7 +31,7 @@
     "record": {
       "type": "string",
       "title": "Keep a decision log",
-      "description": "off: nothing is written to disk (default). on: one line per decision in $CLAUDE_CONFIG_DIR/pignon/decisions/, with the tiers, the judges' answers and timings but none of the prompt, for /pignon stats. Files older than 90 days are removed.",
+      "description": "off: nothing is written to disk (default). on: one line per decision in $CLAUDE_CONFIG_DIR/pignon/decisions/, with the tiers, the judges' answers and timings but none of the prompt, for /pignon stats. Files older than 90 days are removed at each session start, even after you turn this off.",
       "options": [
         "off",
         "on"
@@ -42,6 +42,16 @@
       "type": "string",
       "title": "Score the judges against Opus",
       "description": "off: no reference judge (default). on: in shadow mode, Opus is also asked about each judged prompt once its turn has ended, with the input Haiku read; /pignon compare and /pignon stats then say how often Haiku and the local model pick its tier. One Opus call per prompt, about a cent at list price (at most about nine); the stats show what it cost. Turn the decision log on too, or its answers are lost when the session ends.",
+      "options": [
+        "off",
+        "on"
+      ],
+      "default": "off"
+    },
+    "corpus": {
+      "type": "string",
+      "title": "Keep the prompts, to train a local judge",
+      "description": "off: no prompt is written to disk (default). on: the text of each judged prompt (acknowledgements aside, up to 32,000 characters) goes to its own file in $CLAUDE_CONFIG_DIR/pignon/corpus/, a folder only you can enter, keyed to its line in the decision log, so a judge can later be trained on this Mac from the oracle's verdicts. Nothing leaves the Mac. Files older than 90 days are removed at each session start, even after you turn this off. Turn the decision log and the oracle on too, in shadow mode, or the prompts have no labels.",
       "options": [
         "off",
         "on"
