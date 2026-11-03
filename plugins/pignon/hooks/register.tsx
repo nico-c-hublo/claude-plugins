@@ -634,32 +634,56 @@ async function startShared($: EngineInterface, daemon: LocalDaemon): Promise<str
 
 // The decision log (see record.ts): one file per session, rewritten whole, since
 // the engine's fs has no append and two sessions on one file would lose lines.
-const kept: DecisionRecord[] = []
-let keptFile: string | null = null
-let session: string | null = null
+// One ledger per conversation. A /clear or a resume goes on in the same process
+// under a new session, so it gets a new ledger: its records and its kept prompts
+// never share a (session, n) key with the last one's, whatever the counter does.
+type Ledger = { id: string; records: DecisionRecord[]; file: string | null; promptsKept: number }
+let ledger: Ledger | null = null
 let flushing: Promise<void> = Promise.resolve()
 let hasFailedToWrite = false
 
-function sessionId(): string {
-  session ??= randomHex(4)
+function currentLedger(): Ledger {
+  ledger ??= { id: randomHex(4), records: [], file: null, promptsKept: 0 }
 
-  return session
+  return ledger
 }
 
-async function decisionsDir($: EngineInterface): Promise<string> {
-  return `${await dataHome($)}/decisions`
+function sessionId(): string {
+  return currentLedger().id
+}
+
+// A folder only you can enter, made so on every call: one that exists with looser
+// rights is closed, one deleted meanwhile is made again (fs.write would make it
+// open). `install -d -m` sets the mode on a folder that already exists; mkdir does not.
+async function privateDir($: EngineInterface, sub: 'decisions' | 'corpus'): Promise<string> {
+  const dir = `${await dataHome($)}/${sub}`
+  const made = await $.process.run(['install', '-d', '-m', '700', dir])
+  if (made.exitCode !== 0) throw new Error(`${dir} could not be made private`)
+
+  return dir
+}
+
+// Files older than KEEP_DAYS go; nothing happens when the folder is missing.
+// Never throws: it runs at every session start, off its path.
+async function prune($: EngineInterface, sub: 'decisions' | 'corpus', pattern: string): Promise<void> {
+  try {
+    const dir = `${await dataHome($)}/${sub}`
+    if (!(await $.fs.exists(dir))) return
+    await $.process.run(['find', dir, '-name', pattern, '-mtime', `+${KEEP_DAYS}`, '-delete'])
+  } catch {
+    // The next session start tries again.
+  }
 }
 
 // Never throws: a log that cannot be written must not cost a prompt.
-async function writeKept($: EngineInterface): Promise<void> {
+async function writeKept($: EngineInterface, book: Ledger): Promise<void> {
   try {
-    if (keptFile === null) {
-      const dir = await decisionsDir($)
-      await $.process.run(['mkdir', '-p', '-m', '700', dir])
+    const dir = await privateDir($, 'decisions')
+    if (book.file === null) {
       const stamp = new Date(await $.clock.now()).toISOString().replace(/[-:]/g, '').slice(0, 15)
-      keptFile = `${dir}/${stamp}-${sessionId()}.jsonl`
+      book.file = `${dir}/${stamp}-${book.id}.jsonl`
     }
-    await $.fs.write(keptFile, serialize(kept))
+    await $.fs.write(book.file, serialize(book.records))
   } catch {
     if (!hasFailedToWrite) $.ui.toast('pignon: the decision log could not be written.')
     hasFailedToWrite = true
@@ -667,9 +691,10 @@ async function writeKept($: EngineInterface): Promise<void> {
 }
 
 function keep($: EngineInterface, change: (list: DecisionRecord[]) => void): Promise<void> {
-  change(kept)
-  if (kept.length > MAX_RECORDS) kept.splice(0, kept.length - MAX_RECORDS)
-  flushing = flushing.then(() => writeKept($))
+  const book = currentLedger()
+  change(book.records)
+  if (book.records.length > MAX_RECORDS) book.records.splice(0, book.records.length - MAX_RECORDS)
+  flushing = flushing.then(() => writeKept($, book))
 
   return flushing
 }
@@ -727,15 +752,44 @@ async function finishTurn(
   if (turn.oracle) void oracleOpinion($, turn.id, turn.oracle.text, turn.oracle.tier, isRecording)
 }
 
-async function pruneLog($: EngineInterface): Promise<void> {
-  const dir = await decisionsDir($)
-  await $.process.run(['find', dir, '-name', '*.jsonl', '-mtime', `+${KEEP_DAYS}`, '-delete']).catch(() => null)
+// The corpus: the words of each judged prompt, for training a judge on this Mac.
+// Kept apart from the log, which stays free of them, and joined to its record by
+// (session, n). One file per prompt, so nothing long is rewritten as it grows.
+const CORPUS_PROMPT_CHARS = 32_000
+let hasFailedToKeep = false
+
+// The first `max` UTF-16 units, never ending on half a pair: a lone surrogate is
+// not valid UTF-8, and a training run's tokenizer would reject the file.
+function cut(text: string, max: number): string {
+  const head = text.slice(0, max)
+  const lastUnit = head.charCodeAt(head.length - 1)
+
+  return lastUnit >= 0xd800 && lastUnit <= 0xdbff ? head.slice(0, -1) : head
+}
+
+// Never throws: a prompt that cannot be kept must not cost the turn.
+async function keepPrompt($: EngineInterface, id: number, at: number, text: string): Promise<void> {
+  const book = currentLedger()
+  try {
+    const dir = await privateDir($, 'corpus')
+    // `chars` is in the same units as the log's `promptChars`.
+    const item = { v: 1, session: book.id, n: id, at, chars: text.length, text: cut(text, CORPUS_PROMPT_CHARS) }
+    await $.fs.write(`${dir}/${book.id}-${id}.json`, JSON.stringify(item) + '\n')
+    book.promptsKept++
+    hasFailedToKeep = false
+    // The log keeps a session's newest MAX_RECORDS records; the prompt whose record
+    // it just let go of goes too, so every kept prompt has its labels.
+    if (id >= MAX_RECORDS) await $.process.run(['rm', '-f', `${dir}/${book.id}-${id - MAX_RECORDS}.json`])
+  } catch {
+    if (!hasFailedToKeep) $.ui.toast('pignon: a prompt could not be kept in the corpus.')
+    hasFailedToKeep = true
+  }
 }
 
 // `/pignon stats [days]`: the newest 200 session files, summed.
 async function statsReport($: EngineInterface, daysArg: string): Promise<string> {
   const days = Number.parseInt(daysArg, 10)
-  const dir = await decisionsDir($)
+  const dir = `${await dataHome($)}/decisions`
   const entries = await $.fs.list(dir).catch(() => [])
   const files = entries.filter(e => e.kind === 'file' && e.name.endsWith('.jsonl')).sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, 200)
   const since = days > 0 ? (await $.clock.now()) - days * 86_400_000 : 0
@@ -1094,6 +1148,7 @@ type Settings = {
   isRecording: boolean
   cacheTtlMs: number
   hasOracle: boolean
+  isKeepingPrompts: boolean
 }
 
 async function route(
@@ -1102,7 +1157,7 @@ async function route(
   model: string,
   effort: Effort | undefined,
   mode: Mode,
-  { wantsLocal, daemon, isShared, isRecording, cacheTtlMs, hasOracle }: Settings,
+  { wantsLocal, daemon, isShared, isRecording, cacheTtlMs, hasOracle, isKeepingPrompts }: Settings,
 ): Promise<{ id: number; oracle?: OracleInput }> {
   const was = await read($, current)
   const startedAt = await $.clock.now()
@@ -1198,6 +1253,7 @@ async function route(
     }
     void recordDecision($, recordOf(entry, context))
   }
+  if (isKeepingPrompts && !isAcknowledgement) void keepPrompt($, id, startedAt, text)
   if (mode === 'shadow' && local) void secondOpinion($, id, text, was, isRecording)
 
   const verdict = decision
@@ -1235,6 +1291,11 @@ export const register: Register = (on, options) => {
   const isShared = decider === 'laya' && options.daemon === 'shared'
   const isRecording = options.record === 'on'
   const hasOracle = options.oracle === 'on'
+  const isKeepingPrompts = options.corpus === 'on'
+  // Why a kept prompt would get no Opus verdict beside it, if it would not.
+  // Prompts are kept all the same: they can still be labelled later, in bulk.
+  const unlabelled = (mode: Mode): string | null =>
+    !isRecording ? 'the log is off' : !hasOracle ? 'the oracle is off' : mode !== 'shadow' ? 'the oracle only runs in shadow mode' : null
   // Resolved at session start; the conservative guess until then.
   let cache: { ttl: CacheTtl; source: string } = { ttl: '1h', source: 'assumed' }
   // The routed turns still running, by turn id, until `turn.complete`.
@@ -1251,7 +1312,10 @@ export const register: Register = (on, options) => {
       immediate: true,
     })
     cache = await resolveCacheTtl($, options.cacheTtl).catch(() => cache)
-    if (isRecording) void pruneLog($)
+    // Whatever the settings: turning the log or the corpus off must not keep its
+    // old files, prompts and their secrets included, past KEEP_DAYS.
+    void prune($, 'decisions', '*.jsonl')
+    void prune($, 'corpus', '*.json')
     // The local model's state shows from the start, before the first prompt.
     if (decider === 'laya') {
       const mode = await modeOf($)
@@ -1294,6 +1358,7 @@ export const register: Register = (on, options) => {
           isRecording,
           cacheTtlMs: CACHE_TTL_MS[cache.ttl],
           hasOracle,
+          isKeepingPrompts,
         })
         lastEntryId = routed.id
         turns.set(e.turnId, { id: routed.id, steps: 1, model: e.model, ...(routed.oracle && { oracle: routed.oracle }) })
@@ -1324,6 +1389,14 @@ export const register: Register = (on, options) => {
       turns.delete(e.turnId)
       if (running) await finishTurn($, running, e, isRecording).catch(() => undefined)
     }
+
+    return next(e)
+  })
+
+  // A /clear or a resume goes on in this process with no session.start: the next
+  // conversation's records and kept prompts go to a new ledger.
+  on('session.end', ($, e, next) => {
+    ledger = null
 
     return next(e)
   })
@@ -1516,7 +1589,8 @@ export const register: Register = (on, options) => {
         `context ${Math.round((await read($, contextTokens)) / 1000)}k · cache ${cacheState}, ttl ${cache.ttl} (${cache.source}) · ${guard}`,
         sessionSavings(await read($, log), mode),
         table,
-        `decision log: ${isRecording ? `on (${kept.length} this session; /pignon stats sums them)` : 'off'} · oracle: ${hasOracle ? `${mode === 'shadow' ? 'on (Opus judges each prompt once its turn ends)' : 'on, idle outside shadow mode'}${isRecording ? '' : '; the log is off, so its answers are lost when the session ends'}` : 'off'}`,
+        `decision log: ${isRecording ? `on (${currentLedger().records.length} this session; /pignon stats sums them)` : 'off'} · oracle: ${hasOracle ? `${mode === 'shadow' ? 'on (Opus judges each prompt once its turn ends)' : 'on, idle outside shadow mode'}${isRecording ? '' : '; the log is off, so its answers are lost when the session ends'}` : 'off'}`,
+        `corpus: ${isKeepingPrompts ? `on (${currentLedger().promptsKept} prompts kept this session, in ${await dataHome($)}/corpus/)${unlabelled(mode) ? `; ${unlabelled(mode)}, so the kept prompts get no labels` : ''}` : 'off'}`,
         'Commands: /pignon live | shadow | off | unpin | log | compare | mark | stats | watch | daemon | setup',
       ].join('\n'),
     }
