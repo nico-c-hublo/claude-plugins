@@ -32,14 +32,16 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 ## What it does
 
 1. **Downloads without running anything.** It clones with git hooks disabled. npm and PyPI packages are downloaded as archives, since `npm install`, `npx` and `pip download` can run the package's scripts. It vets the version you would install, and the linked source repo when there is one.
-2. **Maps the code** with `scan.sh`, a read-only script. It reports:
-   - every file, plus binaries and minified lines
-   - invisible, bidi and tag Unicode
-   - install and load-time hooks
+2. **Maps the code** with `scan.sh`, a read-only script. It covers every file on disk, including ignored and built files, and never runs git under the target's own config. It reports:
+   - every file, plus binaries, minified lines, symlinks, and files whose extension doesn't match their content
+   - invisible, bidi, tag, variation-selector and filler Unicode, and ANSI escapes
+   - install and load-time hooks, including `` !`cmd` `` in skills, `allowed-tools`, `.pth` files, VS Code folder-open tasks, submodules and external marketplace sources
    - sensitive patterns: network, exec, obfuscation, credential paths, persistence, text aimed at an agent
-   - files and patterns that were in the git history but are gone now
-   - data hidden after an image's end
+   - files and sensitive lines that were in the git history but are gone now
+   - data hidden after the end of a PNG, JPEG, GIF or WebP, and scripts in SVGs
    - secrets, through gitleaks when it is installed
+
+   The output is capped per section; the full, uncapped report is written to a work directory for Claude to read when a section is cut.
 3. **Reads in full** every file that runs or that an agent reads: code, manifests, hooks, MCP definitions, SKILL.md files, prompts and tool descriptions.
 4. **Compares what the code can do with what its docs say.** That covers network, execution, files and credentials it reaches, persistence, obfuscation, agent steering, dependencies and provenance. Anything undeclared is a finding.
 5. **Reports:** a verdict, what was and was not read, findings with `file:line`, a capability table, and the command to install the exact commit or version that was vetted.
@@ -50,7 +52,8 @@ The plugin's text is treated as evidence, never as instructions: a README tellin
 
 It is a careful review aid, not a guarantee.
 
-- It reads source code. It does not run the plugin or watch it at runtime.
+- It reads source code. It does not run the plugin or watch it at runtime, so code that only turns malicious at run time (a payload fetched later, a time bomb) can pass.
+- `scan.sh` matches patterns. A determined author can write code that matches none of them; that is why Claude reads every executable and agent-consumed file in full.
 - It does not analyze compiled binaries, and it reports packed or minified code as unreadable rather than decoding it.
 - It lists dependencies but does not read the whole dependency tree. When `osv-scanner` or `uvx` is installed, it can check dependencies for known vulnerabilities and malicious packages.
 - A verdict covers the vetted commit or version only. Vet again before you update.
@@ -72,4 +75,13 @@ Each is used when present and skipped when not:
 bash plugins/vetting/tests/scan.test.sh
 ```
 
-The test builds a booby-trapped repo (an install hook, a credential read deleted from history, a zero-width character in an agent instruction, bytes appended to a PNG) and a clean one full of harmless typographic characters. It checks that `scan.sh` flags every trap in the first, and nothing in the second.
+The test builds booby-trapped repos and checks that `scan.sh` reports each trap in the section it belongs to:
+- install hooks, a credential read deleted from history, agent-steering text with a zero-width character
+- filenames that try to pass as options to perl or grep, or to forge a section header
+- a `.git/config` and `.gitattributes` that run commands through fsmonitor, a diff driver or the pager
+- lines hidden behind an SVG-namespace comment or a flood of harmless hits; variation selectors, fillers and ANSI escapes; NUL bytes, UTF-16 and fake images
+- `` !`cmd` `` in a skill, external marketplace sources, `.pth` files, VS Code tasks, submodules, symlinks out of the target
+- ignored build output, and a plain directory inside another repo
+- data after a JPEG, GIF and WebP end, and an SVG with a script
+
+It also checks that a clean repo full of typographic characters and emoji triggers nothing.

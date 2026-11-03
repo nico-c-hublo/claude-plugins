@@ -1,91 +1,182 @@
 #!/usr/bin/env bash
-# Mechanical checks for the vet-plugin skill. Read-only: never runs anything from the target.
-# Usage: scan.sh <dir>   (a git checkout or an unpacked package)
+# Mechanical checks for the vet-plugin skill. Read-only on the target:
+# - never runs its code, and never follows its symlinks;
+# - never runs git under the target's own config, attributes or hooks: history is read
+#   from a fresh git directory that only borrows the target's objects and refs;
+# - scans every file on disk, ignored and untracked ones included (they run too).
+# Usage: scan.sh <dir> [work dir]
+#   The work dir (default: a new temp dir; must be outside <dir>) receives full-report.txt,
+#   which has every line the capped output below leaves out, and git-safe, a wrapper for
+#   reading the target's history without running anything from it.
 set -u
 export LC_ALL=C
-DIR="${1:?usage: scan.sh <dir>}"
+HERE=$(cd "$(dirname "$0")" && pwd -P)
+LIB="$HERE/lib"
+DIR=$(cd "${1:?usage: scan.sh <dir> [work dir]}" && pwd -P) || exit 1
+W=${2:-$(mktemp -d)}; mkdir -p "$W" && W=$(cd "$W" && pwd -P) || exit 1
+case "$W/" in "$DIR"/*) echo "scan.sh: the work dir must be outside the target" >&2; exit 1;; esac
+FULL="$W/full-report.txt"
+CAP=40
 cd "$DIR" || exit 1
-CAP=40   # max lines per section; a hit count is printed when cut
 
-section() { printf '\n===== %s\n' "$1"; }
-capped() { awk -v cap="$CAP" 'NR<=cap{print} END{if(NR>cap) printf "... %d more (%d total)\n", NR-cap, NR}'; }
+PY() { python3 -I "$LIB/inspect.py" "$@"; }
+# Every file on disk except git's own metadata, sorted, as ./-prefixed paths (so no path can
+# be read as an option), NUL-separated.
+find . \( -path '*/.git' -prune \) -o -type f -print0 2>/dev/null | sort -z > "$W/files"
+FILES() { cat "$W/files"; }
+h() { printf '\001%s\n' "$1"; }
 
-IS_GIT=0; git rev-parse --git-dir >/dev/null 2>&1 && IS_GIT=1
-if [ $IS_GIT = 1 ]; then FILES() { git ls-files -z --cached --others --exclude-standard -- .; }; else FILES() { find . -type f -not -path './.git/*' -print0; }; fi
-# Text files only, NUL-separated (by encoding: grep -I calls UTF-8 binary under LC_ALL=C).
-TEXT() { FILES | while IFS= read -r -d '' f; do case "$(file -b --mime-encoding "$f")" in *binary*) ;; *) printf '%s\0' "$f";; esac; done; }
+# A git directory the target cannot configure: fresh config, no attributes, no hooks, no
+# replace refs, no grafts. Only objects (linked) and refs (copied) come from the target.
+GD=""
+if [ -e .git ]; then
+  SRC=""
+  if [ -d .git ]; then SRC="$DIR/.git"
+  elif [ -f .git ]; then
+    g=$(sed -n 's/^gitdir: //p' .git | head -1)
+    case "$g" in /*) ;; ?*) g="$DIR/$g";; esac
+    [ -n "$g" ] && [ -d "$g" ] && SRC=$(cd "$g" && pwd -P)
+  fi
+  if [ -n "$SRC" ]; then
+    COMMON="$SRC"
+    [ -f "$SRC/commondir" ] && COMMON=$(cd "$SRC" && cd "$(head -1 commondir)" 2>/dev/null && pwd -P)
+    if [ -d "$COMMON/objects" ]; then
+      GD="$W/git"; rm -rf "$GD"
+      GIT_DIR="$GD" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git init -q --bare "$GD"
+      rm -rf "$GD/objects" "$GD/refs" "$GD/hooks" "$GD/info"
+      ln -s "$COMMON/objects" "$GD/objects"
+      cp -RP "$COMMON/refs" "$GD/refs" 2>/dev/null || mkdir -p "$GD/refs"
+      [ -f "$COMMON/packed-refs" ] && cp -P "$COMMON/packed-refs" "$GD/"
+      cp -P "$SRC/HEAD" "$GD/HEAD" 2>/dev/null
+      [ -f "$COMMON/shallow" ] && cp -P "$COMMON/shallow" "$GD/"
+      cat > "$W/git-safe" <<EOF
+#!/bin/sh
+# Read the target's history with none of its config, attributes, hooks or replace refs.
+exec env GIT_DIR='$GD' GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \\
+  GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 \\
+  git -c core.quotePath=false -c diff.external= -c core.pager=cat --no-pager "\$@"
+EOF
+      chmod +x "$W/git-safe"
+    fi
+  fi
+fi
+G() { "$W/git-safe" "$@"; }
+LOGP=(log --all -m -p --no-color --no-textconv --no-ext-diff)
 
-section "INVENTORY (lines / bytes / type)"
-FILES | xargs -0 -I{} sh -c 'printf "%7s %9s  %s  [%s]\n" "$(wc -l < "$1" | tr -d " ")" "$(wc -c < "$1" | tr -d " ")" "$1" "$(file -b "$1" | cut -c1-50)"' _ {} | capped
-printf 'files: %s   total size: %s\n' "$(FILES | tr -cd '\0' | wc -c | tr -d ' ')" "$(du -sh . | cut -f1)"
+perl "$LIB/textscan.pl" "$LIB/patterns.re" "$W" < "$W/files"
+FILES | xargs -0 file -0 -N -- > "$W/types" 2>/dev/null
+FILES | xargs -0 file -0 -N --mime -- > "$W/mimes" 2>/dev/null
 
-section "BINARIES / NON-TEXT FILES"
-FILES | xargs -0 file --mime | grep -v -E 'charset=(us-ascii|utf-8)|inode/x-empty' | capped
+{
+h "SCOPE"
+echo "target: $DIR"
+echo "full report (nothing cut): $FULL"
+[ -n "$GD" ] && echo "history: read it only with $W/git-safe <git args> (never plain git inside the target)"
+[ -e .git ] && [ -z "$GD" ] && echo "WARNING: .git exists but could not be read as a repository; history was not checked"
+[ -z "$GD" ] && [ ! -e .git ] && echo "not a git checkout: no history checked"
 
-section "MINIFIED OR PACKED LINES (> 400 chars)"
-TEXT | xargs -0 grep -n -E '^.{400,}' 2>/dev/null | cut -c1-160 | capped
+h "INVENTORY (lines / bytes / type)"
+FILES | PY inventory "$W/types"
+printf 'files: %s   total size: %s\n' "$(tr -cd '\0' < "$W/files" | wc -c | tr -d ' ')" "$(du -sh . | cut -f1)"
 
-section "INVISIBLE / BIDI / TAG UNICODE (zero-width, RTL overrides, tag chars)"
-TEXT | xargs -0 perl -CSD -ne 'while(/([\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}\x{E0000}-\x{E007F}\x{00AD}])/g){printf "%s:%d U+%04X\n",$ARGV,$.,ord $1} close ARGV if eof' 2>/dev/null | capped
+h "SYMLINKS (never followed by this scan)"
+find . \( -path '*/.git' -prune \) -o -type l -print0 2>/dev/null | sort -z | PY symlinks "$DIR"
 
-section "OTHER NON-ASCII (count per file and code point; usually harmless)"
-TEXT | xargs -0 perl -CSD -ne 'while(/([^\x00-\x7f])/g){printf "%s U+%04X\n",$ARGV,ord $1}' 2>/dev/null | sort | uniq -c | sort -rn | capped
+h "NESTED GIT REPOSITORIES AND OTHER SPECIAL FILES"
+find . -mindepth 2 -name .git -print 2>/dev/null | sed 's/^/nested repo: /'
+find . \( -path '*/.git' -prune \) -o \( -type p -o -type s -o -type b -o -type c \) -print 2>/dev/null | sed 's/^/special file: /'
 
-section "INSTALL / LOAD-TIME HOOKS (what runs without you calling it)"
-FILES | tr '\0' '\n' | grep -E '(^|/)(package\.json|setup\.py|setup\.cfg|pyproject\.toml|Makefile|Cargo\.toml|build\.rs|binding\.gyp|install\.sh|postinstall[^/]*|\.npmrc|\.mcp\.json|mcp\.json|plugin\.json|marketplace\.json|hooks\.json|settings(\.local)?\.json|mod\.json|manifest\.json|Dockerfile|\.husky/.*|\.envrc)$' | capped
-for f in $(FILES | tr '\0' '\n' | grep -E '(^|/)package\.json$'); do
-  printf -- '--- %s scripts:\n' "$f"
-  python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); [print(f"  {k}: {v}") for k,v in (d.get("scripts") or {}).items()]; print("  deps:", ", ".join({**(d.get("dependencies") or {}), **(d.get("optionalDependencies") or {})}) or "none")' "$f" 2>/dev/null
-done
+h "BINARIES / NON-TEXT FILES"
+PY binaries "$W/mimes"
 
-PATTERNS='https?://|fetch\(|XMLHttpRequest|WebSocket|axios|requests\.(get|post)|urllib|http\.client|\bsocket\b|net\.connect|\bcurl\b|\bwget\b|/dev/tcp|\bnc -|child_process|execSync|spawnSync|subprocess|os\.system|os\.popen|\beval\(|new Function|Function\(|\bexec\(|atob\(|btoa\(|fromCharCode|base64|(\\x[0-9a-fA-F]{2}){8,}|\.ssh\b|id_rsa|\.aws\b|\.npmrc|\.netrc|\.kube|keychain|find-generic-password|process\.env|os\.environ|getenv|\btoken\b|secret|passw|api[_-]?key|cookies?\.sqlite|Login Data|crontab|LaunchAgents|LaunchDaemons|launchctl|systemd|\.bashrc|\.zshrc|\.profile|chmod \+x|ignore (all |any )?(previous|prior|above) instructions|do not (tell|inform|mention)|without (asking|telling)|\| *(ba)?sh\b'
+h "EXTENSION / CONTENT MISMATCH"
+cat "$W/mismatch.txt"
 
-section "SENSITIVE PATTERNS IN CURRENT FILES (network, exec, obfuscation, credentials, persistence, agent-steering text)"
-TEXT | xargs -0 grep -n -i -E "$PATTERNS" 2>/dev/null | cut -c1-200 | grep -v 'www\.w3\.org/2000/svg' | capped
+h "FILES THAT LOOK BINARY BUT WERE SCANNED AS TEXT (NUL bytes, UTF-16): read them raw"
+cat "$W/looks_binary.txt"
 
-if [ $IS_GIT = 1 ]; then
-  section "HISTORY"
-  printf 'commits: %s   first: %s   last: %s\n' "$(git rev-list --all --count)" "$(git log --reverse --format=%ad --date=short | head -1)" "$(git log -1 --format=%ad --date=short)"
-  echo "authors / committers:"; git log --all --format='  %an <%ae> | %cn <%ce>' | sort | uniq -c | sort -rn | capped
-  echo "branches / tags:"; git branch -a --format='  %(refname:short)'; git tag | sed 's/^/  tag /' | capped
-  echo "unsigned vs signed commits:"; git log --all --format='%G?' | sort | uniq -c
-  section "PATHS THAT EXISTED IN HISTORY BUT NOT AT HEAD"
-  comm -23 <(git log --all --pretty=format: --name-only | sort -u | sed '/^$/d') <(git ls-files --cached --others --exclude-standard | sort) | capped
-  section "SENSITIVE PATTERNS ADDED IN HISTORY BUT ABSENT AT HEAD"
-  # Pattern hits (normalized token) in lines ever added, minus those still at HEAD.
-  T=$(mktemp -d)
-  git log --all -p --no-color | grep -E '^\+[^+]' | grep -o -i -E "$PATTERNS" | tr 'A-Z' 'a-z' | sort -u > "$T/hist"
-  TEXT | xargs -0 grep -o -h -i -E "$PATTERNS" 2>/dev/null | tr 'A-Z' 'a-z' | sort -u > "$T/head"
-  comm -23 "$T/hist" "$T/head" | while IFS= read -r tok; do
-    c=$(git log --all -i -G"$(printf '%s' "$tok" | sed 's/[][\.*^$()+?{}|]/\\&/g')" --format='%h %ad %s' --date=short | tail -1)
-    printf '%-28s first in: %s\n' "$tok" "$c"
-  done | capped
-  echo "(inspect each with: git log --all -p -S'<token>')"
-  rm -rf "$T"
+h "MINIFIED OR PACKED LINES (> 400 chars)"
+cat "$W/minified.txt"
+
+h "INVISIBLE / BIDI / TAG / VARIATION-SELECTOR UNICODE: totals per file"
+cat "$W/invisible_counts.txt"
+
+h "INVISIBLE / BIDI / TAG / VARIATION-SELECTOR UNICODE: locations"
+cat "$W/invisible.txt"
+
+h "OTHER NON-ASCII (count per file and code point; typography and emoji are normal, look-alike letters in code are not)"
+sort -rn "$W/nonascii.txt"
+
+h "INSTALL / LOAD-TIME HOOKS (what runs without you calling it)"
+FILES | PY hooks
+
+h "AGENT-CONSUMED FILES (read every one in full)"
+FILES | PY agent-files
+
+h "AGENT LOAD-TIME COMMANDS AND GRANTS (!\`cmd\` runs when the prompt loads)"
+cat "$W/agent.txt"
+
+h "SENSITIVE PATTERNS IN CURRENT FILES (network, exec, obfuscation, credentials, persistence, agent-steering text)"
+cat "$W/patterns.txt" "$W/patterns_docs.txt"
+
+if [ -n "$GD" ]; then
+  h "HISTORY"
+  printf 'commits: %s   first: %s   last: %s\n' "$(G rev-list --all --count)" \
+    "$(G log --all --reverse --format=%ad --date=short | head -1)" "$(G log --all -1 --format=%ad --date=short)"
+  echo "authors / committers:"; G log --all --format='  %an <%ae> | %cn <%ce>' | sort | uniq -c | sort -rn
+  echo "refs:"; G for-each-ref --format='  %(refname)'
+  echo "unsigned vs signed commits:"; G log --all --format='%G?' | sort | uniq -c
+
+  G ls-tree -r -z HEAD > "$W/head.tree" 2>/dev/null
+  G ls-tree -r -z --name-only HEAD > "$W/head.list" 2>/dev/null
+  h "FILES ON DISK BUT NOT IN HEAD (untracked, ignored or built: these run too)"
+  FILES | PY notinhead "$W/head.list"
+  h "TRACKED FILES THAT DIFFER FROM HEAD ON DISK"
+  PY changed "$W/head.tree" "$(G rev-parse --show-object-format 2>/dev/null || echo sha1)"
+
+  h "PATHS THAT EXISTED IN HISTORY BUT NOT AT HEAD"
+  comm -23 <(G log --all -m --format= --name-only | sed '/^$/d' | sort -u) \
+           <(G ls-tree -r --name-only HEAD 2>/dev/null | sort -u)
+
+  h "SENSITIVE LINES ADDED IN HISTORY BUT ABSENT FROM EVERY FILE ON DISK"
+  G "${LOGP[@]}" --format='%x00%h %ad %an: %s' --date=short | perl "$LIB/history.pl" "$LIB/patterns.re" "$W/headlines.txt" > "$W/history.txt"
+  if [ -s "$W/history.txt" ]; then
+    cat "$W/history.txt"
+    echo "(inspect each with: $W/git-safe log --all -p --no-textconv -S'<text from the line>')"
+  fi
 fi
 
-section "DATA AFTER END OF IMAGE / EMBEDDED METADATA"
-FILES | tr '\0' '\n' | grep -i -E '\.(png|jpe?g|gif|webp)$' | while IFS= read -r img; do
-  python3 -I - "$img" <<'PY'
-import struct, sys
-p = sys.argv[1]; d = open(p, "rb").read(); note = []
-if d[:8] == b"\x89PNG\r\n\x1a\n":
-    i = 8; chunks = []
-    while i + 8 <= len(d):
-        n, = struct.unpack(">I", d[i:i+4]); t = d[i+4:i+8].decode("latin1"); chunks.append((t, n)); i += 12 + n
-        if t == "IEND": break
-    note.append("chunks: " + ", ".join(sorted({t for t, _ in chunks})))
-    text = [(t, n) for t, n in chunks if t in ("tEXt", "zTXt", "iTXt", "eXIf")]
-    if text: note.append("metadata chunks: " + ", ".join(f"{t}({n}B)" for t, n in text))
-    note.append(f"bytes after IEND: {len(d) - i}")
-elif d[:2] == b"\xff\xd8":
-    end = d.rfind(b"\xff\xd9"); note.append(f"bytes after last EOI: {len(d) - end - 2 if end >= 0 else '?'}")
-    if b"Exif" in d[:65536]: note.append("has EXIF (check for GPS / device / user info)")
-print(f"{p}: " + "; ".join(note))
-PY
-done
+h "DATA AFTER END OF IMAGE / ACTIVE SVG CONTENT / EMBEDDED METADATA"
+FILES | PY images
 
-section "GITLEAKS (secrets)"
+h "GITLEAKS (secrets; the target's own gitleaks config and allow comments are ignored)"
+for f in .gitleaks.toml .gitleaksignore; do
+  find . -name "$f" -not -path '*/.git/*' 2>/dev/null | sed "s/\$/: the target ships its own $f (could hide its secrets; ignored here)/"
+done
 if command -v gitleaks >/dev/null; then
-  if [ $IS_GIT = 1 ]; then gitleaks git . --no-banner --no-color --redact 2>&1 | tail -5; else gitleaks dir . --no-banner --no-color --redact 2>&1 | tail -5; fi
+  printf '[extend]\nuseDefault = true\n' > "$W/gitleaks.toml"; mkdir -p "$W/gitleaks-ignore"
+  GL=(--no-banner --no-color --redact --ignore-gitleaks-allow --exit-code 0 -c "$W/gitleaks.toml" -i "$W/gitleaks-ignore" -f json)
+  gitleaks dir . "${GL[@]}" -r "$W/gitleaks-dir.json" >/dev/null 2>&1 || echo "gitleaks dir failed"
+  if [ -n "$GD" ]; then
+    env GIT_DIR="$GD" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 \
+      gitleaks git "$GD" "${GL[@]}" -r "$W/gitleaks-git.json" >/dev/null 2>&1 || echo "gitleaks git failed"
+  fi
+  PY gitleaks "$W/gitleaks-dir.json" "$W/gitleaks-git.json" | sort -u
+  echo "(gitleaks done)"
 else echo "not installed (brew install gitleaks)"; fi
+} > "$W/raw" 2>&1
+
+# Render: section headers are the \001 lines; nothing from the target can forge one. Control
+# characters are escaped. The full report keeps every line; stdout keeps CAP per section.
+perl -e '
+  my ($full, $cap) = @ARGV; open my $F, ">", $full or die "$full: $!";
+  my ($n, $name) = (0, "");
+  sub flush { if ($name && !$n) { print "(none)\n"; print $F "(none)\n" } printf "... %d more lines in this section (%d total): read them in %s\n", $n - $cap, $n, $full if $n > $cap }
+  while (my $l = <STDIN>) {
+    if ($l =~ /^\x01(.*)/) { flush(); ($n, $name) = (0, $1); print $F "\n===== $1\n"; print "\n===== $1\n"; next }
+    $l =~ s/([\x00-\x08\x0b-\x1f\x7f])/sprintf("\\x{%X}", ord $1)/ge;
+    $l = "  $l" if $l =~ /^=====/;
+    print $F $l; $n++; print $l if $n <= $cap;
+  }
+  flush();
+' "$FULL" "$CAP" < "$W/raw"
