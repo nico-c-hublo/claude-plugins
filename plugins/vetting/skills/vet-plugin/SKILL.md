@@ -47,6 +47,7 @@ Read in full every file that **executes** or that an **agent consumes**:
 - hooks and MCP server definitions
 - SKILL.md, commands, prompts, CLAUDE.md/AGENTS.md and tool descriptions
 - every file in "look binary but were scanned as text" and "extension / content mismatch": read them raw (`cat -v`, `xxd`), since a NUL byte or UTF-16 encoding is a way to hide code from tools
+- every file inside a `.git` directory that git didn't put there (anything but its config, HEAD, refs, logs, index and `*.sample` hooks): code can load it, and most tools skip it. In a downloaded archive, the shipped `.git/config` itself is a finding if it sets commands (`fsmonitor`, `textconv`, `pager`, `sshCommand`)
 
 Follow every lead from step 2 to its source line. A history-only line gets `<work dir>/git-safe log --all -p --no-textconv -S'<text>'`.
 

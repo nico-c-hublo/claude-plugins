@@ -29,7 +29,11 @@ while (my $l = <STDIN>) {
     next;
   }
   next unless $l =~ /^\+(.*)/;
-  my $s = decode('UTF-8', $1, FB_DEFAULT); $s =~ s/\r$//;
+  my $bytes = $1;
+  # A line with NUL bytes is UTF-16 or padded to look binary: drop the NULs so its ASCII
+  # shows (git log --text prints such files instead of "Binary files differ").
+  $bytes =~ s/\x00//g; $bytes =~ s/^\xff\xfe|^\xfe\xff//;
+  my $s = decode('UTF-8', $bytes, FB_DEFAULT); $s =~ s/\r$//;
   next unless $s =~ $PAT;
   (my $norm = $s) =~ s/^\s+|\s+$//g; $norm =~ s/\s+/ /g;
   next if $head{$norm};

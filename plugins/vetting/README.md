@@ -82,6 +82,10 @@ The test builds booby-trapped repos and checks that `scan.sh` reports each trap 
 - lines hidden behind an SVG-namespace comment or a flood of harmless hits; variation selectors, fillers and ANSI escapes; NUL bytes, UTF-16 and fake images
 - `` !`cmd` `` in a skill, external marketplace sources, `.pth` files, VS Code tasks, submodules, symlinks out of the target
 - ignored build output, and a plain directory inside another repo
-- data after a JPEG, GIF and WebP end, and an SVG with a script
+- polyglots: a `.ttf` or `.gif` that starts with its format's signature but is really JavaScript
+- NUL-byte and UTF-16 files deleted from history, and code planted inside a `.git` directory
+- a FIFO or a symlinked directory standing where HEAD has a file (the scan must finish without reading it)
+- data after a PNG (including data declared inside its end chunk), JPEG, GIF and WebP end, and an SVG with a script
+- a work dir reused for a second target
 
 It also checks that a clean repo full of typographic characters and emoji triggers nothing.

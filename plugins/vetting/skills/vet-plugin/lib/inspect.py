@@ -5,14 +5,20 @@ Usage: python3 -I inspect.py <command> [args]   (file lists arrive NUL-separated
   binaries  <file -0 -N --mime output>
   hooks | agent-files | images | symlinks <target dir>
   changed   <git ls-tree -r -z HEAD output> <sha1|sha256>
-  notinhead <HEAD path list, NUL-separated>
+  notinhead <ls-tree output>
+  historypaths <ls-tree output> <git log --name-only -z output>
   gitleaks  <report.json>...
 """
-import json, os, re, struct, sys, unicodedata
+import json, os, re, stat, struct, sys, unicodedata
 
 HIDE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e"
                   r"\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\u2800\u3164\ufe00-\ufe0f\ufeff\uffa0"
                   r"\U000e0000-\U000e007f\U000e0100-\U000e01ef]")
+
+
+def cut(s, n):
+    s = s if isinstance(s, str) else json.dumps(s)
+    return esc(s[:n]) + (f" …[cut: {len(s)} chars in all, read the file]" if len(s) > n else "")
 
 
 def esc(s):
@@ -49,10 +55,22 @@ def inventory(types):
         print(f"{lines:7} {len(d):9}  {show(p)}  [{esc(t.get(p, '?'))[:50]}]")
 
 
+TEXTUAL = re.compile(r"^(text/|inode/x-empty|application/(json|x-ndjson|javascript|x-javascript|ecmascript|xml|x-sh|"
+                     r"x-shellscript|toml|x-yaml|yaml|x-perl|x-php|x-ruby|x-python|x-awk|x-tex|x-wine-extension-ini|"
+                     r"x-subrip|x-empty)\b|image/svg\+xml)")
+
+
 def binaries(mimes):
+    """Non-text files, and files whose content is ASCII but whose type is not a text type
+    (an ASCII-only GIF is a polyglot)."""
     for p, m in sorted(file_records(mimes).items()):
-        if not re.search(r"charset=(us-ascii|utf-8)|inode/x-empty", m):
-            print(f"{show(p)}: {esc(m)}")
+        textual = TEXTUAL.search(m)
+        if textual and re.search(r"charset=(us-ascii|utf-8)", m) or m.startswith("inode/x-empty"):
+            continue
+        if re.search(rb"(^|/)\.git/", p):
+            continue   # git's index and packs; pattern hits inside .git have their own section
+        note = "" if textual or "charset=binary" in m else "  (text bytes in a non-text type: read it)"
+        print(f"{show(p)}: {esc(m)}{note}")
 
 
 HOOK = re.compile(
@@ -99,7 +117,7 @@ def hooks():
         if name.endswith(".pth"):
             print(f"--- {show(p)}: Python runs every line starting with 'import' at interpreter start-up")
             for line in text.splitlines():
-                print("  " + esc(line[:200]))
+                print("  " + cut(line, 200))
         elif name == ".gitmodules":
             print(f"--- {show(p)}: submodules (each is separate code to vet)")
             for line in text.splitlines():
@@ -128,8 +146,7 @@ def hooks():
             if items:
                 print(f"--- {show(p)}:")
                 for k, v in items:
-                    v = v if isinstance(v, str) else json.dumps(v)
-                    print(f"  {esc(k)}: {esc(v[:300])}")
+                    print(f"  {esc(k)}: {cut(v, 300)}")
 
 
 AGENT = re.compile(r"(^|/)(SKILL\.md|CLAUDE\.md|AGENTS\.md|GEMINI\.md|\.cursorrules|\.windsurfrules|copilot-instructions\.md|"
@@ -143,19 +160,23 @@ def agent_files():
 
 
 def png(d):
-    i, chunks = 8, []
+    i, chunks, note = 8, [], []
     while i + 8 <= len(d):
-        n, = struct.unpack(">I", d[i:i + 4]); t = d[i + 4:i + 8].decode("latin1"); chunks.append((t, n)); i += 12 + n
+        n, = struct.unpack(">I", d[i:i + 4]); t = d[i + 4:i + 8].decode("latin1"); chunks.append((t, n))
         if t == "IEND":
+            if n:
+                note.append(f"IEND DECLARES {n} BYTES OF DATA (must be 0: data hidden inside the end chunk)")
+            i += 12   # IEND is empty: whatever follows its type and CRC is appended data
             break
+        i += 12 + n
     else:
-        return ["no IEND chunk (truncated or malformed)"]
+        return ["no IEND chunk (truncated, malformed, or a chunk length runs past the end)"]
     std = {"IHDR", "PLTE", "IDAT", "IEND", "tRNS", "cHRM", "gAMA", "iCCP", "sBIT", "sRGB", "pHYs", "sPLT", "tIME", "bKGD", "hIST", "acTL", "fcTL", "fdAT", "cICP"}
-    note = ["chunks: " + ", ".join(sorted({t for t, _ in chunks}))]
+    note.insert(0, "chunks: " + ", ".join(sorted({esc(t) for t, _ in chunks})))
     odd = [(t, n) for t, n in chunks if t in ("tEXt", "zTXt", "iTXt", "eXIf") or t not in std]
     if odd:
         note.append("metadata or non-standard chunks: " + ", ".join(f"{esc(t)}({n}B)" for t, n in odd))
-    return note + [f"bytes after IEND: {len(d) - i}"]
+    return note + [f"bytes after IEND: {max(len(d) - i, 0)}"]
 
 
 def jpeg(d):
@@ -266,35 +287,80 @@ def symlinks(root):
         print(f"{show(p)} -> {esc(target)}  [{where}]")
 
 
-def changed(lstree, algo):
-    """Tracked files whose bytes on disk differ from HEAD: the disk copy is what runs."""
-    import hashlib
+def tree(lstree):
+    """Parse `git ls-tree -r -z HEAD`: (mode, type, oid, path) records."""
     for rec in open(lstree, "rb").read().split(b"\0"):
-        if b"\t" not in rec:
+        if b"\t" in rec:
+            meta, path = rec.split(b"\t", 1)
+            yield (*meta.split(), path)
+
+
+def kind(st):
+    for test, name in ((stat.S_ISREG, "a file"), (stat.S_ISDIR, "a directory"), (stat.S_ISLNK, "a symlink"),
+                       (stat.S_ISFIFO, "a FIFO"), (stat.S_ISSOCK, "a socket"), (stat.S_ISCHR, "a device"), (stat.S_ISBLK, "a device")):
+        if test(st.st_mode):
+            return name
+    return "a special file"
+
+
+def changed(lstree, algo):
+    """Tracked files whose bytes on disk differ from HEAD: the disk copy is what runs.
+    Never follows a symlink and never opens anything but a regular file."""
+    import hashlib
+    for mode, typ, oid, path in tree(lstree):
+        if typ != b"blob":
             continue
-        meta, path = rec.split(b"\t", 1)
-        mode, kind, oid = meta.split()
-        if kind != b"blob":
-            continue
+        parts, at, bad = path.split(b"/"), b".", None
+        for d in parts[:-1]:
+            at += b"/" + d
+            try:
+                st = os.lstat(at)
+            except OSError:
+                bad = "missing on disk"; break
+            if not stat.S_ISDIR(st.st_mode):
+                bad = f"its parent {show(at)} is {kind(st)} on disk"; break
+        if bad:
+            print(f"{show(path)}: in HEAD, {bad}"); continue
         disk = b"./" + path
         try:
-            data = os.readlink(disk).encode("utf-8", "surrogateescape") if mode == b"120000" else (
-                None if os.path.islink(disk) else open(disk, "rb").read())
+            st = os.lstat(disk)
         except OSError:
             print(f"{show(path)}: in HEAD, missing on disk"); continue
-        if data is None:
-            print(f"{show(path)}: a file in HEAD, a symlink on disk"); continue
+        want = "a symlink" if mode == b"120000" else "a file"
+        if kind(st) != want:
+            print(f"{show(path)}: {want} in HEAD, {kind(st)} on disk"); continue
+        if want == "a symlink":
+            data = os.readlink(disk)
+        else:
+            fd = os.open(disk, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as f:
+                data = f.read()
         h = hashlib.new(algo, b"blob %d\0" % len(data) + data).hexdigest()
         if h != oid.decode():
             print(f"{show(path)}: differs from HEAD")
 
 
-def notinhead(headlist):
-    head = {p for p in open(headlist, "rb").read().split(b"\0") if p}
+def notinhead(lstree):
+    head = {path for *_, path in tree(lstree)}
+    ingit = 0
     for p in paths():
         rel = p[2:] if p.startswith(b"./") else p
-        if rel not in head:
+        if rel in head:
+            continue
+        if re.search(rb"(^|/)\.git/", rel):
+            ingit += 1
+        else:
             print(show(rel))
+    if ingit:
+        print(f"(+ {ingit} files inside .git directories, not listed here; they are scanned like any other)")
+
+
+def historypaths(lstree, log):
+    """Paths some commit touched that HEAD doesn't have (from `git log --name-only -z`)."""
+    head = {path for *_, path in tree(lstree)}
+    seen = {p.strip(b"\n") for p in open(log, "rb").read().split(b"\0")}
+    for p in sorted(seen - head - {b""}):
+        print(show(p))
 
 
 def gitleaks(*reports):
@@ -312,4 +378,4 @@ def gitleaks(*reports):
 if __name__ == "__main__":
     cmd, args = sys.argv[1], sys.argv[2:]
     {"inventory": inventory, "binaries": binaries, "hooks": hooks, "agent-files": agent_files, "images": images,
-     "symlinks": symlinks, "changed": changed, "notinhead": notinhead, "gitleaks": gitleaks}[cmd](*args)
+     "symlinks": symlinks, "changed": changed, "historypaths": historypaths, "notinhead": notinhead, "gitleaks": gitleaks}[cmd](*args)

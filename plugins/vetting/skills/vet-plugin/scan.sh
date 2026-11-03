@@ -18,11 +18,15 @@ case "$W/" in "$DIR"/*) echo "scan.sh: the work dir must be outside the target" 
 FULL="$W/full-report.txt"
 CAP=40
 cd "$DIR" || exit 1
+# A reused work dir must not carry results over from an earlier target.
+rm -rf "$W/git" "$W/git-safe" "$W"/gitleaks-*.json "$W/head.tree" "$W/history.txt" "$W/history.paths" "$W/raw" "$FULL"
 
 PY() { python3 -I "$LIB/inspect.py" "$@"; }
-# Every file on disk except git's own metadata, sorted, as ./-prefixed paths (so no path can
-# be read as an option), NUL-separated.
-find . \( -path '*/.git' -prune \) -o -type f -print0 2>/dev/null | sort -z > "$W/files"
+# Every regular file on disk, sorted, as ./-prefixed paths (so no path can be read as an
+# option), NUL-separated. Files inside .git directories are included, since code can load
+# a file planted there; only their compressed object store is left out (history covers it).
+NOOBJ=(\( -path '*/.git/objects' -o -path '*/.git/modules/*/objects' \) -prune -o)
+find . "${NOOBJ[@]}" -type f -print0 2>/dev/null | sort -z > "$W/files"
 FILES() { cat "$W/files"; }
 h() { printf '\001%s\n' "$1"; }
 
@@ -61,7 +65,7 @@ EOF
   fi
 fi
 G() { "$W/git-safe" "$@"; }
-LOGP=(log --all -m -p --no-color --no-textconv --no-ext-diff)
+LOGP=(log --all -m -p --text --no-color --no-textconv --no-ext-diff)
 
 perl "$LIB/textscan.pl" "$LIB/patterns.re" "$W" < "$W/files"
 FILES | xargs -0 file -0 -N -- > "$W/types" 2>/dev/null
@@ -80,11 +84,11 @@ FILES | PY inventory "$W/types"
 printf 'files: %s   total size: %s\n' "$(tr -cd '\0' < "$W/files" | wc -c | tr -d ' ')" "$(du -sh . | cut -f1)"
 
 h "SYMLINKS (never followed by this scan)"
-find . \( -path '*/.git' -prune \) -o -type l -print0 2>/dev/null | sort -z | PY symlinks "$DIR"
+find . "${NOOBJ[@]}" -type l -print0 2>/dev/null | sort -z | PY symlinks "$DIR"
 
 h "NESTED GIT REPOSITORIES AND OTHER SPECIAL FILES"
-find . -mindepth 2 -name .git -print 2>/dev/null | sed 's/^/nested repo: /'
-find . \( -path '*/.git' -prune \) -o \( -type p -o -type s -o -type b -o -type c \) -print 2>/dev/null | sed 's/^/special file: /'
+find . -mindepth 2 -name .git -print 2>/dev/null | sed 's/^/nested repo (its files are scanned like any other): /'
+find . "${NOOBJ[@]}" \( -type p -o -type s -o -type b -o -type c \) -print 2>/dev/null | sed 's/^/special file (never read): /'
 
 h "BINARIES / NON-TEXT FILES"
 PY binaries "$W/mimes"
@@ -119,6 +123,12 @@ cat "$W/agent.txt"
 h "SENSITIVE PATTERNS IN CURRENT FILES (network, exec, obfuscation, credentials, persistence, agent-steering text)"
 cat "$W/patterns.txt" "$W/patterns_docs.txt"
 
+h "SENSITIVE PATTERNS IN BINARY FILES (raw bytes; XMP metadata URLs such as ns.adobe.com are normal)"
+cat "$W/patterns_binary.txt"
+
+h "SENSITIVE PATTERNS INSIDE .git DIRECTORIES (git's sample hooks match; anything else was put there)"
+cat "$W/patterns_git.txt"
+
 if [ -n "$GD" ]; then
   h "HISTORY"
   printf 'commits: %s   first: %s   last: %s\n' "$(G rev-list --all --count)" \
@@ -128,15 +138,14 @@ if [ -n "$GD" ]; then
   echo "unsigned vs signed commits:"; G log --all --format='%G?' | sort | uniq -c
 
   G ls-tree -r -z HEAD > "$W/head.tree" 2>/dev/null
-  G ls-tree -r -z --name-only HEAD > "$W/head.list" 2>/dev/null
   h "FILES ON DISK BUT NOT IN HEAD (untracked, ignored or built: these run too)"
-  FILES | PY notinhead "$W/head.list"
+  FILES | PY notinhead "$W/head.tree"
   h "TRACKED FILES THAT DIFFER FROM HEAD ON DISK"
   PY changed "$W/head.tree" "$(G rev-parse --show-object-format 2>/dev/null || echo sha1)"
 
   h "PATHS THAT EXISTED IN HISTORY BUT NOT AT HEAD"
-  comm -23 <(G log --all -m --format= --name-only | sed '/^$/d' | sort -u) \
-           <(G ls-tree -r --name-only HEAD 2>/dev/null | sort -u)
+  G log --all -m --format= --name-only -z > "$W/history.paths"
+  PY historypaths "$W/head.tree" "$W/history.paths"
 
   h "SENSITIVE LINES ADDED IN HISTORY BUT ABSENT FROM EVERY FILE ON DISK"
   G "${LOGP[@]}" --format='%x00%h %ad %an: %s' --date=short | perl "$LIB/history.pl" "$LIB/patterns.re" "$W/headlines.txt" > "$W/history.txt"

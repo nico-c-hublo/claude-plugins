@@ -11,13 +11,14 @@ open my $pf, '<', $patfile or die "$patfile: $!"; chomp(my $p = <$pf>); close $p
 my $PAT = qr/$p/i;
 
 my %fh;
-for my $n (qw(minified invisible invisible_counts nonascii patterns patterns_docs headlines looks_binary mismatch agent)) {
+for my $n (qw(minified invisible invisible_counts nonascii patterns patterns_docs patterns_git patterns_binary headlines looks_binary mismatch agent)) {
   open $fh{$n}, '>:encoding(UTF-8)', "$out/$n.txt" or die "$out/$n.txt: $!";
 }
 
-# Formats whose content is not text. A file with one of these extensions is skipped only
-# when its content looks the part (right magic, or NUL bytes when no magic is known);
-# otherwise it is a disguised file and is scanned as text.
+# Formats whose content is not text. A file with one of these extensions gets only the
+# pattern scan (into its own section) when its content is binary and looks the part.
+# Content that is text is scanned as text whatever its extension or its first bytes say:
+# several magics (GIF89a, true, wOFF, OTTO) are plain ASCII a script can start with.
 my %MAGIC = (
   png => qr/^\x89PNG\r\n\x1a\n/, jpg => qr/^\xff\xd8\xff/, jpeg => qr/^\xff\xd8\xff/,
   gif => qr/^GIF8[79]a/, webp => qr/^RIFF....WEBP/s, ico => qr/^\x00\x00[\x01\x02]\x00/,
@@ -43,6 +44,19 @@ sub window {
 }
 my $VS = qr/[\x{FE00}-\x{FE0F}\x{E0100}-\x{E01EF}]/;
 
+# Binary content that looks the part: the pattern scan only, on the raw bytes.
+sub binscan {
+  my ($raw, $shown, $to) = @_;
+  my $ln = 0;
+  for my $line (split /\n/, $raw, -1) {
+    $ln++;
+    next unless $line =~ $PAT;
+    my $l = decode('ISO-8859-1', $line);
+    $l =~ $PAT;
+    printf {$fh{$to}} "%s:%d: %s\n", $shown, $ln, window($l, $-[0], $+[0] - $-[0]);
+  }
+}
+
 local $/ = "\0";
 while (my $path = <STDIN>) {
   chomp $path;
@@ -53,14 +67,20 @@ while (my $path = <STDIN>) {
   my $shown = show_path($path);
   my ($ext) = $path =~ /\.([^.\/]+)$/; $ext = lc($ext // '');
   my $head = substr($raw, 0, 8192);
+  # Files inside a .git directory (git's own, or planted there to be loaded from it).
+  my $ingit = $path =~ m{(?:^|/)\.git/};
 
-  if ($MAGIC{$ext}) {
-    if ($raw =~ $MAGIC{$ext}) { next }
-    print {$fh{mismatch}} "$shown: .$ext extension but content is not $ext; scanned as text\n" if length $raw;
-  } elsif ($OPAQUE{$ext}) {
-    next if $head =~ /\x00/;
-    print {$fh{mismatch}} "$shown: .$ext extension but content has no NUL byte; scanned as text\n" if length $raw;
+  my $textlike = $head !~ /\x00/ && ($head =~ tr/\x00-\x08\x0b\x0e-\x1f\x7f//) <= 0.02 * length($head);
+  if ($MAGIC{$ext} || $OPAQUE{$ext}) {
+    if (!length $raw) { next }
+    elsif ($textlike) {
+      print {$fh{mismatch}} "$shown: .$ext extension but the content is text"
+        . ($MAGIC{$ext} && $raw =~ $MAGIC{$ext} ? " (it starts with the $ext signature: a polyglot)" : '') . "; scanned as text\n";
+    } elsif ($MAGIC{$ext} && $raw !~ $MAGIC{$ext}) {
+      print {$fh{mismatch}} "$shown: .$ext extension but content is not $ext; scanned as text\n";
+    } else { binscan($raw, $shown, 'patterns_binary'); next }
   }
+  if ($ingit && !$textlike) { binscan($raw, $shown, 'patterns_git'); next }
 
   # Encoding: UTF-16 by BOM or by NUL-byte layout, else lenient UTF-8.
   my $enc = 'UTF-8';
@@ -112,8 +132,15 @@ while (my $path = <STDIN>) {
       if ($o == 0x200C || $o == 0x200D) {
         next if $prev =~ /[^\x00-\x7f]/ && $next =~ /[^\x00-\x7f]/;
       }
+      # Variation selectors are legitimate one at a time after emoji and symbols (FE00-FE0F)
+      # or after CJK ideographs (both ranges), never after other letters: one selector per
+      # letter is how a payload hides one byte per carrier character.
       if ($o >= 0xFE00 && $o <= 0xFE0F) {
-        next if $prev !~ $VS && $next !~ $VS && ($prev =~ /[^\x00-\x7f]/ || $prev =~ /[0-9#*]/);
+        next if $prev !~ $VS && $next !~ $VS
+          && (($prev =~ /[^\x00-\x7f]/ && $prev !~ /\p{L}/) || $prev =~ /\p{Han}/ || $prev =~ /[0-9#*]/);
+      }
+      if ($o >= 0xE0100 && $o <= 0xE01EF) {
+        next if $prev !~ $VS && $next !~ $VS && $prev =~ /\p{Han}/;
       }
       $c{$o}++;
     }
@@ -124,9 +151,9 @@ while (my $path = <STDIN>) {
     while ($line =~ /([^\x00-\x7f])/g) { my $o = ord $1; $other{$o}++ unless $c{$o} }
 
     if ($line =~ $PAT) {
-      printf {$fh{$doc ? 'patterns_docs' : 'patterns'}} "%s:%d: %s\n", $shown, $ln, window($line, $-[0], $+[0] - $-[0]);
+      printf {$fh{$ingit ? 'patterns_git' : $doc ? 'patterns_docs' : 'patterns'}} "%s:%d: %s\n", $shown, $ln, window($line, $-[0], $+[0] - $-[0]);
       (my $norm = $line) =~ s/^\s+|\s+$//g; $norm =~ s/\s+/ /g;
-      print {$fh{headlines}} "$norm\n";
+      print {$fh{headlines}} "$norm\n" unless $ingit;   # a copy planted in .git must not mask history
     }
 
     # Commands an agent host runs when it loads a prompt file, and the tools it grants.
