@@ -1,0 +1,9 @@
+{
+  "name": "vetting",
+  "version": "0.1.0",
+  "author": {
+    "name": "nico-c-hublo"
+  },
+  "description": "Vets a plugin, extension, mod, agent skill, MCP server or package for malware, backdoors and data leakage before you install it, without running any of it.",
+  "license": "MIT"
+}

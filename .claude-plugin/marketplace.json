@@ -12,6 +12,11 @@
       "name": "pignon",
       "source": "./plugins/pignon",
       "description": "Routes each prompt to the right Claude model and effort level (Haiku, Sonnet or Opus), with a cache-aware switching policy."
+    },
+    {
+      "name": "vetting",
+      "source": "./plugins/vetting",
+      "description": "Vets a plugin, extension, mod, agent skill, MCP server or package for malware, backdoors and data leakage before you install it, without running any of it."
     }
   ]
 }
