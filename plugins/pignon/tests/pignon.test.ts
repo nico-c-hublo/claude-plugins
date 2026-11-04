@@ -70,6 +70,26 @@ describe('policy', () => {
     expect(decide({ ...base, sessionEffort: 'medium', decision: hard(0.9) }).reason).toBe('already on target')
   })
 
+  test("lowering Opus's effort is held by the downgrade's cache guard, at 60k, not the upgrade's", async () => {
+    const hard = { tier: 'hard', explore: true, confidence: 0.95 }
+
+    expect(decide({ ...base, contextTokens: 50_000, decision: hard }).target).toBe('hard')
+    const warm = decide({ ...base, contextTokens: 70_000, decision: hard })
+    expect(warm.target).toBe(null)
+    expect(warm.reason).toContain('cache protected')
+    const cold = decide({ ...base, contextTokens: 70_000, decision: hard, isCacheCold: true })
+    expect(cold.target).toBe('hard')
+    expect(cold.reason).toContain('cache cold')
+  })
+
+  test("lowering Opus's effort skips the cooldown: leaving the session's own settings is not a switch back", async () => {
+    const hard = { tier: 'hard', explore: true, confidence: 0.95 }
+
+    expect(decide({ ...base, promptsSinceSwitch: 0, decision: hard }).target).toBe('hard')
+    // Once routed to hard, the tier already runs Opus at medium.
+    expect(decide({ ...base, current: 'hard', promptsSinceSwitch: 0, decision: hard }).reason).toBe('already on target')
+  })
+
   test('an upgrade is guarded past 100k tokens, not before', async () => {
     const hard = { tier: 'hard', explore: true, confidence: 0.95 }
     const sonnet = { ...base, current: 'standard', decision: hard }
