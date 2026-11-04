@@ -16,6 +16,12 @@ export type TurnOutcome = {
   steps: number
   reason: 'answer' | 'aborted' | 'refusal' | 'error'
   durationMs: number
+  /**
+   * The effort the turn's requests were sent with, after any tier rewrote them:
+   * null when they named none (the model's default). Absent on records written
+   * before it was kept.
+   */
+  effort?: Effort | null
   /** The API's counts summed over the turn, and the model that answered; absent when nothing counted. */
   usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; model: string }
   /** `usage` priced at list price when the turn ended, on the model that answered, on the session's and on the tier's; absent when one has no price. */

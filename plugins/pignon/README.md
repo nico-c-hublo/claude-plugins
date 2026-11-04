@@ -11,7 +11,7 @@ A Claude Code mod that shifts to the right model for each prompt, the way a bike
 | --- | --- | --- |
 | trivial | haiku / low | mechanical edits, renames, single lookups (moves up to standard when it must explore) |
 | standard | sonnet / medium | localized changes, routine features and tests, explaining code |
-| hard | opus / high | multi-step investigations, unclear bugs, cross-cutting design |
+| hard | opus / medium | multi-step investigations, unclear bugs, cross-cutting design |
 
 The table and thresholds live in [`hooks/policy.ts`](hooks/policy.ts).
 
@@ -197,7 +197,7 @@ Each decision then adds one JSON line to a file for the session in `$CLAUDE_CONF
 - Opus's opinion and what it cost, when the [oracle](#the-oracle-opus-as-the-reference) is on;
 - how long each took, the fallback cause when the local model was chosen but Haiku decided;
 - what was done (kept, would switch, switched), the tier before and after, the policy's reason, the session's model and the context size;
-- once the turn has ended, how many requests it made, why it ended, how long it took, the API's token counts and the model that answered, and the cost below;
+- once the turn has ended, how many requests it made, why it ended, how long it took, the effort its requests were sent with (`null` when they named none), the API's token counts and the model that answered, and the cost below;
 - whether the next prompt was a correction, and your mark (what you said, the tier it was taken against, the tiers it accepts), when there is one.
 
 `/pignon stats` sums the newest 200 session files (`/pignon stats 7` keeps the last 7 days). The numbers below only show the format:
