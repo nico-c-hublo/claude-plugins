@@ -2542,8 +2542,9 @@ describe("a turn's end", () => {
     expect(await logText($)).not.toContain('steps')
   })
 
-  test('goes on the record too, when the log is kept', { options: { record: 'on' } }, async ($, on) => {
-    engine(on, TRIVIAL, [], 'live')
+  // A session on Opus that keeps its log: every write, and the records last written.
+  function recording(on: On, mode: 'live' | 'shadow') {
+    engine(on, TRIVIAL, [], mode)
     const writes: { path: string; text: string }[] = []
     mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
     on('process.run', () => ({ value: OK }))
@@ -2553,7 +2554,12 @@ describe("a turn's end", () => {
 
       return { value: undefined }
     })
-    const last = () => parseRecords(writes.at(-1)?.text ?? '')
+
+    return { writes, last: () => parseRecords(writes.at(-1)?.text ?? '') }
+  }
+
+  test('goes on the record too, when the log is kept', { options: { record: 'on' } }, async ($, on) => {
+    const { writes, last } = recording(on, 'live')
     await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
 
     await prompt($, 't1', SECRET)
@@ -2566,35 +2572,19 @@ describe("a turn's end", () => {
     expect(writes.every(w => !w.text.includes('SECRETWORD'))).toBe(true)
   })
 
-  // A shadow session on Opus that keeps its log; returns the records last written.
-  function recordingShadow(on: On) {
-    engine(on, TRIVIAL, [], 'shadow')
-    const writes: { path: string; text: string }[] = []
-    mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
-    on('process.run', () => ({ value: OK }))
-    on('session.cwd', () => ({ value: '/work/api' }))
-    on('fs.write', (_, e) => {
-      writes.push(e)
-
-      return { value: undefined }
-    })
-
-    return () => parseRecords(writes.at(-1)?.text ?? '')
-  }
-
   test("keeps the effort the turn ran at: the session's own in shadow mode", { options: { record: 'on' } }, async ($, on) => {
-    const records = recordingShadow(on)
+    const { last } = recording(on, 'shadow')
     await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
 
     await prompt($, 't1', 'rename foo')
     await complete($, 't1')
     await settle()
 
-    expect(records().map(r => r.turn?.effort)).toEqual(['high'])
+    expect(last().map(r => r.turn?.effort)).toEqual(['high'])
   })
 
   test('keeps null for the effort when the requests named none', { options: { record: 'on' } }, async ($, on) => {
-    const records = recordingShadow(on)
+    const { last } = recording(on, 'shadow')
     await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
 
     await $.turn.start({ turnId: 't1', text: 'rename foo' })
@@ -2602,7 +2592,7 @@ describe("a turn's end", () => {
     await complete($, 't1')
     await settle()
 
-    expect(records().map(r => r.turn?.effort)).toEqual([null])
+    expect(last().map(r => r.turn?.effort)).toEqual([null])
   })
 
   test('the pane draws it, in warning colour when the tier fell short', LOCAL, async ($, on) => {

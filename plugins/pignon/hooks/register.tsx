@@ -1372,8 +1372,8 @@ export const register: Register = (on, options) => {
       const tier = mode === 'live' ? tierOf(await read($, current)) : undefined
       if (tier) request = { ...e, model: tier.model, effort: tier.effort }
       // What the turn ran at, kept because a tier's effort can change between releases.
-      const running = isNewPrompt ? turns.get(e.turnId) : undefined
-      if (running) running.effort = (request.effort as Effort | undefined) ?? null
+      const started = isNewPrompt ? turns.get(e.turnId) : undefined
+      if (started) started.effort = (request.effort as Effort | undefined) ?? null
     }
 
     const result = yield* next(request)
