@@ -34,8 +34,9 @@ export const TIERS: readonly Tier[] = [
   {
     id: 'hard',
     model: 'opus',
-    // Opus 5.5's own default: there it matches Opus 5 at high on agentic
-    // coding, with fewer tokens, and high thinks more per turn than it did.
+    // Opus 5.5's own default. Opus 5.5 at medium matches Opus 5 at high on
+    // agentic coding with fewer tokens, and Opus 5.5 at high thinks more per
+    // turn than Opus 5 at high did.
     effort: 'medium',
     canExplore: true,
     criteria:
