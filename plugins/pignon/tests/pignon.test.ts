@@ -2687,6 +2687,16 @@ describe('the decision log: turns by effort', () => {
     expect(text).not.toContain('  low ')
   })
 
+  test("counts the hard verdict of the judge that decided, not Haiku's or the oracle's", async () => {
+    const trivial = { tier: 'trivial', explore: false, confidence: 0.9 }
+    const records = [
+      recordOf(entry({ id: 1, turn: ended({ effort: 'low' }), second: { decision: hard, ms: 700 }, oracle: { decision: hard, ms: 900 } }), CONTEXT),
+      recordOf(entry({ id: 2, decision: hard, turn: ended({ effort: 'low' }), oracle: { decision: trivial, ms: 900 } }), CONTEXT),
+    ]
+
+    expect(summarize(records, 1)).toContain('  low      2 turns · corrected 0% of 2 · too high 100% of 1 hard · $0.200 spent')
+  })
+
   test('says nothing when no turn has ended, and leaves out the notes it does not need', async () => {
     expect(summarize([recordOf(entry(), CONTEXT)], 1)).not.toContain('by the effort')
 
