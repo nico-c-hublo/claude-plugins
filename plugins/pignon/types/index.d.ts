@@ -17,8 +17,8 @@ export type TurnOutcome = {
   reason: 'answer' | 'aborted' | 'refusal' | 'error'
   durationMs: number
   /**
-   * The effort the turn's requests were sent with, after any tier rewrote them:
-   * null when they named none (the model's default). Absent on records written
+   * The effort the turn's first request was sent with, after any tier rewrote it:
+   * null when it named none (the model's default). Absent on records written
    * before it was kept.
    */
   effort?: Effort | null

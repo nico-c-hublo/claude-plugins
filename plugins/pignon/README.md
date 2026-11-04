@@ -1,6 +1,6 @@
 # pignon
 
-A Claude Code mod that shifts to the right model for each prompt, the way a bike changes sprocket (*pignon*), so you don't spend all day on Opus at high effort. The routing policy descends from [pi-pignon](https://github.com/nico-c-hublo/pi-pignon).
+A Claude Code mod that shifts to the right model for each prompt, the way a bike changes sprocket (*pignon*), so you don't spend all day on Opus. The routing policy descends from [pi-pignon](https://github.com/nico-c-hublo/pi-pignon).
 
 - **A small decider judges each prompt.** On the first model request of a turn, Haiku (low effort) answers how hard the task is, whether it needs exploring the codebase, and how sure it is. Bare acknowledgements ("yes", "go ahead", "vas-y") keep the current tier without asking anyone. Or the judge is [a model on your Mac](#a-local-decider): then the prompt goes to Claude only.
 - **Your session runs on the tier's model and effort.** Every main-loop request of the turn is sent with that tier's model and effort, tool steps included. Subagents keep their own settings.
@@ -197,7 +197,7 @@ Each decision then adds one JSON line to a file for the session in `$CLAUDE_CONF
 - Opus's opinion and what it cost, when the [oracle](#the-oracle-opus-as-the-reference) is on;
 - how long each took, the fallback cause when the local model was chosen but Haiku decided;
 - what was done (kept, would switch, switched), the tier before and after, the policy's reason, the session's model and the context size;
-- once the turn has ended, how many requests it made, why it ended, how long it took, the effort its requests were sent with (`null` when they named none), the API's token counts and the model that answered, and the cost below;
+- once the turn has ended, how many requests it made, why it ended, how long it took, the effort its first request was sent with (`null` when it named none), the API's token counts and the model that answered, and the cost below;
 - whether the next prompt was a correction, and your mark (what you said, the tier it was taken against, the tiers it accepts), when there is one.
 
 `/pignon stats` sums the newest 200 session files (`/pignon stats 7` keeps the last 7 days). The numbers below only show the format:
