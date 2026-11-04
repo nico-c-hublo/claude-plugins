@@ -398,10 +398,10 @@ function costLines(records: readonly DecisionRecord[]): string[] {
 
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 
-// The turns again, by the effort their requests went out with: a tier's effort
-// can change between releases (hard went from high to medium in 0.1.10), and a
-// turn at a lower effort answers shorter, so the outcomes of two efforts do not
-// add up. Records written before the effort was kept stand apart.
+// The turns again, by the effort their first request went out with: a tier's
+// effort can change between releases (hard went from high to medium in 0.1.10),
+// and a turn at a lower effort answers shorter, so the outcomes of two efforts
+// do not add up. Records written before the effort was kept stand apart.
 function effortLines(records: readonly DecisionRecord[]): string[] {
   const ended = records.filter(r => r.turn)
   if (ended.length === 0) return []
