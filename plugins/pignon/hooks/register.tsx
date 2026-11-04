@@ -1353,8 +1353,9 @@ export const register: Register = (on, options) => {
 
     let request = e
     if (mode !== 'off' && !(await hasPinned($, e))) {
+      const sessionEffort = e.effort as Effort | undefined
       if (isNewPrompt) {
-        const routed = await route($, text, e.model, e.effort as Effort | undefined, mode, {
+        const routed = await route($, text, e.model, sessionEffort, mode, {
           wantsLocal: decider === 'laya',
           daemon,
           isShared,
@@ -1373,7 +1374,7 @@ export const register: Register = (on, options) => {
       if (tier) request = { ...e, model: tier.model, effort: tier.effort }
       // What the turn ran at, kept because a tier's effort can change between releases.
       const started = isNewPrompt ? turns.get(e.turnId) : undefined
-      if (started) started.effort = (request.effort as Effort | undefined) ?? null
+      if (started) started.effort = tier ? tier.effort : (sessionEffort ?? null)
     }
 
     const result = yield* next(request)
