@@ -185,6 +185,43 @@ FULLR="$WORK/out-special/full-report.txt"
 expect "FIFO reported, not read"          "TRACKED FILES THAT DIFFER" "x: a file in HEAD, a FIFO on disk"
 expect "symlinked parent reported"        "TRACKED FILES THAT DIFFER" "d/zero: in HEAD, its parent d is a symlink on disk"
 
+# --- A hostile .git: FIFOs where git would block, and pointers to another repo's history.
+# scan_timed <dir> <what>: the scan must finish within 30s.
+scan_timed() {
+  ( bash "$SCAN" "$1" "$WORK/out-$(basename "$1")" >/dev/null 2>&1 ) & local pid=$!
+  for _ in $(seq 30); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+  if kill -0 $pid 2>/dev/null; then kill $pid; fail "scan hung on $2"; else ok "scan finished despite $2"; fi
+  FULLR="$WORK/out-$(basename "$1")/full-report.txt"
+}
+FH="$WORK/fifohead"; repo "$FH"; printf 'x\n' > "$FH/a"; commit "$FH" init
+rm "$FH/.git/HEAD"; mkfifo "$FH/.git/HEAD"
+scan_timed "$FH" "a FIFO as .git/HEAD"
+expect "FIFO HEAD reported"               "SCOPE"   "HEAD in the target's .git is not a regular file"
+FA="$WORK/fifoalt"; repo "$FA"; printf 'x\n' > "$FA/a"; commit "$FA" init
+mkdir -p "$FA/.git/objects/info"; mkfifo "$FA/.git/objects/info/alternates"
+scan_timed "$FA" "a FIFO as objects/info/alternates"
+expect "history read without alternates"  "HISTORY" "commits: 1"
+O="$WORK/other"; repo "$O"; git -C "$O" config user.name OTHERAUTHOR; printf 'x\n' > "$O/a"; commit "$O" init
+RA="$WORK/regalt"; repo "$RA"; printf 'y\n' > "$RA/b"; commit "$RA" init
+printf '%s\n' "$O/.git/objects" > "$RA/.git/objects/info/alternates"
+git -C "$RA" update-ref refs/heads/other "$(git -C "$O" rev-parse HEAD)"
+scan "$RA"
+reject "alternates cannot pull in another repo" "HISTORY" "OTHERAUTHOR"
+GF="$WORK/gitfile"; mkdir -p "$GF"; printf 'gitdir: %s\n' "$O/.git" > "$GF/.git"; printf 'z\n' > "$GF/c"
+scan "$GF"
+expect "gitdir outside the target refused" "SCOPE" ".git leads outside the target"
+reject "outside gitdir history not read"   "HISTORY" "OTHERAUTHOR"
+
+# --- The target's own .gitleaksignore cannot hide its secrets.
+if command -v gitleaks >/dev/null; then
+  K="$WORK/leaks"; mkdir -p "$K"
+  printf 'token = "ghp_%s"\n' "$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 36)" > "$K/config.py"
+  printf 'config.py:github-pat:1\n' > "$K/.gitleaksignore"
+  scan "$K"
+  expect "root .gitleaksignore reported"  "GITLEAKS" "the target ships its own .gitleaksignore"
+  expect "root .gitleaksignore not obeyed" "GITLEAKS" "config.py:1: github-pat"
+else echo "skip gitleaks checks (not installed)"; fi
+
 # --- A reused work dir carries nothing over from the previous target.
 R="$WORK/reuse"; mkdir -p "$R"; printf 'x\n' > "$R/a.txt"
 bash "$SCAN" "$P" "$WORK/shared" >/dev/null 2>&1; bash "$SCAN" "$R" "$WORK/shared" >/dev/null 2>&1

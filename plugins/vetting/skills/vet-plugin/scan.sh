@@ -19,7 +19,7 @@ FULL="$W/full-report.txt"
 CAP=40
 cd "$DIR" || exit 1
 # A reused work dir must not carry results over from an earlier target.
-rm -rf "$W/git" "$W/git-safe" "$W"/gitleaks-*.json "$W/head.tree" "$W/history.txt" "$W/history.paths" "$W/raw" "$FULL"
+rm -rf "$W/git" "$W/git-safe" "$W"/gitleaks-*.json "$W/head.tree" "$W/history.txt" "$W/history.paths" "$W/raw" "$W/gitleaks-src" "$FULL"
 
 PY() { python3 -I "$LIB/inspect.py" "$@"; }
 # Every regular file on disk, sorted, as ./-prefixed paths (so no path can be read as an
@@ -31,28 +31,36 @@ FILES() { cat "$W/files"; }
 h() { printf '\001%s\n' "$1"; }
 
 # A git directory the target cannot configure: fresh config, no attributes, no hooks, no
-# replace refs, no grafts. Only objects (linked) and refs (copied) come from the target.
-GD=""
+# replace refs, no grafts, no alternates. Only objects (each regular file linked) and refs
+# (copied) come from the target, and only from inside it.
+GD=""; NOGIT=""
+REG() { [ -f "$1" ] && [ ! -L "$1" ]; }   # a regular file, not a symlink, FIFO or device
+INSIDE() { case "$1/" in "$DIR"/*) return 0;; esac; return 1; }
 if [ -e .git ]; then
   SRC=""
-  if [ -d .git ]; then SRC="$DIR/.git"
-  elif [ -f .git ]; then
+  if [ -d .git ]; then SRC=$(cd .git && pwd -P)
+  elif REG .git; then
     g=$(sed -n 's/^gitdir: //p' .git | head -1)
     case "$g" in /*) ;; ?*) g="$DIR/$g";; esac
     [ -n "$g" ] && [ -d "$g" ] && SRC=$(cd "$g" && pwd -P)
   fi
   if [ -n "$SRC" ]; then
     COMMON="$SRC"
-    [ -f "$SRC/commondir" ] && COMMON=$(cd "$SRC" && cd "$(head -1 commondir)" 2>/dev/null && pwd -P)
-    if [ -d "$COMMON/objects" ]; then
+    REG "$SRC/commondir" && COMMON=$(cd "$SRC" && cd "$(head -1 commondir)" 2>/dev/null && pwd -P)
+    if [ -z "$COMMON" ]; then
+      NOGIT="the commondir in the target's .git does not resolve: history was not checked"
+    elif ! INSIDE "$SRC" || ! INSIDE "$COMMON"; then
+      NOGIT=".git leads outside the target (to $COMMON): that history is not the target's and was not read"
+    elif [ -d "$COMMON/objects" ] && [ ! -L "$COMMON/objects" ]; then
       GD="$W/git"; rm -rf "$GD"
       GIT_DIR="$GD" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git init -q --bare "$GD"
       rm -rf "$GD/objects" "$GD/refs" "$GD/hooks" "$GD/info"
-      ln -s "$COMMON/objects" "$GD/objects"
+      PY link-objects "$COMMON/objects" "$GD/objects"
       cp -RP "$COMMON/refs" "$GD/refs" 2>/dev/null || mkdir -p "$GD/refs"
-      [ -f "$COMMON/packed-refs" ] && cp -P "$COMMON/packed-refs" "$GD/"
-      cp -P "$SRC/HEAD" "$GD/HEAD" 2>/dev/null
-      [ -f "$COMMON/shallow" ] && cp -P "$COMMON/shallow" "$GD/"
+      REG "$COMMON/packed-refs" && cp -P "$COMMON/packed-refs" "$GD/"
+      if REG "$SRC/HEAD"; then cp -P "$SRC/HEAD" "$GD/HEAD"
+      else NOGIT="HEAD in the target's .git is not a regular file (not read): the HEAD comparisons below are unreliable, --all history is still read"; fi
+      REG "$COMMON/shallow" && cp -P "$COMMON/shallow" "$GD/"
       cat > "$W/git-safe" <<EOF
 #!/bin/sh
 # Read the target's history with none of its config, attributes, hooks or replace refs.
@@ -76,7 +84,8 @@ h "SCOPE"
 echo "target: $DIR"
 echo "full report (nothing cut): $FULL"
 [ -n "$GD" ] && echo "history: read it only with $W/git-safe <git args> (never plain git inside the target)"
-[ -e .git ] && [ -z "$GD" ] && echo "WARNING: .git exists but could not be read as a repository; history was not checked"
+[ -n "$NOGIT" ] && echo "WARNING: $NOGIT"
+[ -e .git ] && [ -z "$GD" ] && [ -z "$NOGIT" ] && echo "WARNING: .git exists but could not be read as a repository; history was not checked"
 [ -z "$GD" ] && [ ! -e .git ] && echo "not a git checkout: no history checked"
 
 h "INVENTORY (lines / bytes / type)"
@@ -165,7 +174,14 @@ done
 if command -v gitleaks >/dev/null; then
   printf '[extend]\nuseDefault = true\n' > "$W/gitleaks.toml"; mkdir -p "$W/gitleaks-ignore"
   GL=(--no-banner --no-color --redact --ignore-gitleaks-allow --exit-code 0 -c "$W/gitleaks.toml" -i "$W/gitleaks-ignore" -f json)
-  gitleaks dir . "${GL[@]}" -r "$W/gitleaks-dir.json" >/dev/null 2>&1 || echo "gitleaks dir failed"
+  # gitleaks always obeys <source>/.gitleaksignore, whatever -i says: when the target ships
+  # one at its root, scan a copy of its regular files without it.
+  GSRC=.
+  if [ -e .gitleaksignore ] || [ -L .gitleaksignore ]; then
+    GSRC="$W/gitleaks-src"; mkdir -p "$GSRC"
+    FILES | PY copy-files "$GSRC" ./.gitleaksignore
+  fi
+  (cd "$GSRC" && gitleaks dir . "${GL[@]}" -r "$W/gitleaks-dir.json") >/dev/null 2>&1 || echo "gitleaks dir failed"
   if [ -n "$GD" ]; then
     env GIT_DIR="$GD" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 \
       gitleaks git "$GD" "${GL[@]}" -r "$W/gitleaks-git.json" >/dev/null 2>&1 || echo "gitleaks git failed"

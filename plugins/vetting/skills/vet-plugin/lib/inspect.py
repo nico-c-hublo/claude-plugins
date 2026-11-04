@@ -8,6 +8,8 @@ Usage: python3 -I inspect.py <command> [args]   (file lists arrive NUL-separated
   notinhead <ls-tree output>
   historypaths <ls-tree output> <git log --name-only -z output>
   gitleaks  <report.json>...
+  link-objects <target objects dir> <new objects dir>
+  copy-files <dest dir> [path to leave out]...
 """
 import json, os, re, stat, struct, sys, unicodedata
 
@@ -363,6 +365,43 @@ def historypaths(lstree, log):
         print(show(p))
 
 
+def link_objects(src, dest):
+    """A git object store at dest made of symlinks to src's regular files. Leaves out
+    objects/info (alternates would pull in another repo's objects; a FIFO there or anywhere
+    else would hang git) and never descends a symlinked directory."""
+    os.mkdir(dest)
+    for root, dirs, files in os.walk(src, followlinks=False):
+        rel = os.path.relpath(root, src)
+        if rel == ".":
+            dirs[:] = [d for d in dirs if d != "info"]
+        else:
+            os.makedirs(os.path.join(dest, rel), exist_ok=True)
+        for f in files:
+            at = os.path.join(root, f)
+            if stat.S_ISREG(os.lstat(at).st_mode):
+                os.symlink(at, os.path.join(dest, rel, f))
+
+
+def copy_files(dest, *skip):
+    """Copy the listed regular files into dest, minus the paths in skip. Opens nothing but a
+    regular file and never follows a symlink."""
+    leave = {s.encode() for s in skip}
+    for p in paths():
+        if p in leave:
+            continue
+        try:
+            fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            continue
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                continue
+            out = os.path.join(dest.encode(), p)
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out, "wb") as o:
+                o.write(f.read())
+
+
 def gitleaks(*reports):
     for r in reports:
         try:
@@ -378,4 +417,5 @@ def gitleaks(*reports):
 if __name__ == "__main__":
     cmd, args = sys.argv[1], sys.argv[2:]
     {"inventory": inventory, "binaries": binaries, "hooks": hooks, "agent-files": agent_files, "images": images,
-     "symlinks": symlinks, "changed": changed, "historypaths": historypaths, "notinhead": notinhead, "gitleaks": gitleaks}[cmd](*args)
+     "symlinks": symlinks, "changed": changed, "historypaths": historypaths, "notinhead": notinhead, "gitleaks": gitleaks,
+     "link-objects": link_objects, "copy-files": copy_files}[cmd](*args)
