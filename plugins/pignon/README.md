@@ -238,10 +238,10 @@ cost (estimated at list price): 180 turns priced
 under-routed: 7 trivial turns ran 8+ steps · 2 switched turns ended in an error or a refusal
 
 turns, by the effort they ran at (too high counts the deciding judge's hard verdicts):
-  low      60 turns · corrected 10% of 60 · $0.300 spent
-  medium   70 turns · corrected 3% of 70 · too high 18% of 40 hard · $2.90 spent
-  high     40 turns · corrected 4% of 40 · too high 9% of 22 hard · $1.20 spent
-  not kept 57 turns · corrected 5% of 57 · too high 21% of 20 hard · $0.950 spent
+  low      50 turns · corrected 10% of 50 · $0.420 spent
+  medium   120 turns · corrected 3% of 120 · too high 20% of 40 hard · $5.10 spent on 60 priced
+  high     90 turns · corrected 4% of 90 · too high 14% of 14 hard · $7.30 spent on 50 priced
+  not kept 120 turns · corrected 4% of 120 · too high 30% of 10 hard · $1.20 spent on 20 priced
   not kept: recorded before the effort was kept (0.1.10)
 ```
 
