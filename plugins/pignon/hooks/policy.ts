@@ -34,7 +34,10 @@ export const TIERS: readonly Tier[] = [
   {
     id: 'hard',
     model: 'opus',
-    effort: 'high',
+    // Opus 5.5's own default. Opus 5.5 at medium matches Opus 5 at high on
+    // agentic coding with fewer tokens, and Opus 5.5 at high thinks more per
+    // turn than Opus 5 at high did.
+    effort: 'medium',
     canExplore: true,
     criteria:
       'multi-step investigation, debugging an unclear failure, cross-cutting design or refactor, a plan with real trade-offs',

@@ -1,17 +1,17 @@
 # pignon
 
-A Claude Code mod that shifts to the right model for each prompt, the way a bike changes sprocket (*pignon*), so you don't spend all day on Opus at high effort. The routing policy descends from [pi-pignon](https://github.com/nico-c-hublo/pi-pignon).
+A Claude Code mod that shifts to the right model for each prompt, the way a bike changes sprocket (*pignon*), so you don't spend all day on Opus. The routing policy descends from [pi-pignon](https://github.com/nico-c-hublo/pi-pignon).
 
 - **A small decider judges each prompt.** On the first model request of a turn, Haiku (low effort) answers how hard the task is, whether it needs exploring the codebase, and how sure it is. Bare acknowledgements ("yes", "go ahead", "vas-y") keep the current tier without asking anyone. Or the judge is [a model on your Mac](#a-local-decider): then the prompt goes to Claude only.
 - **Your session runs on the tier's model and effort.** Every main-loop request of the turn is sent with that tier's model and effort, tool steps included. Subagents keep their own settings.
-- **Switching is cache-aware.** Upgrades need confidence ≥ 0.5; downgrades need ≥ 0.85 (≥ 0.7 for the local model, whose probabilities are lower and calibrated) and a 2-prompt cooldown. A change of model or of effort drops the prompt cache, so past 60k tokens of context a downgrade is refused, and past 100k an upgrade is too. When the cache is gone anyway, after a compaction or an idle gap longer than its lifetime, the guards and the cooldown are lifted for the next prompt (see [below](#when-the-cache-is-cold)).
+- **Switching is cache-aware.** Upgrades need confidence ≥ 0.5; downgrades need ≥ 0.85 (≥ 0.7 for the local model, whose probabilities are lower and calibrated) and a 2-prompt cooldown. Leaving the session's own model or effort is not a switch back, so a downgrade from it skips the cooldown. A hard prompt on a session at Opus/high counts as a downgrade: it lowers the effort to medium if it clears the downgrade bar. A change of model or of effort drops the prompt cache, so past 60k tokens of context a downgrade is refused, and past 100k an upgrade is too. When the cache is gone anyway, after a compaction or an idle gap longer than its lifetime, the guards and the cooldown are lifted for the next prompt (see [below](#when-the-cache-is-cold)).
 - **It says what routing saves.** When a turn ends, its requests, its duration and its cost at list price go on its decision, against what the session model would have charged, and `/pignon stats` sums them with the turns where the tier fell short (see [below](#what-routing-costs-and-saves)).
 
 | Tier | Model / effort | For |
 | --- | --- | --- |
 | trivial | haiku / low | mechanical edits, renames, single lookups (moves up to standard when it must explore) |
 | standard | sonnet / medium | localized changes, routine features and tests, explaining code |
-| hard | opus / high | multi-step investigations, unclear bugs, cross-cutting design |
+| hard | opus / medium | multi-step investigations, unclear bugs, cross-cutting design |
 
 The table and thresholds live in [`hooks/policy.ts`](hooks/policy.ts).
 
@@ -197,7 +197,7 @@ Each decision then adds one JSON line to a file for the session in `$CLAUDE_CONF
 - Opus's opinion and what it cost, when the [oracle](#the-oracle-opus-as-the-reference) is on;
 - how long each took, the fallback cause when the local model was chosen but Haiku decided;
 - what was done (kept, would switch, switched), the tier before and after, the policy's reason, the session's model and the context size;
-- once the turn has ended, how many requests it made, why it ended, how long it took, the API's token counts and the model that answered, and the cost below;
+- once the turn has ended, how many requests it made, why it ended, how long it took, the effort its first request was sent with (`null` when it named none), the API's token counts and the model that answered, and the cost below;
 - whether the next prompt was a correction, and your mark (what you said, the tier it was taken against, the tiers it accepts), when there is one.
 
 `/pignon stats` sums the newest 200 session files (`/pignon stats 7` keeps the last 7 days). The numbers below only show the format:

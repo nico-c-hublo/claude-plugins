@@ -723,6 +723,8 @@ type RunningTurn = {
   id: number
   steps: number
   model: string
+  /** The effort its first request went out with, null for none; undefined until it has gone. */
+  effort?: Effort | null
   /** What the oracle is asked once the turn has ended, when it is on. */
   oracle?: OracleInput
 }
@@ -745,6 +747,7 @@ async function finishTurn(
     steps: turn.steps,
     reason: e.reason,
     durationMs: e.durationMs,
+    ...(turn.effort !== undefined && { effort: turn.effort }),
     ...(usage && { usage }),
     ...(cost && { cost }),
   }
@@ -1350,8 +1353,9 @@ export const register: Register = (on, options) => {
 
     let request = e
     if (mode !== 'off' && !(await hasPinned($, e))) {
+      const sessionEffort = e.effort as Effort | undefined
       if (isNewPrompt) {
-        const routed = await route($, text, e.model, e.effort as Effort | undefined, mode, {
+        const routed = await route($, text, e.model, sessionEffort, mode, {
           wantsLocal: decider === 'laya',
           daemon,
           isShared,
@@ -1368,6 +1372,9 @@ export const register: Register = (on, options) => {
       }
       const tier = mode === 'live' ? tierOf(await read($, current)) : undefined
       if (tier) request = { ...e, model: tier.model, effort: tier.effort }
+      // What the turn ran at, kept because a tier's effort can change between releases.
+      const started = isNewPrompt ? turns.get(e.turnId) : undefined
+      if (started) started.effort = tier ? tier.effort : (sessionEffort ?? null)
     }
 
     const result = yield* next(request)

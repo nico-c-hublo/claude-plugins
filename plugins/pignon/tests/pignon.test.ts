@@ -60,6 +60,36 @@ describe('policy', () => {
     expect(decide({ ...settings, contextTokens: 10_000 }).target).toBe('hard')
   })
 
+  test('a hard prompt on Opus at high lowers the effort to medium, as a downgrade would', async () => {
+    const hard = (confidence: number) => ({ tier: 'hard', explore: true, confidence })
+
+    const sure = decide({ ...base, decision: hard(0.9) })
+    expect(sure.target).toBe('hard')
+    expect(sure.reason).toContain('effort')
+    expect(decide({ ...base, decision: hard(0.6) }).target).toBe(null)
+    expect(decide({ ...base, sessionEffort: 'medium', decision: hard(0.9) }).reason).toBe('already on target')
+  })
+
+  test("lowering Opus's effort is held by the downgrade's cache guard, at 60k, not the upgrade's", async () => {
+    const hard = { tier: 'hard', explore: true, confidence: 0.95 }
+
+    expect(decide({ ...base, contextTokens: 50_000, decision: hard }).target).toBe('hard')
+    const warm = decide({ ...base, contextTokens: 70_000, decision: hard })
+    expect(warm.target).toBe(null)
+    expect(warm.reason).toContain('cache protected')
+    const cold = decide({ ...base, contextTokens: 70_000, decision: hard, isCacheCold: true })
+    expect(cold.target).toBe('hard')
+    expect(cold.reason).toContain('cache cold')
+  })
+
+  test("lowering Opus's effort skips the cooldown: leaving the session's own settings is not a switch back", async () => {
+    const hard = { tier: 'hard', explore: true, confidence: 0.95 }
+
+    expect(decide({ ...base, promptsSinceSwitch: 0, decision: hard }).target).toBe('hard')
+    // Once routed to hard, the tier already runs Opus at medium.
+    expect(decide({ ...base, current: 'hard', promptsSinceSwitch: 0, decision: hard }).reason).toBe('already on target')
+  })
+
   test('an upgrade is guarded past 100k tokens, not before', async () => {
     const hard = { tier: 'hard', explore: true, confidence: 0.95 }
     const sonnet = { ...base, current: 'standard', decision: hard }
@@ -2512,8 +2542,9 @@ describe("a turn's end", () => {
     expect(await logText($)).not.toContain('steps')
   })
 
-  test('goes on the record too, when the log is kept', { options: { record: 'on' } }, async ($, on) => {
-    engine(on, TRIVIAL, [], 'live')
+  // A session on Opus that keeps its log: every write, and the records last written.
+  function recording(on: On, mode: 'live' | 'shadow') {
+    engine(on, TRIVIAL, [], mode)
     const writes: { path: string; text: string }[] = []
     mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TMPDIR: '/var/tmp' })
     on('process.run', () => ({ value: OK }))
@@ -2523,7 +2554,12 @@ describe("a turn's end", () => {
 
       return { value: undefined }
     })
-    const last = () => parseRecords(writes.at(-1)?.text ?? '')
+
+    return { writes, last: () => parseRecords(writes.at(-1)?.text ?? '') }
+  }
+
+  test('goes on the record too, when the log is kept', { options: { record: 'on' } }, async ($, on) => {
+    const { writes, last } = recording(on, 'live')
     await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
 
     await prompt($, 't1', SECRET)
@@ -2532,8 +2568,31 @@ describe("a turn's end", () => {
     await complete($, 't1')
     await settle()
 
-    expect(last()[0]?.turn).toMatchObject({ steps: 1, reason: 'answer', durationMs: 12_000, cost: { actual: 0.1, onSessionModel: 4, onTier: 0.1 } })
+    expect(last()[0]?.turn).toMatchObject({ steps: 1, reason: 'answer', durationMs: 12_000, effort: 'low', cost: { actual: 0.1, onSessionModel: 4, onTier: 0.1 } })
     expect(writes.every(w => !w.text.includes('SECRETWORD'))).toBe(true)
+  })
+
+  test("keeps the effort the turn ran at: the session's own in shadow mode", { options: { record: 'on' } }, async ($, on) => {
+    const { last } = recording(on, 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await prompt($, 't1', 'rename foo')
+    await complete($, 't1')
+    await settle()
+
+    expect(last().map(r => r.turn?.effort)).toEqual(['high'])
+  })
+
+  test('keeps null for the effort when the requests named none', { options: { record: 'on' } }, async ($, on) => {
+    const { last } = recording(on, 'shadow')
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+    await $.turn.start({ turnId: 't1', text: 'rename foo' })
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: OPUS, messageCount: 1 }));
+    await complete($, 't1')
+    await settle()
+
+    expect(last().map(r => r.turn?.effort)).toEqual([null])
   })
 
   test('the pane draws it, in warning colour when the tier fell short', LOCAL, async ($, on) => {
