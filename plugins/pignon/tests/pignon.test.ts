@@ -2660,6 +2660,53 @@ describe('the decision log: the cost', () => {
   })
 })
 
+describe('the decision log: turns by effort', () => {
+  const cost = { actual: 0.1, onSessionModel: 4, onTier: 0.1 }
+  const short = { input: 1_000, output: 200, cacheRead: 0, cacheWrite: 0, model: OPUS }
+  const ended = (over: Partial<TurnOutcome> = {}): TurnOutcome => ({ steps: 2, reason: 'answer', durationMs: 5_000, usage: short, cost, ...over })
+  const hard = { tier: 'hard', explore: true, confidence: 0.9 }
+
+  test("splits the turns by the effort they ran at, the old records apart, and counts the deciding judge's hard verdicts", async () => {
+    const records = [
+      recordOf(entry({ id: 1, decision: hard, turn: ended({ effort: 'medium' }) }), CONTEXT),
+      recordOf(entry({ id: 2, decision: hard, turn: ended({ effort: 'medium', steps: 6 }), corrected: true }), CONTEXT),
+      recordOf(entry({ id: 3, turn: ended({ effort: 'medium', cost: undefined }) }), CONTEXT),
+      recordOf(entry({ id: 4, decision: hard, turn: ended({ effort: 'high', steps: 6 }) }), CONTEXT),
+      recordOf(entry({ id: 5, turn: ended({ effort: null }) }), CONTEXT),
+      recordOf(entry({ id: 6, turn: ended({ cost: { ...cost, actual: 2 } }) }), CONTEXT),
+    ]
+
+    const text = summarize(records, 1)
+
+    expect(text).toContain("turns, by the effort they ran at (too high counts the deciding judge's hard verdicts):")
+    expect(text).toContain('  medium   3 turns · corrected 33% of 3 · too high 50% of 2 hard · $0.200 spent on 2 priced')
+    expect(text).toContain('  high     1 turn · corrected 0% of 1 · too high 0% of 1 hard · $0.100 spent')
+    expect(text).toContain('  default  1 turn · corrected 0% of 1 · $0.100 spent')
+    expect(text).toContain('  not kept 1 turn · corrected 0% of 1 · $2.00 spent')
+    expect(text).toContain("default: the requests named no effort, so the model's own ran · not kept: recorded before the effort was kept (0.1.10)")
+    expect(text).not.toContain('  low ')
+  })
+
+  test("counts the hard verdict of the judge that decided, not Haiku's or the oracle's", async () => {
+    const trivial = { tier: 'trivial', explore: false, confidence: 0.9 }
+    const records = [
+      recordOf(entry({ id: 1, turn: ended({ effort: 'low' }), second: { decision: hard, ms: 700 }, oracle: { decision: hard, ms: 900 } }), CONTEXT),
+      recordOf(entry({ id: 2, decision: hard, turn: ended({ effort: 'low' }), oracle: { decision: trivial, ms: 900 } }), CONTEXT),
+    ]
+
+    expect(summarize(records, 1)).toContain('  low      2 turns · corrected 0% of 2 · too high 100% of 1 hard · $0.200 spent')
+  })
+
+  test('says nothing when no turn has ended, and leaves out the notes it does not need', async () => {
+    expect(summarize([recordOf(entry(), CONTEXT)], 1)).not.toContain('by the effort')
+
+    const text = summarize([recordOf(entry({ turn: ended({ effort: 'low' }) }), CONTEXT)], 1)
+    expect(text).toContain('  low      1 turn · corrected 0% of 1 · $0.100 spent')
+    expect(text).not.toContain('not kept')
+    expect(text).not.toContain('default:')
+  })
+})
+
 // The cache guard, lifted when the cache is cold anyway.
 describe('a cold cache', () => {
   const HARD = '{"tier":"hard","explore":true,"confidence":0.9}'
