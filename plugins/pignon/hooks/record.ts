@@ -1,4 +1,4 @@
-import type { Decision, DecisionRecord, LogEntry, Mark, TurnOutcome } from '../types'
+import type { Decision, DecisionRecord, Effort, LogEntry, Mark, TurnOutcome } from '../types'
 import { LOCAL_PROMPT_CHARS, THRESHOLDS, TIERS, effectiveTier, failedAfterSwitch, hybridDecision, isAccepted, ranLongOnTrivial, ranOn, tierOfModel, verdictSignal } from './policy'
 import { usd } from './prices'
 
@@ -177,6 +177,7 @@ export function summarize(records: readonly DecisionRecord[], sessions: number):
 
   lines.push(...judgeLines(records))
   lines.push(...costLines(records))
+  lines.push(...effortLines(records))
 
   return lines.join('\n')
 }
@@ -393,4 +394,45 @@ function costLines(records: readonly DecisionRecord[]): string[] {
   if (parts.length > 0) lines.push(`under-routed: ${parts.join(' · ')}`)
 
   return lines
+}
+
+const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+
+// The turns again, by the effort their requests went out with: a tier's effort
+// can change between releases (hard went from high to medium in 0.1.10), and a
+// turn at a lower effort answers shorter, so the outcomes of two efforts do not
+// add up. Records written before the effort was kept stand apart.
+function effortLines(records: readonly DecisionRecord[]): string[] {
+  const ended = records.filter(r => r.turn)
+  if (ended.length === 0) return []
+  const groups: { label: string; mine: DecisionRecord[] }[] = [
+    ...EFFORTS.map(effort => ({ label: effort, mine: ended.filter(r => r.turn!.effort === effort) })),
+    { label: 'default', mine: ended.filter(r => r.turn!.effort === null) },
+    { label: 'not kept', mine: ended.filter(r => r.turn!.effort === undefined) },
+  ].filter(g => g.mine.length > 0)
+
+  const lines = groups.map(({ label, mine }) => {
+    const hard = mine.filter(r => effectiveTier(r.decision) === TIERS.at(-1)!.id)
+    const priced = mine.filter(r => r.turn!.cost)
+    const spent = priced.length === 0 ? [] : [`${usd(sum(priced.map(r => r.turn!.cost!.actual)))} spent${priced.length < mine.length ? ` on ${priced.length} priced` : ''}`]
+    const cells = [
+      `${mine.length} turn${mine.length === 1 ? '' : 's'}`,
+      ...cell('corrected', tally(mine, r => r.corrected === true)),
+      ...cell('too high', tally(hard, r => verdictSignal(r.decision, r.turn) === 'too high'), ' hard'),
+      ...spent,
+    ]
+
+    return `  ${label.padEnd(8)} ${cells.join(' · ')}`
+  })
+  const notes = [
+    ...(groups.some(g => g.label === 'default') ? ["default: the requests named no effort, so the model's own ran"] : []),
+    ...(groups.some(g => g.label === 'not kept') ? ['not kept: recorded before the effort was kept (0.1.10)'] : []),
+  ]
+
+  return [
+    '',
+    "turns, by the effort they ran at (too high counts the deciding judge's hard verdicts):",
+    ...lines,
+    ...(notes.length > 0 ? [`  ${notes.join(' · ')}`] : []),
+  ]
 }

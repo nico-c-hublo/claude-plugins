@@ -236,9 +236,18 @@ cost (estimated at list price): 180 turns priced
   shadow: would have saved $3.40 of $9.90
   by tier: trivial 60 turns $0.30 · standard 90 turns $2.10 · hard 30 turns $1.72
 under-routed: 7 trivial turns ran 8+ steps · 2 switched turns ended in an error or a refusal
+
+turns, by the effort they ran at (too high counts the deciding judge's hard verdicts):
+  low      60 turns · corrected 10% of 60 · $0.300 spent
+  medium   70 turns · corrected 3% of 70 · too high 18% of 40 hard · $2.90 spent
+  high     40 turns · corrected 4% of 40 · too high 9% of 22 hard · $1.20 spent
+  not kept 57 turns · corrected 5% of 57 · too high 21% of 20 hard · $0.950 spent
+  not kept: recorded before the effort was kept (0.1.10)
 ```
 
 The confidence bands are what the bars are tuned against: if a judge stays right (by your marks, or by Opus) below its downgrade bar, the bar is too strict; if it is no more often right at 0.9 than at 0.6, its confidence carries no information and a bar on it is noise. "Agree" means the two judges would run the same tier; see [Scoring the judges](#scoring-the-judges) for what each judge line counts.
+
+The last block counts the turns again, by the effort their first request went out with. A tier's effort can change from one release to the next (hard went from high to medium in 0.1.10), and a turn at a lower effort answers shorter, so a rise in "too high" after an upgrade can be the effort and not the judge. Each line counts the turns that ran at that effort, those the next prompt corrected, the hard verdicts of the judge that decided and how many of them were too high, and what the turns cost at list price. `default` is a turn whose requests named no effort, and `not kept` a record written before 0.1.10, which does not say.
 
 ### What routing costs and saves
 
