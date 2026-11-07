@@ -259,13 +259,13 @@ Files are rewritten whole on each decision (the engine has no append, and two se
 
 ## Keeping the prompts, to train a local judge
 
-On the first prompts Opus's verdict could score, laya picked Opus's tier 10 times out of 38, and Haiku 28 times out of 37 (one prompt had no answer from Haiku). Laya's probabilities hardly follow Opus's ranking, so recalibrating them gives no more than always answering `standard`; see [below](#what-the-first-measurement-said). A judge of laya's speed that does better has to be trained on prompts like yours, labelled by Opus. The decision log holds the labels but, by design, not the prompts. The corpus holds the prompts.
+On the first prompts Opus's verdict could score, laya picked Opus's tier 10 times out of 38, and Haiku 28 times out of 37 (one prompt had no answer from Haiku). Laya's probabilities hardly follow Opus's ranking, so recalibrating them gives no more than always answering `standard`; see [below](#what-the-first-measurement-said). A judge of laya's speed that does better has to be trained on prompts like yours, labelled by Opus. A new classifier on top of laya's model, left as it is, was not enough on 342 such prompts; see [what the corpus said](#what-the-corpus-said). The decision log holds the labels but, by design, not the prompts. The corpus holds the prompts.
 
 Set *Keep the prompts, to train a local judge* to `on` (the `corpus` option, in `/config` or `"corpus": "on"` in the same `pluginConfigs` block as `decider`), with the decision log and the oracle on, in shadow mode, or the prompts get no labels (`/pignon` says so). They are kept all the same, so they can still be labelled later. It is off by default.
 
 - **What is kept.** The text of each judged prompt, up to 32,000 characters (its full length is noted), in its own file `$CLAUDE_CONFIG_DIR/pignon/corpus/<session>-<n>.json`. `session` and `n` are the keys of its line in the decision log, where the tiers, the judges' answers, the oracle's verdict, the turn's outcome and your mark are. A `/clear` starts a new `session`. Like the log, a session keeps its newest 3,000 prompts. Acknowledgements are not kept, nor prompts that were not routed (pignon off or pinned).
 - **Where it stays.** In a folder only you can enter, on this Mac; pignon sets its rights again before each prompt it keeps. Nothing reads it but you and a training run on this Mac; pignon sends it nowhere. A file older than 90 days is deleted at each session start, with the corpus on or off, as long as pignon is enabled; delete the folder to clear everything. Prompts hold whatever you typed or pasted, secrets included: mind the folder in backups and when sharing.
-- **How much it takes.** At about a cent per oracle label, a few hundred labelled prompts cost a few dollars and some weeks of ordinary work. The judge is trained, and checked on prompts it was not trained on, once there are enough.
+- **How much it takes.** At about a cent per oracle label, a few hundred labelled prompts cost a few dollars and some weeks of ordinary work. A few hundred were not enough (see [below](#what-the-corpus-said)): training the whole model is the step left, and it is not worth trying before about a thousand. The judge is checked on prompts it was not trained on.
 
 ### What the first measurement said
 
@@ -280,6 +280,28 @@ On 2026-11-02, 115 decisions were logged, 45 with laya's probabilities and Opus'
 | laya | 10 of 38 (26%) |
 
 Laya said `hard` 26 times, and Opus agreed 4 times. On an Opus session the hybrid's downgrades go no lower than laya's verdict, so it inherits that lean. Haiku's confidence ran from 0.4 to 0.7, its misses spread across that range, so it says nothing of when Haiku is wrong, and it never reaches the 0.85 downgrade bar.
+
+### What the corpus said
+
+On 2026-11-07 the corpus of two config folders, one for work and one personal, held 342 distinct prompts with an absolute verdict from Opus (prompts Opus said to keep at the same tier score nothing): 129 `trivial`, 166 `standard`, 47 `hard`, gathered from 2026-11-03 to 2026-11-07, almost all on Opus sessions. The question was whether laya's model, left as it is, already holds what Opus judges on, so that a new classifier on top of it (cheap to train, as fast as laya) would do. Each prompt was run once through the pinned checkpoint, offline, with the wording laya was fine-tuned on, and the model's internal states were kept at four places: the encoder's mean and its first token, and the decision head's first token and its three option markers. A linear classifier on each was trained and scored by 10-fold cross-validation, its regularisation chosen inside each training fold, so every prompt is scored by a classifier that never saw it. A margin of about ±5 points applies to the shares below.
+
+| Judge | Picks Opus's tier | `hard` found |
+| --- | --- | --- |
+| Haiku (on the 278 it answered) | 80% | 86% |
+| a classifier on the encoder's first token | 65% | 26% |
+| the same, weighted so each tier counts equally | 62% | 60% |
+| a classifier on the head's first token, weighted | 62% | 64% |
+| a classifier on word and letter counts, not laya (on 327 of them, the day before) | 63% | 0% |
+| laya, recalibrated | 46 to 58% | 0 to 77% |
+| always `standard` | 49% | 0% |
+| laya | 45% | 85% |
+
+- **Laya's model adds nothing over counting words.** The best classifier on it does as well as one on word and letter counts, 17 points below Haiku. Haiku and Opus read only the prompt, as laya does: their input is the system prompt, the current tier and the prompt's first 4,000 characters, no earlier message ([`askJudge`](hooks/register.tsx)). The gap is not information they had and laya lacked; laya reads the first 400 characters, and half the prompts are under 60.
+- **More prompts do not close it.** Trained on about 75, 150, 230 and 310 prompts, the best classifier picks Opus's tier 59, 61, 64 and 63% of the time: it stops rising at about 230.
+- **The misses are between neighbours.** Weighted, it called 34 `trivial` prompts `standard` and 33 `standard` prompts `trivial`; it found 30 of the 47 `hard` prompts by also calling 37 `standard` prompts `hard`.
+- **Opus is unsure of its own labels.** It gave a confidence of 0.6 or less on 149 of its 248 verdicts on work prompts (duplicates included), and there are only 11 marks to check it against.
+
+A judge of laya's speed now needs the whole model trained on the corpus, not a classifier on top of it; on a few hundred labels, half of them unsure, it would mostly learn them by heart. Until the corpus holds about a thousand, Haiku stays the judge.
 
 ## Limits
 
