@@ -3,15 +3,20 @@
 Usage: python3 -I inspect.py <command> [args]   (file lists arrive NUL-separated on stdin)
   inventory <file -0 -N output>
   binaries  <file -0 -N --mime output>
+  archives  <file -0 -N --mime output>
   hooks | agent-files | images | symlinks <target dir>
   changed   <git ls-tree -r -z HEAD output> <sha1|sha256>
   notinhead <ls-tree output>
   historypaths <ls-tree output> <git log --name-only -z output>
   gitleaks  <report.json>...
   link-objects <target objects dir> <new objects dir>
+  copy-refs <target refs dir> <new refs dir>
   copy-files <dest dir> [path to leave out]...
 """
 import json, os, re, stat, struct, sys, unicodedata
+
+# Files bigger than this are listed, not read (same limit as textscan.pl).
+MAXB = int(os.environ.get("VET_MAX_BYTES") or 20 * 1024 * 1024)
 
 HIDE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e"
                   r"\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\u2800\u3164\ufe00-\ufe0f\ufeff\uffa0"
@@ -50,6 +55,9 @@ def inventory(types):
     t = file_records(types)
     for p in paths():
         try:
+            size = os.lstat(p).st_size
+            if size > MAXB:
+                print(f"{'?':>7} {size:9}  {show(p)}  [too large: not read]"); continue
             d = open(p, "rb").read()
         except OSError as e:
             print(f"{show(p)}: unreadable ({e.strerror})"); continue
@@ -75,15 +83,40 @@ def binaries(mimes):
         print(f"{show(p)}: {esc(m)}{note}")
 
 
+ARCHIVE = re.compile(r"^application/(zip|gzip|x-gzip|x-tar|x-bzip2|x-xz|x-7z-compressed|java-archive|x-rar|vnd\.rar|"
+                     r"zstd|x-zstd|x-lzma|x-lzip|x-compress|x-archive|x-cpio|x-iso9660-image|x-apple-diskimage|"
+                     r"vnd\.ms-cab-compressed|x-debian-package|x-rpm|x-xar)\b")
+
+
+def archives(mimes):
+    """Archives by content, whatever their extension: nothing inside them was scanned."""
+    for p, m in sorted(file_records(mimes).items()):
+        if ARCHIVE.search(m) and not re.search(rb"(^|/)\.git/", p):
+            print(f"{show(p)}: {esc(m.split(';')[0])}")
+
+
 HOOK = re.compile(
     r"(^|/)(package\.json|setup\.py|setup\.cfg|pyproject\.toml|[^/]+\.pth|sitecustomize\.py|usercustomize\.py|"
     r"conftest\.py|Makefile|Cargo\.toml|build\.rs|binding\.gyp|install\.sh|postinstall[^/]*|\.npmrc|\.yarnrc(\.yml)?|"
     r"\.mcp\.json|mcp\.json|plugin\.json|marketplace\.json|hooks\.json|settings(\.local)?\.json|mod\.json|"
     r"manifest\.json|Dockerfile|\.envrc|\.gitmodules|\.husky/.*|\.vscode/(tasks|settings|launch|extensions)\.json|"
-    r"\.devcontainer(/devcontainer)?\.json|\.devcontainer/.*|\.idea/.*\.xml)$")
+    r"\.devcontainer(/devcontainer)?\.json|\.devcontainer/.*|\.idea/.*\.xml|"
+    r"\.pnpmfile\.c?js|\.cargo/config(\.toml)?|entry_points\.txt|(requirements|constraints)[^/]*\.txt|Pipfile|"
+    r"go\.mod|Gemfile|Rakefile|build\.gradle(\.kts)?|settings\.gradle(\.kts)?|\.pre-commit-config\.ya?ml|"
+    r"noxfile\.py|tox\.ini|justfile|Taskfile\.ya?ml|lefthook\.ya?ml|\.lfsconfig)$")
+# Text install files: the lines that run something, fetch from somewhere, or redirect.
+SHOW = (
+    (re.compile(r"(requirements|constraints)[^/]*\.txt$|^Pipfile$"),
+     re.compile(r"^\s*-|://|git\+|@\s*(file|https?):"), "options, URLs and direct references"),
+    (re.compile(r"^config(\.toml)?$"), re.compile(r"^\s*(runner|rustc-wrapper|rustc|linker|rustdoc|ar)\s*="), "commands cargo runs"),
+    (re.compile(r"^entry_points\.txt$"), re.compile(r"\S"), "entry points other programs load"),
+    (re.compile(r"^go\.mod$"), re.compile(r"^\s*(replace|toolchain|tool)\b"), "replacements and toolchains"),
+    (re.compile(r"^\.lfsconfig$"), re.compile(r"url\s*="), "where git-lfs downloads from on checkout"),
+)
 # JSON keys whose values are commands, sources or endpoints.
 RUNKEY = re.compile(r"command|helper|^args$|^url$|^source$|^repo$|^runOn$|refresh|export|^main$|^bin$|"
-                    r"^activationEvents$|^entrypoint$|^module$|^exec", re.I)
+                    r"^activationEvents$|^entrypoint$|^module$|^exec|^env$|^permissions$|^enableAllProjectMcpServers$|"
+                    r"^enabledMcpjsonServers$|^disableAllHooks$", re.I)
 
 
 def loose_json(text):
@@ -125,6 +158,14 @@ def hooks():
             for line in text.splitlines():
                 if re.match(r"\s*(url|path|branch)\s*=", line):
                     print("  " + esc(line.strip()))
+        elif any(n.search(name) for n, _, _ in SHOW):
+            for n, line_re, what in SHOW:
+                if n.search(name):
+                    hits = [l for l in text.splitlines() if line_re.search(l)]
+                    if hits:
+                        print(f"--- {show(p)}: {what}")
+                        for line in hits:
+                            print("  " + cut(line.strip(), 200))
         elif name.endswith(".json"):
             try:
                 d = loose_json(text)
@@ -137,9 +178,14 @@ def hooks():
                     if isinstance(d.get(k), dict):
                         deps.update(d[k])
                 items.append(("deps", ", ".join(deps) or "none"))
+                ranges = []
                 for k, v in deps.items():
-                    if isinstance(v, str) and re.search(r"[:/]|^latest$|^\*$|^$", v):
-                        items.append((f"UNPINNED OR NON-REGISTRY DEPENDENCY {k}", v))
+                    if isinstance(v, str) and re.search(r"[:/]", v):
+                        items.append((f"NON-REGISTRY DEPENDENCY {k}", v))
+                    elif not (isinstance(v, str) and re.fullmatch(r"=?v?\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?", v)):
+                        ranges.append(k)
+                if ranges:
+                    items.append(("UNPINNED DEPENDENCIES (ranges or tags, resolved at install time)", ", ".join(ranges)))
             if name == "marketplace.json" and isinstance(d, dict):
                 for pl in d.get("plugins") or []:
                     src = pl.get("source") if isinstance(pl, dict) else None
@@ -151,8 +197,12 @@ def hooks():
                     print(f"  {esc(k)}: {cut(v, 300)}")
 
 
-AGENT = re.compile(r"(^|/)(SKILL\.md|CLAUDE\.md|AGENTS\.md|GEMINI\.md|\.cursorrules|\.windsurfrules|copilot-instructions\.md|"
-                   r"(commands|agents|output-styles|prompts)/.+\.md|\.claude/.*|\.claude-plugin/[^/]+\.json|\.cursor/.*)$")
+# Keep in step with $agentish in textscan.pl. Everything under skills/ counts: an agent reads
+# a skill's supporting files on demand.
+AGENT = re.compile(r"(^|/)(SKILL\.md|CLAUDE\.md|AGENTS\.md|GEMINI\.md|CONVENTIONS\.md|\.cursorrules|\.windsurfrules|"
+                   r"\.clinerules.*|\.goosehints|copilot-instructions\.md|skills/.+|(commands|agents|output-styles|prompts)/.+\.md|"
+                   r"\.claude/.*|\.claude-plugin/[^/]+\.json|\.cursor/.*|\.windsurf/.*|\.roo/.*|\.kiro/.*|\.amazonq/.*|"
+                   r"\.junie/.*|\.github/(instructions|prompts)/.*)$")
 
 
 def agent_files():
@@ -258,6 +308,8 @@ def images():
     for p in paths():
         ext = p.rsplit(b".", 1)[-1].lower()
         try:
+            if os.lstat(p).st_size > MAXB:
+                continue
             d = open(p, "rb").read()
         except OSError:
             continue
@@ -331,6 +383,8 @@ def changed(lstree, algo):
         want = "a symlink" if mode == b"120000" else "a file"
         if kind(st) != want:
             print(f"{show(path)}: {want} in HEAD, {kind(st)} on disk"); continue
+        if st.st_size > MAXB:
+            print(f"{show(path)}: too large to compare with HEAD ({st.st_size} bytes)"); continue
         if want == "a symlink":
             data = os.readlink(disk)
         else:
@@ -382,6 +436,26 @@ def link_objects(src, dest):
                 os.symlink(at, os.path.join(dest, rel, f))
 
 
+def copy_refs(src, dest):
+    """Copy the regular files of a refs tree. Never descends a symlinked directory, and
+    skips symlinks, FIFOs and devices: git would walk a link to / or block on a FIFO."""
+    os.makedirs(dest, exist_ok=True)
+    for root, dirs, files in os.walk(src, followlinks=False):
+        rel = os.path.relpath(root, src)
+        os.makedirs(os.path.join(dest, rel), exist_ok=True)
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        for f in files:
+            at = os.path.join(root, f)
+            try:
+                fd = os.open(at, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+            except OSError:
+                continue
+            with os.fdopen(fd, "rb") as fh:
+                if stat.S_ISREG(os.fstat(fh.fileno()).st_mode) and os.fstat(fh.fileno()).st_size < 4096:
+                    with open(os.path.join(dest, rel, f), "wb") as o:
+                        o.write(fh.read())
+
+
 def copy_files(dest, *skip):
     """Copy the listed regular files into dest, minus the paths in skip. Opens nothing but a
     regular file and never follows a symlink."""
@@ -394,7 +468,8 @@ def copy_files(dest, *skip):
         except OSError:
             continue
         with os.fdopen(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_size > MAXB:
                 continue
             out = os.path.join(dest.encode(), p)
             os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -416,6 +491,6 @@ def gitleaks(*reports):
 
 if __name__ == "__main__":
     cmd, args = sys.argv[1], sys.argv[2:]
-    {"inventory": inventory, "binaries": binaries, "hooks": hooks, "agent-files": agent_files, "images": images,
+    {"inventory": inventory, "binaries": binaries, "archives": archives, "hooks": hooks, "agent-files": agent_files, "images": images,
      "symlinks": symlinks, "changed": changed, "historypaths": historypaths, "notinhead": notinhead, "gitleaks": gitleaks,
-     "link-objects": link_objects, "copy-files": copy_files}[cmd](*args)
+     "link-objects": link_objects, "copy-refs": copy_refs, "copy-files": copy_files}[cmd](*args)

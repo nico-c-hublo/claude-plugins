@@ -7,11 +7,14 @@ use Encode qw(decode FB_DEFAULT);
 binmode STDOUT, ':encoding(UTF-8)';
 
 my ($patfile, $out) = @ARGV;
-open my $pf, '<', $patfile or die "$patfile: $!"; chomp(my $p = <$pf>); close $pf;
+open my $pf, '<', $patfile or die "$patfile: $!";
+my $p = join '|', map { chomp; $_ } grep { !/^\s*(?:#|$)/ } <$pf>; close $pf;
 my $PAT = qr/$p/i;
+# Files bigger than this are listed, not read: a sparse or padded file would stall the scan.
+my $MAXB = $ENV{VET_MAX_BYTES} || 20 * 1024 * 1024;
 
 my %fh;
-for my $n (qw(minified invisible invisible_counts nonascii patterns patterns_docs patterns_git patterns_binary headlines looks_binary mismatch agent)) {
+for my $n (qw(minified invisible invisible_counts nonascii patterns patterns_docs patterns_git patterns_binary headlines looks_binary mismatch agent toolarge)) {
   open $fh{$n}, '>:encoding(UTF-8)', "$out/$n.txt" or die "$out/$n.txt: $!";
 }
 
@@ -43,6 +46,8 @@ sub window {
   return ($from ? '…' : '') . esc(substr($line, $from, 200)) . ($from + 200 < length($line) ? '…' : '');
 }
 my $VS = qr/[\x{FE00}-\x{FE0F}\x{E0100}-\x{E01EF}]/;
+# Scripts that put joiners inside words (Persian ZWNJ, Indic half forms).
+my $JOINS = qr/[\p{Arabic}\p{Syriac}\p{Nko}\p{Mongolian}\p{Devanagari}\p{Bengali}\p{Gurmukhi}\p{Gujarati}\p{Oriya}\p{Tamil}\p{Telugu}\p{Kannada}\p{Malayalam}\p{Sinhala}]/;
 
 # Binary content that looks the part: the pattern scan only, on the raw bytes.
 sub binscan {
@@ -61,6 +66,7 @@ local $/ = "\0";
 while (my $path = <STDIN>) {
   chomp $path;
   next unless -f $path && !-l $path;
+  if (-s _ > $MAXB) { printf {$fh{toolarge}} "%s: %d bytes\n", show_path($path), -s _; next }
   open my $in, '<:raw', $path or next;
   my $raw = do { local $/; <$in> }; close $in;
   $raw //= '';
@@ -100,8 +106,9 @@ while (my $path = <STDIN>) {
     if $enc ne 'UTF-8' || $nul;
   my $text = decode($enc, $raw, FB_DEFAULT);
   my $is_md = $path =~ /\.(?:md|mdx|markdown)$/i;
-  my $agentish = $path =~ m{(?:^|/)(?:commands|agents|skills|output-styles|prompts|\.claude|\.claude-plugin)/}
-    || $path =~ m{(?:^|/)(?:SKILL|CLAUDE|AGENTS|GEMINI)\.md$};
+  # Keep in step with AGENT in inspect.py.
+  my $agentish = $path =~ m{(?:^|/)(?:commands|agents|skills|output-styles|prompts|hooks|\.claude|\.claude-plugin|\.cursor|\.windsurf|\.roo|\.kiro|\.amazonq|\.junie|\.github/(?:instructions|prompts))/}
+    || $path =~ m{(?:^|/)(?:SKILL|CLAUDE|AGENTS|GEMINI|CONVENTIONS|copilot-instructions)\.md$|(?:^|/)\.(?:cursorrules|windsurfrules|clinerules|goosehints)};
   # Plain documentation goes after code in the pattern section, so a README full of links
   # cannot push code hits past the cap.
   my $doc = !$agentish && $path =~ /\.(?:md|mdx|markdown|txt|rst|adoc)$/i;
@@ -115,11 +122,13 @@ while (my $path = <STDIN>) {
     printf {$fh{minified}} "%s:%d: (%d chars) %s\n", $shown, $ln, length $line, esc(substr($line, 0, 160))
       if length($line) > 400;
 
-    # Invisible characters. Allowed: a BOM opening the file, joiners between two non-ASCII
-    # characters (emoji, Persian), a single variation selector after a non-ASCII character
-    # or a keycap digit, and the tag sequence of a subdivision flag emoji.
+    # Invisible characters. Allowed: a BOM opening the file, a joiner inside an emoji
+    # sequence or a word of a script that uses joiners, one variation selector after a CJK
+    # ideograph or VS15/VS16 after a symbol or keycap base, and the tags of the three
+    # subdivision flags (England, Scotland, Wales). Each exemption admits one character at a
+    # time: a run of invisible characters is how a payload is encoded.
     my $l2 = $line;
-    $l2 =~ s/\x{1F3F4}[\x{E0020}-\x{E007E}]{1,12}\x{E007F}/\x{1F3F4}/g;
+    $l2 =~ s/\x{1F3F4}\x{E0067}\x{E0062}(?:\x{E0065}\x{E006E}\x{E0067}|\x{E0073}\x{E0063}\x{E0074}|\x{E0077}\x{E006C}\x{E0073})\x{E007F}/\x{1F3F4}/g;
     $l2 =~ s/^\x{FEFF}// if $ln == 1;
     my %c;
     while ($l2 =~ /($HIDE)/g) {
@@ -129,15 +138,21 @@ while (my $path = <STDIN>) {
       next if ($o < 0x20 || ($o >= 0x7F && $o <= 0x9F)) && $o != 0x1B && $o != 0x9B && $o != 0x08;
       my $prev = $at > 0 ? substr($l2, $at - 1, 1) : '';
       my $next = substr($l2, $at + 1, 1);
+      # Joiners: ZWJ between an emoji (or its skin tone or VS16) and the next emoji, or ZWJ and
+      # ZWNJ between two letters of a script that joins. Never next to another invisible
+      # character, and never between Latin letters: a joiner choice per gap is one bit.
       if ($o == 0x200C || $o == 0x200D) {
-        next if $prev =~ /[^\x00-\x7f]/ && $next =~ /[^\x00-\x7f]/;
+        next if $next !~ $HIDE
+          && (($o == 0x200D && $prev =~ /[\p{So}\p{Sk}\x{FE0F}]/ && $next =~ /\p{So}/)
+              || ($prev =~ $JOINS && $next =~ $JOINS));
       }
-      # Variation selectors are legitimate one at a time after emoji and symbols (FE00-FE0F)
-      # or after CJK ideographs (both ranges), never after other letters: one selector per
-      # letter is how a payload hides one byte per carrier character.
+      # Variation selectors: any one after a CJK ideograph; otherwise only VS15/VS16 (text or
+      # emoji style) after a symbol or a keycap base. The other 14 selectors after symbols
+      # carry 4 bits per carrier character, and any selector after a letter carries a byte.
       if ($o >= 0xFE00 && $o <= 0xFE0F) {
         next if $prev !~ $VS && $next !~ $VS
-          && (($prev =~ /[^\x00-\x7f]/ && $prev !~ /\p{L}/) || $prev =~ /\p{Han}/ || $prev =~ /[0-9#*]/);
+          && ($prev =~ /\p{Han}/
+              || (($o == 0xFE0E || $o == 0xFE0F) && (($prev =~ /[^\x00-\x7f]/ && $prev !~ /\p{L}/) || $prev =~ /[0-9#*]/)));
       }
       if ($o >= 0xE0100 && $o <= 0xE01EF) {
         next if $prev !~ $VS && $next !~ $VS && $prev =~ /\p{Han}/;

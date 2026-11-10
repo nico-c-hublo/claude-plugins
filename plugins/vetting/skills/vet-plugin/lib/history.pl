@@ -8,7 +8,8 @@ use Encode qw(decode FB_DEFAULT);
 binmode STDOUT, ':encoding(UTF-8)';
 
 my ($patfile, $headfile) = @ARGV;
-open my $pf, '<', $patfile or die "$patfile: $!"; chomp(my $p = <$pf>); close $pf;
+open my $pf, '<', $patfile or die "$patfile: $!";
+my $p = join '|', map { chomp; $_ } grep { !/^\s*(?:#|$)/ } <$pf>; close $pf;
 my $PAT = qr/$p/i;
 my %head;
 open my $hf, '<:encoding(UTF-8)', $headfile or die "$headfile: $!";

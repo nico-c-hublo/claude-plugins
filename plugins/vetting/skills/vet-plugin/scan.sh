@@ -17,6 +17,8 @@ W=${2:-$(mktemp -d)}; mkdir -p "$W" && W=$(cd "$W" && pwd -P) || exit 1
 case "$W/" in "$DIR"/*) echo "scan.sh: the work dir must be outside the target" >&2; exit 1;; esac
 FULL="$W/full-report.txt"
 CAP=40
+# Files bigger than this are listed under FILES TOO LARGE TO SCAN and not read.
+export VET_MAX_BYTES=${VET_MAX_BYTES:-$((20 * 1024 * 1024))}
 cd "$DIR" || exit 1
 # A reused work dir must not carry results over from an earlier target.
 rm -rf "$W/git" "$W/git-safe" "$W"/gitleaks-*.json "$W/head.tree" "$W/history.txt" "$W/history.paths" "$W/raw" "$W/gitleaks-src" "$FULL"
@@ -56,17 +58,20 @@ if [ -e .git ]; then
       GIT_DIR="$GD" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git init -q --bare "$GD"
       rm -rf "$GD/objects" "$GD/refs" "$GD/hooks" "$GD/info"
       PY link-objects "$COMMON/objects" "$GD/objects"
-      cp -RP "$COMMON/refs" "$GD/refs" 2>/dev/null || mkdir -p "$GD/refs"
+      if [ -d "$COMMON/refs" ] && [ ! -L "$COMMON/refs" ]; then PY copy-refs "$COMMON/refs" "$GD/refs"
+      else mkdir -p "$GD/refs"; NOGIT="refs in the target's .git is not a plain directory (not read): only packed refs and HEAD were used"; fi
       REG "$COMMON/packed-refs" && cp -P "$COMMON/packed-refs" "$GD/"
       if REG "$SRC/HEAD"; then cp -P "$SRC/HEAD" "$GD/HEAD"
       else NOGIT="HEAD in the target's .git is not a regular file (not read): the HEAD comparisons below are unreliable, --all history is still read"; fi
       REG "$COMMON/shallow" && cp -P "$COMMON/shallow" "$GD/"
       cat > "$W/git-safe" <<EOF
 #!/bin/sh
-# Read the target's history with none of its config, attributes, hooks or replace refs.
+# Read the target's history with none of its config, attributes, hooks, replace refs or
+# .mailmap (a bare repo reads HEAD:.mailmap, which would rename authors).
 exec env GIT_DIR='$GD' GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \\
   GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 \\
-  git -c core.quotePath=false -c diff.external= -c core.pager=cat --no-pager "\$@"
+  git -c core.quotePath=false -c diff.external= -c core.pager=cat -c log.mailmap=false -c mailmap.blob= \\
+  --no-pager "\$@"
 EOF
       chmod +x "$W/git-safe"
     fi
@@ -101,6 +106,12 @@ find . "${NOOBJ[@]}" \( -type p -o -type s -o -type b -o -type c \) -print 2>/de
 
 h "BINARIES / NON-TEXT FILES"
 PY binaries "$W/mimes"
+
+h "ARCHIVES (their contents were NOT scanned: unpack each into its own empty dir and vet it as a separate target)"
+PY archives "$W/mimes"
+
+h "FILES TOO LARGE TO SCAN (over $VET_MAX_BYTES bytes; not read: inspect them by hand with head, xxd or file)"
+cat "$W/toolarge.txt"
 
 h "EXTENSION / CONTENT MISMATCH"
 cat "$W/mismatch.txt"
@@ -173,7 +184,7 @@ for f in .gitleaks.toml .gitleaksignore; do
 done
 if command -v gitleaks >/dev/null; then
   printf '[extend]\nuseDefault = true\n' > "$W/gitleaks.toml"; mkdir -p "$W/gitleaks-ignore"
-  GL=(--no-banner --no-color --redact --ignore-gitleaks-allow --exit-code 0 -c "$W/gitleaks.toml" -i "$W/gitleaks-ignore" -f json)
+  GL=(--no-banner --no-color --redact --ignore-gitleaks-allow --max-target-megabytes $((VET_MAX_BYTES / 1048576)) --exit-code 0 -c "$W/gitleaks.toml" -i "$W/gitleaks-ignore" -f json)
   # gitleaks always obeys <source>/.gitleaksignore, whatever -i says: when the target ships
   # one at its root, scan a copy of its regular files without it.
   GSRC=.
