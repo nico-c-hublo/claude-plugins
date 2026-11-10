@@ -17,9 +17,16 @@ W=${2:-$(mktemp -d)}; mkdir -p "$W" && W=$(cd "$W" && pwd -P) || exit 1
 case "$W/" in "$DIR"/*) echo "scan.sh: the work dir must be outside the target" >&2; exit 1;; esac
 FULL="$W/full-report.txt"
 CAP=40
+# Files and history blobs bigger than this are listed and not read. One check here; the
+# Perl and Python helpers refuse anything else.
+export VET_MAX_BYTES=${VET_MAX_BYTES:-$((20 * 1024 * 1024))}
+case "$VET_MAX_BYTES" in
+  ''|0*|*[!0-9]*) echo "scan.sh: VET_MAX_BYTES must be a positive whole number of bytes (got '$VET_MAX_BYTES')" >&2; exit 1;;
+esac
+GL_MB=$(( (VET_MAX_BYTES + 1048575) / 1048576 ))   # gitleaks takes whole MB, and 0 would mean no limit
 cd "$DIR" || exit 1
 # A reused work dir must not carry results over from an earlier target.
-rm -rf "$W/git" "$W/git-safe" "$W"/gitleaks-*.json "$W/head.tree" "$W/history.txt" "$W/history.paths" "$W/raw" "$W/gitleaks-src" "$FULL"
+rm -rf "$W/git" "$W/git-safe" "$W"/gitleaks-*.json "$W/head.tree" "$W/history.txt" "$W/history.paths" "$W/bigpaths" "$W/raw" "$W/gitleaks-src" "$FULL"
 
 PY() { python3 -I "$LIB/inspect.py" "$@"; }
 # Every regular file on disk, sorted, as ./-prefixed paths (so no path can be read as an
@@ -34,6 +41,9 @@ h() { printf '\001%s\n' "$1"; }
 # replace refs, no grafts, no alternates. Only objects (each regular file linked) and refs
 # (copied) come from the target, and only from inside it.
 GD=""; NOGIT=""
+# Every reason history is incomplete is kept: one problem must not hide another.
+nogit() { NOGIT="${NOGIT:+$NOGIT
+}$1"; }
 REG() { [ -f "$1" ] && [ ! -L "$1" ]; }   # a regular file, not a symlink, FIFO or device
 INSIDE() { case "$1/" in "$DIR"/*) return 0;; esac; return 1; }
 if [ -e .git ]; then
@@ -48,25 +58,28 @@ if [ -e .git ]; then
     COMMON="$SRC"
     REG "$SRC/commondir" && COMMON=$(cd "$SRC" && cd "$(head -1 commondir)" 2>/dev/null && pwd -P)
     if [ -z "$COMMON" ]; then
-      NOGIT="the commondir in the target's .git does not resolve: history was not checked"
+      nogit "the commondir in the target's .git does not resolve: history was not checked"
     elif ! INSIDE "$SRC" || ! INSIDE "$COMMON"; then
-      NOGIT=".git leads outside the target (to $COMMON): that history is not the target's and was not read"
+      nogit ".git leads outside the target (to $COMMON): that history is not the target's and was not read"
     elif [ -d "$COMMON/objects" ] && [ ! -L "$COMMON/objects" ]; then
       GD="$W/git"; rm -rf "$GD"
       GIT_DIR="$GD" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git init -q --bare "$GD"
       rm -rf "$GD/objects" "$GD/refs" "$GD/hooks" "$GD/info"
       PY link-objects "$COMMON/objects" "$GD/objects"
-      cp -RP "$COMMON/refs" "$GD/refs" 2>/dev/null || mkdir -p "$GD/refs"
+      if [ -d "$COMMON/refs" ] && [ ! -L "$COMMON/refs" ]; then PY copy-refs "$COMMON/refs" "$GD/refs"
+      else mkdir -p "$GD/refs"; nogit "refs in the target's .git is not a plain directory (not read): only packed refs and HEAD were used"; fi
       REG "$COMMON/packed-refs" && cp -P "$COMMON/packed-refs" "$GD/"
       if REG "$SRC/HEAD"; then cp -P "$SRC/HEAD" "$GD/HEAD"
-      else NOGIT="HEAD in the target's .git is not a regular file (not read): the HEAD comparisons below are unreliable, --all history is still read"; fi
+      else nogit "HEAD in the target's .git is not a regular file (not read): the HEAD comparisons below are unreliable, --all history is still read"; fi
       REG "$COMMON/shallow" && cp -P "$COMMON/shallow" "$GD/"
       cat > "$W/git-safe" <<EOF
 #!/bin/sh
-# Read the target's history with none of its config, attributes, hooks or replace refs.
+# Read the target's history with none of its config, attributes, hooks, replace refs or
+# .mailmap (a bare repo reads HEAD:.mailmap, which would rename authors).
 exec env GIT_DIR='$GD' GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \\
   GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 \\
-  git -c core.quotePath=false -c diff.external= -c core.pager=cat --no-pager "\$@"
+  git -c core.quotePath=false -c diff.external= -c core.pager=cat -c log.mailmap=false -c mailmap.blob= \\
+  --no-pager "\$@"
 EOF
       chmod +x "$W/git-safe"
     fi
@@ -84,7 +97,8 @@ h "SCOPE"
 echo "target: $DIR"
 echo "full report (nothing cut): $FULL"
 [ -n "$GD" ] && echo "history: read it only with $W/git-safe <git args> (never plain git inside the target)"
-[ -n "$NOGIT" ] && echo "WARNING: $NOGIT"
+echo "size limit: $VET_MAX_BYTES bytes (gitleaks: $GL_MB MB); bigger files and history blobs are listed, not read"
+[ -n "$NOGIT" ] && printf '%s\n' "$NOGIT" | sed 's/^/WARNING: /'
 [ -e .git ] && [ -z "$GD" ] && [ -z "$NOGIT" ] && echo "WARNING: .git exists but could not be read as a repository; history was not checked"
 [ -z "$GD" ] && [ ! -e .git ] && echo "not a git checkout: no history checked"
 
@@ -101,6 +115,12 @@ find . "${NOOBJ[@]}" \( -type p -o -type s -o -type b -o -type c \) -print 2>/de
 
 h "BINARIES / NON-TEXT FILES"
 PY binaries "$W/mimes"
+
+h "ARCHIVES (their contents were NOT scanned: unpack each into its own empty dir and vet it as a separate target)"
+PY archives "$W/mimes"
+
+h "FILES TOO LARGE TO SCAN (over $VET_MAX_BYTES bytes; not read: inspect them by hand with head, xxd or file)"
+cat "$W/toolarge.txt"
 
 h "EXTENSION / CONTENT MISMATCH"
 cat "$W/mismatch.txt"
@@ -156,8 +176,20 @@ if [ -n "$GD" ]; then
   G log --all -m --format= --name-only -z > "$W/history.paths"
   PY historypaths "$W/head.tree" "$W/history.paths"
 
+  # git log -p --text prints a blob in full for every commit that touches it: a big one,
+  # rewritten many times, would stall the history pass. Leave big blobs' paths out of it, and
+  # read those paths' other versions in a second pass where git treats big blobs as binary.
+  h "HISTORY BLOBS TOO LARGE TO SCAN (over $VET_MAX_BYTES bytes: not read; their paths' smaller versions are read without --text)"
+  G rev-list --all --objects | G cat-file --batch-check='%(objecttype) %(objectsize) %(objectname) %(rest)' | PY bigblobs "$W/bigpaths"
+  EX=(); IN=()
+  while IFS= read -r -d '' p; do EX+=(":(exclude,literal)$p"); IN+=(":(literal)$p"); done < "$W/bigpaths"
+
   h "SENSITIVE LINES ADDED IN HISTORY BUT ABSENT FROM EVERY FILE ON DISK"
-  G "${LOGP[@]}" --format='%x00%h %ad %an: %s' --date=short | perl "$LIB/history.pl" "$LIB/patterns.re" "$W/headlines.txt" > "$W/history.txt"
+  FMT=(--format='%x00%h %ad %an: %s' --date=short)
+  {
+    G "${LOGP[@]}" "${FMT[@]}" -- ${EX[@]+"${EX[@]}"}
+    [ ${#IN[@]} -gt 0 ] && G -c core.bigFileThreshold="$VET_MAX_BYTES" log --all -m -p --no-color --no-textconv --no-ext-diff "${FMT[@]}" -- "${IN[@]}"
+  } | perl "$LIB/history.pl" "$LIB/patterns.re" "$W/headlines.txt" > "$W/history.txt"
   if [ -s "$W/history.txt" ]; then
     cat "$W/history.txt"
     echo "(inspect each with: $W/git-safe log --all -p --no-textconv -S'<text from the line>')"
@@ -173,7 +205,7 @@ for f in .gitleaks.toml .gitleaksignore; do
 done
 if command -v gitleaks >/dev/null; then
   printf '[extend]\nuseDefault = true\n' > "$W/gitleaks.toml"; mkdir -p "$W/gitleaks-ignore"
-  GL=(--no-banner --no-color --redact --ignore-gitleaks-allow --exit-code 0 -c "$W/gitleaks.toml" -i "$W/gitleaks-ignore" -f json)
+  GL=(--no-banner --no-color --redact --ignore-gitleaks-allow --max-target-megabytes $GL_MB --exit-code 0 -c "$W/gitleaks.toml" -i "$W/gitleaks-ignore" -f json)
   # gitleaks always obeys <source>/.gitleaksignore, whatever -i says: when the target ships
   # one at its root, scan a copy of its regular files without it.
   GSRC=.
