@@ -11,12 +11,21 @@ Usage: python3 -I inspect.py <command> [args]   (file lists arrive NUL-separated
   gitleaks  <report.json>...
   link-objects <target objects dir> <new objects dir>
   copy-refs <target refs dir> <new refs dir>
+  bigblobs  <paths out file>   (rev-list --objects | cat-file --batch-check on stdin)
   copy-files <dest dir> [path to leave out]...
 """
 import json, os, re, stat, struct, sys, unicodedata
 
-# Files bigger than this are listed, not read (same limit as textscan.pl).
-MAXB = int(os.environ.get("VET_MAX_BYTES") or 20 * 1024 * 1024)
+LIB = os.path.dirname(os.path.abspath(__file__))
+
+
+def max_bytes():
+    """Files bigger than this are listed, not read. scan.sh sets and checks VET_MAX_BYTES;
+    textscan.pl applies the same rule."""
+    v = os.environ.get("VET_MAX_BYTES", "")
+    if not re.fullmatch(r"[1-9][0-9]*", v):
+        sys.exit("VET_MAX_BYTES must be a positive whole number")
+    return int(v)
 
 HIDE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e"
                   r"\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\u2800\u3164\ufe00-\ufe0f\ufeff\uffa0"
@@ -56,7 +65,7 @@ def inventory(types):
     for p in paths():
         try:
             size = os.lstat(p).st_size
-            if size > MAXB:
+            if size > max_bytes():
                 print(f"{'?':>7} {size:9}  {show(p)}  [too large: not read]"); continue
             d = open(p, "rb").read()
         except OSError as e:
@@ -85,7 +94,9 @@ def binaries(mimes):
 
 ARCHIVE = re.compile(r"^application/(zip|gzip|x-gzip|x-tar|x-bzip2|x-xz|x-7z-compressed|java-archive|x-rar|vnd\.rar|"
                      r"zstd|x-zstd|x-lzma|x-lzip|x-compress|x-archive|x-cpio|x-iso9660-image|x-apple-diskimage|"
-                     r"vnd\.ms-cab-compressed|x-debian-package|x-rpm|x-xar)\b")
+                     r"vnd\.ms-cab-compressed|x-debian-package|vnd\.debian\.binary-package|x-rpm|x-xar|x-msi|"
+                     r"epub\+zip|vnd\.android\.package-archive|vnd\.oasis\.opendocument\.[\w.-]+|"
+                     r"vnd\.openxmlformats-[\w.-]+|vnd\.ms-(word|excel|powerpoint)[\w.-]*|[\w.+-]*(zip|archive|compressed))\b")
 
 
 def archives(mimes):
@@ -101,18 +112,33 @@ HOOK = re.compile(
     r"\.mcp\.json|mcp\.json|plugin\.json|marketplace\.json|hooks\.json|settings(\.local)?\.json|mod\.json|"
     r"manifest\.json|Dockerfile|\.envrc|\.gitmodules|\.husky/.*|\.vscode/(tasks|settings|launch|extensions)\.json|"
     r"\.devcontainer(/devcontainer)?\.json|\.devcontainer/.*|\.idea/.*\.xml|"
-    r"\.pnpmfile\.c?js|\.cargo/config(\.toml)?|entry_points\.txt|(requirements|constraints)[^/]*\.txt|Pipfile|"
-    r"go\.mod|Gemfile|Rakefile|build\.gradle(\.kts)?|settings\.gradle(\.kts)?|\.pre-commit-config\.ya?ml|"
+    r"\.pnpmfile\.c?js|\.cargo/config(\.toml)?|entry_points\.txt|[^/]*(requirements|constraints)[^/]*\.(txt|in)|"
+    r"requirements/[^/]+\.(txt|in)|Pipfile|go\.mod|go\.work|Gemfile|Rakefile|build\.gradle(\.kts)?|settings\.gradle(\.kts)?|\.pre-commit-config\.ya?ml|"
     r"noxfile\.py|tox\.ini|justfile|Taskfile\.ya?ml|lefthook\.ya?ml|\.lfsconfig)$")
-# Text install files: the lines that run something, fetch from somewhere, or redirect.
+# Text install files, matched on their path: the lines that run something, fetch from
+# somewhere, or redirect. A matching line that opens a block (Go's `replace (`) brings the
+# block's lines with it.
 SHOW = (
-    (re.compile(r"(requirements|constraints)[^/]*\.txt$|^Pipfile$"),
+    (re.compile(r"(^|/)([^/]*(requirements|constraints)[^/]*|requirements/[^/]+)\.(txt|in)$|(^|/)Pipfile$"),
      re.compile(r"^\s*-|://|git\+|@\s*(file|https?):"), "options, URLs and direct references"),
-    (re.compile(r"^config(\.toml)?$"), re.compile(r"^\s*(runner|rustc-wrapper|rustc|linker|rustdoc|ar)\s*="), "commands cargo runs"),
-    (re.compile(r"^entry_points\.txt$"), re.compile(r"\S"), "entry points other programs load"),
-    (re.compile(r"^go\.mod$"), re.compile(r"^\s*(replace|toolchain|tool)\b"), "replacements and toolchains"),
-    (re.compile(r"^\.lfsconfig$"), re.compile(r"url\s*="), "where git-lfs downloads from on checkout"),
+    # Cargo's config is all commands, environment, aliases and sources: show all of it.
+    (re.compile(r"(^|/)\.cargo/config(\.toml)?$"), re.compile(r"^\s*[^#\s]"), "everything cargo reads (wrappers, env, aliases, sources)"),
+    (re.compile(r"(^|/)entry_points\.txt$"), re.compile(r"\S"), "entry points other programs load"),
+    (re.compile(r"(^|/)go\.(mod|work)$"), re.compile(r"^\s*(replace|toolchain|tool|godebug)\b"), "replacements and toolchains"),
+    (re.compile(r"(^|/)\.lfsconfig$"), re.compile(r"url\s*="), "where git-lfs downloads from on checkout"),
 )
+
+
+def shown_lines(text, line_re):
+    out, block = [], False
+    for line in text.splitlines():
+        if block:
+            out.append(line)
+            block = line.strip() != ")"
+        elif line_re.search(line):
+            out.append(line)
+            block = line.rstrip().endswith("(")
+    return out
 # JSON keys whose values are commands, sources or endpoints.
 RUNKEY = re.compile(r"command|helper|^args$|^url$|^source$|^repo$|^runOn$|refresh|export|^main$|^bin$|"
                     r"^activationEvents$|^entrypoint$|^module$|^exec|^env$|^permissions$|^enableAllProjectMcpServers$|"
@@ -144,7 +170,8 @@ def hooks():
     for p in ps:
         print(show(p))
     for p in ps:
-        name = os.path.basename(p.decode("utf-8", "replace"))
+        rel = p.decode("utf-8", "replace")
+        name = os.path.basename(rel)
         try:
             text = open(p, "rb").read().decode("utf-8", "replace")
         except OSError:
@@ -158,10 +185,10 @@ def hooks():
             for line in text.splitlines():
                 if re.match(r"\s*(url|path|branch)\s*=", line):
                     print("  " + esc(line.strip()))
-        elif any(n.search(name) for n, _, _ in SHOW):
+        elif any(n.search(rel) for n, _, _ in SHOW):
             for n, line_re, what in SHOW:
-                if n.search(name):
-                    hits = [l for l in text.splitlines() if line_re.search(l)]
+                if n.search(rel):
+                    hits = shown_lines(text, line_re)
                     if hits:
                         print(f"--- {show(p)}: {what}")
                         for line in hits:
@@ -197,12 +224,8 @@ def hooks():
                     print(f"  {esc(k)}: {cut(v, 300)}")
 
 
-# Keep in step with $agentish in textscan.pl. Everything under skills/ counts: an agent reads
-# a skill's supporting files on demand.
-AGENT = re.compile(r"(^|/)(SKILL\.md|CLAUDE\.md|AGENTS\.md|GEMINI\.md|CONVENTIONS\.md|\.cursorrules|\.windsurfrules|"
-                   r"\.clinerules.*|\.goosehints|copilot-instructions\.md|skills/.+|(commands|agents|output-styles|prompts)/.+\.md|"
-                   r"\.claude/.*|\.claude-plugin/[^/]+\.json|\.cursor/.*|\.windsurf/.*|\.roo/.*|\.kiro/.*|\.amazonq/.*|"
-                   r"\.junie/.*|\.github/(instructions|prompts)/.*)$")
+# The same regex textscan.pl reads.
+AGENT = re.compile(next(l.strip() for l in open(os.path.join(LIB, "agent-files.re")) if l.strip() and not l.startswith("#")))
 
 
 def agent_files():
@@ -308,7 +331,7 @@ def images():
     for p in paths():
         ext = p.rsplit(b".", 1)[-1].lower()
         try:
-            if os.lstat(p).st_size > MAXB:
+            if os.lstat(p).st_size > max_bytes():
                 continue
             d = open(p, "rb").read()
         except OSError:
@@ -383,7 +406,7 @@ def changed(lstree, algo):
         want = "a symlink" if mode == b"120000" else "a file"
         if kind(st) != want:
             print(f"{show(path)}: {want} in HEAD, {kind(st)} on disk"); continue
-        if st.st_size > MAXB:
+        if st.st_size > max_bytes():
             print(f"{show(path)}: too large to compare with HEAD ({st.st_size} bytes)"); continue
         if want == "a symlink":
             data = os.readlink(disk)
@@ -469,12 +492,29 @@ def copy_files(dest, *skip):
             continue
         with os.fdopen(fd, "rb") as f:
             st = os.fstat(f.fileno())
-            if not stat.S_ISREG(st.st_mode) or st.st_size > MAXB:
+            if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes():
                 continue
             out = os.path.join(dest.encode(), p)
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with open(out, "wb") as o:
                 o.write(f.read())
+
+
+def bigblobs(out):
+    """From `rev-list --all --objects | cat-file --batch-check='%(objecttype) %(objectsize)
+    %(objectname) %(rest)'`: report blobs over the limit, and write their paths (NUL-separated)
+    to out so the history pass can leave them out."""
+    limit, big = max_bytes(), {}
+    for line in sys.stdin.buffer:
+        parts = line.rstrip(b"\n").split(b" ", 3)
+        if len(parts) == 4 and parts[0] == b"blob" and int(parts[1]) > limit:
+            big.setdefault(parts[3], []).append((int(parts[1]), parts[2][:12].decode()))
+    with open(out, "wb") as f:
+        for path in sorted(big):
+            f.write(path + b"\0")
+            versions = big[path]
+            print(f"{show(path)}: {len(versions)} version(s), largest {max(n for n, _ in versions)} bytes "
+                  f"(blob {', '.join(o for _, o in versions[:3])}{', …' if len(versions) > 3 else ''})")
 
 
 def gitleaks(*reports):
@@ -493,4 +533,4 @@ if __name__ == "__main__":
     cmd, args = sys.argv[1], sys.argv[2:]
     {"inventory": inventory, "binaries": binaries, "archives": archives, "hooks": hooks, "agent-files": agent_files, "images": images,
      "symlinks": symlinks, "changed": changed, "historypaths": historypaths, "notinhead": notinhead, "gitleaks": gitleaks,
-     "link-objects": link_objects, "copy-refs": copy_refs, "copy-files": copy_files}[cmd](*args)
+     "link-objects": link_objects, "copy-refs": copy_refs, "bigblobs": bigblobs, "copy-files": copy_files}[cmd](*args)

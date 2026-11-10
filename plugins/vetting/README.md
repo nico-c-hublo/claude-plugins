@@ -83,11 +83,12 @@ The test builds booby-trapped repos and checks that `scan.sh` reports each trap 
 - filenames that try to pass as options to perl or grep, or to forge a section header
 - a `.git/config` and `.gitattributes` that run commands through fsmonitor, a diff driver or the pager
 - lines hidden behind an SVG-namespace comment or a flood of harmless hits; variation selectors, fillers and ANSI escapes; NUL bytes, UTF-16 and fake images
-- payloads smuggled past the emoji exemptions: tag characters behind a flag, a run of joiners between letters, a different variation selector after each arrow; bidi controls
+- payloads smuggled past the emoji exemptions: tag characters behind a flag, a run of joiners between letters, a different variation selector after each arrow or after each Chinese character; bidi controls
 - exec, network and steering written in forms a narrower pattern set misses: Go, Rust, `__import__`, a string-built `require`, raw IPs, Unicode escapes
-- Claude Code settings with `env`, permission and MCP keys; `.pnpmfile.cjs`, cargo runners, entry points, extra indexes, `go.mod` replacements, `.lfsconfig`
-- archives (one renamed to `.bin`) and a 100 MB sparse file
-- a `.git/refs` symlinked to `/`, a symlinked directory and a FIFO inside it, and a `.mailmap` that renames authors
+- Claude Code settings with `env`, permission and MCP keys; `.pnpmfile.cjs`, everything in a cargo config, entry points, extra indexes in any requirements layout, `go.mod` and `go.work` replacements (block form too), `.lfsconfig`
+- archives (one renamed to `.bin`, an EPUB, an OpenDocument file), a 100 MB sparse file, and a big blob rewritten across many commits that only history has
+- a size limit that isn't a positive whole number
+- a `.git/refs` symlinked to `/`, a symlinked directory and a FIFO inside it, both a bad refs dir and a FIFO HEAD at once, and a `.mailmap` that renames authors
 - `` !`cmd` `` in a skill, external marketplace sources, `.pth` files, VS Code tasks, submodules, symlinks out of the target
 - ignored build output, and a plain directory inside another repo
 - polyglots: a `.ttf` or `.gif` that starts with its format's signature but is really JavaScript
@@ -96,4 +97,4 @@ The test builds booby-trapped repos and checks that `scan.sh` reports each trap 
 - data after a PNG (including data declared inside its end chunk), JPEG, GIF and WebP end, and an SVG with a script
 - a work dir reused for a second target
 
-It also checks that a clean repo triggers nothing: typographic characters, emoji ZWJ sequences, flags, Persian and Hindi joiners, CJK variation selectors, and ordinary `require`, `maxTokens` and `127.0.0.1` code.
+It also checks that SKILL.md's npm hash command works with GNU `base64`, and that a clean repo triggers nothing: typographic characters, emoji ZWJ sequences, flags, Persian and Hindi joiners, CJK, and ordinary `require`, `maxTokens` and `127.0.0.1` code.

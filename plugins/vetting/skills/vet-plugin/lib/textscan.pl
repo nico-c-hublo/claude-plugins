@@ -10,8 +10,14 @@ my ($patfile, $out) = @ARGV;
 open my $pf, '<', $patfile or die "$patfile: $!";
 my $p = join '|', map { chomp; $_ } grep { !/^\s*(?:#|$)/ } <$pf>; close $pf;
 my $PAT = qr/$p/i;
+(my $lib = $patfile) =~ s{/[^/]*$}{};
+open my $af, '<', "$lib/agent-files.re" or die "$lib/agent-files.re: $!";
+my ($agentre) = grep { !/^\s*(?:#|$)/ } <$af>; close $af; chomp $agentre;
+my $AGENT = qr/$agentre/;
 # Files bigger than this are listed, not read: a sparse or padded file would stall the scan.
-my $MAXB = $ENV{VET_MAX_BYTES} || 20 * 1024 * 1024;
+# scan.sh sets and checks it.
+my $MAXB = $ENV{VET_MAX_BYTES} // '';
+die "VET_MAX_BYTES must be a positive whole number\n" unless $MAXB =~ /^[1-9][0-9]*$/;
 
 my %fh;
 for my $n (qw(minified invisible invisible_counts nonascii patterns patterns_docs patterns_git patterns_binary headlines looks_binary mismatch agent toolarge)) {
@@ -106,9 +112,7 @@ while (my $path = <STDIN>) {
     if $enc ne 'UTF-8' || $nul;
   my $text = decode($enc, $raw, FB_DEFAULT);
   my $is_md = $path =~ /\.(?:md|mdx|markdown)$/i;
-  # Keep in step with AGENT in inspect.py.
-  my $agentish = $path =~ m{(?:^|/)(?:commands|agents|skills|output-styles|prompts|hooks|\.claude|\.claude-plugin|\.cursor|\.windsurf|\.roo|\.kiro|\.amazonq|\.junie|\.github/(?:instructions|prompts))/}
-    || $path =~ m{(?:^|/)(?:SKILL|CLAUDE|AGENTS|GEMINI|CONVENTIONS|copilot-instructions)\.md$|(?:^|/)\.(?:cursorrules|windsurfrules|clinerules|goosehints)};
+  my $agentish = $path =~ $AGENT;
   # Plain documentation goes after code in the pattern section, so a README full of links
   # cannot push code hits past the cap.
   my $doc = !$agentish && $path =~ /\.(?:md|mdx|markdown|txt|rst|adoc)$/i;
@@ -123,8 +127,8 @@ while (my $path = <STDIN>) {
       if length($line) > 400;
 
     # Invisible characters. Allowed: a BOM opening the file, a joiner inside an emoji
-    # sequence or a word of a script that uses joiners, one variation selector after a CJK
-    # ideograph or VS15/VS16 after a symbol or keycap base, and the tags of the three
+    # sequence or a word of a script that uses joiners, VS15/VS16 after a symbol or keycap
+    # base, and the tags of the three
     # subdivision flags (England, Scotland, Wales). Each exemption admits one character at a
     # time: a run of invisible characters is how a payload is encoded.
     my $l2 = $line;
@@ -146,16 +150,13 @@ while (my $path = <STDIN>) {
           && (($o == 0x200D && $prev =~ /[\p{So}\p{Sk}\x{FE0F}]/ && $next =~ /\p{So}/)
               || ($prev =~ $JOINS && $next =~ $JOINS));
       }
-      # Variation selectors: any one after a CJK ideograph; otherwise only VS15/VS16 (text or
-      # emoji style) after a symbol or a keycap base. The other 14 selectors after symbols
-      # carry 4 bits per carrier character, and any selector after a letter carries a byte.
-      if ($o >= 0xFE00 && $o <= 0xFE0F) {
+      # Variation selectors: only VS15/VS16 (text or emoji style) after a symbol or a keycap
+      # base, which carries at most a bit per symbol. Any selector after a letter, a CJK
+      # ideograph included, can be one of 256 and so carries a byte: ideographic variation
+      # sequences are real but rare enough in code and docs to report.
+      if ($o == 0xFE0E || $o == 0xFE0F) {
         next if $prev !~ $VS && $next !~ $VS
-          && ($prev =~ /\p{Han}/
-              || (($o == 0xFE0E || $o == 0xFE0F) && (($prev =~ /[^\x00-\x7f]/ && $prev !~ /\p{L}/) || $prev =~ /[0-9#*]/)));
-      }
-      if ($o >= 0xE0100 && $o <= 0xE01EF) {
-        next if $prev !~ $VS && $next !~ $VS && $prev =~ /\p{Han}/;
+          && (($prev =~ /[^\x00-\x7f]/ && $prev !~ /\p{L}/) || $prev =~ /[0-9#*]/);
       }
       $c{$o}++;
     }

