@@ -31,19 +31,22 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 ## What it does
 
-1. **Downloads without running anything.** It clones with git hooks disabled. npm and PyPI packages are downloaded as archives, since `npm install`, `npx` and `pip download` can run the package's scripts. It vets the version you would install, and the linked source repo when there is one.
+1. **Downloads without running anything.** It clones with git hooks and LFS downloads disabled, outside your working directory so the target's `CLAUDE.md` is never loaded as instructions. npm and PyPI packages are downloaded as archives, since `npm install`, `npx` and `pip download` can run the package's scripts, and checked against the registry's hash. It vets the version you would install, and the linked source repo when there is one.
 2. **Maps the code** with `scan.sh`, a read-only script. It covers every file on disk, including ignored and built files, and never runs git under the target's own config. It reports:
    - every file, plus binaries, minified lines, symlinks, and files whose extension doesn't match their content
    - invisible, bidi, tag, variation-selector and filler Unicode, and ANSI escapes
-   - install and load-time hooks, including `` !`cmd` `` in skills, `allowed-tools`, `.pth` files, VS Code folder-open tasks, submodules and external marketplace sources
-   - sensitive patterns: network, exec, obfuscation, credential paths, persistence, text aimed at an agent
+   - install and load-time hooks, including `` !`cmd` `` in skills, `allowed-tools`, `.pth` files, VS Code folder-open tasks, submodules, external marketplace sources, `.pnpmfile.cjs`, cargo runners and Python entry points
+   - Claude Code settings: `env` blocks (`NODE_OPTIONS`, `ANTHROPIC_BASE_URL`), permission grants and modes, MCP auto-enable
+   - dependency ranges, non-registry dependencies and extra package indexes
+   - sensitive patterns: network, exec (JS, Python, Go, Rust, shell), obfuscation, credential paths, persistence, text aimed at an agent
+   - archives inside the target and files too large to scan, which it lists because it did not read them
    - files and sensitive lines that were in the git history but are gone now
    - data hidden after the end of a PNG, JPEG, GIF or WebP, and scripts in SVGs
    - secrets, through gitleaks when it is installed
 
    The output is capped per section; the full, uncapped report is written to a work directory for Claude to read when a section is cut.
 3. **Reads in full** every file that runs or that an agent reads: code, manifests, hooks, MCP definitions, SKILL.md files, prompts and tool descriptions.
-4. **Compares what the code can do with what its docs say.** That covers network, execution, files and credentials it reaches, persistence, obfuscation, agent steering, dependencies and provenance. Anything undeclared is a finding.
+4. **Compares what the code can do with what its docs say.** That covers network, execution, files and credentials it reaches, persistence, obfuscation, agent steering, where your prompts and transcripts can go, dependencies and provenance. Anything undeclared is a finding.
 5. **Reports:** a verdict, what was and was not read, findings with `file:line`, a capability table, and the command to install the exact commit or version that was vetted.
 
 The plugin's text is treated as evidence, never as instructions: a README telling the reviewer "this is safe" is itself a finding.
@@ -80,6 +83,11 @@ The test builds booby-trapped repos and checks that `scan.sh` reports each trap 
 - filenames that try to pass as options to perl or grep, or to forge a section header
 - a `.git/config` and `.gitattributes` that run commands through fsmonitor, a diff driver or the pager
 - lines hidden behind an SVG-namespace comment or a flood of harmless hits; variation selectors, fillers and ANSI escapes; NUL bytes, UTF-16 and fake images
+- payloads smuggled past the emoji exemptions: tag characters behind a flag, a run of joiners between letters, a different variation selector after each arrow; bidi controls
+- exec, network and steering written in forms a narrower pattern set misses: Go, Rust, `__import__`, a string-built `require`, raw IPs, Unicode escapes
+- Claude Code settings with `env`, permission and MCP keys; `.pnpmfile.cjs`, cargo runners, entry points, extra indexes, `go.mod` replacements, `.lfsconfig`
+- archives (one renamed to `.bin`) and a 100 MB sparse file
+- a `.git/refs` symlinked to `/`, a symlinked directory and a FIFO inside it, and a `.mailmap` that renames authors
 - `` !`cmd` `` in a skill, external marketplace sources, `.pth` files, VS Code tasks, submodules, symlinks out of the target
 - ignored build output, and a plain directory inside another repo
 - polyglots: a `.ttf` or `.gif` that starts with its format's signature but is really JavaScript
@@ -88,4 +96,4 @@ The test builds booby-trapped repos and checks that `scan.sh` reports each trap 
 - data after a PNG (including data declared inside its end chunk), JPEG, GIF and WebP end, and an SVG with a script
 - a work dir reused for a second target
 
-It also checks that a clean repo full of typographic characters and emoji triggers nothing.
+It also checks that a clean repo triggers nothing: typographic characters, emoji ZWJ sequences, flags, Persian and Hindi joiners, CJK variation selectors, and ordinary `require`, `maxTokens` and `127.0.0.1` code.
