@@ -99,7 +99,7 @@ mkdir "$WORK/d-cap-ok"; unpack --max-bytes 16 "$WORK/in/big.zip" "$WORK/d-cap-ok
 # --- write() itself, past the checks: a link already planted in its root is never followed.
 R="$WORK/wroot" O="$WORK/wout"; mkdir -p "$R" "$O"
 ln -s "$O" "$R/lnk"; ln -s "$O/target" "$R/f"; ln -s "$O" "$R/d"
-WOUT=$(python3 -I - "$SKILL" "$R" <<'PY'
+WOUT=$(python3 -I -B - "$SKILL" "$R" <<'PY'
 import io, sys
 sys.path.insert(0, sys.argv[1]); import unpack
 for name, kind in (("lnk/x", "file"), ("f", "file"), ("d/sub/", "dir")):
