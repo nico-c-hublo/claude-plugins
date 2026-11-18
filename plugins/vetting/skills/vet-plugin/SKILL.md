@@ -29,7 +29,7 @@ Done when the target is on disk outside the working directory, you've recorded i
 Run `bash <this skill's base directory>/scan.sh <dir> <work dir>`, with a new work dir in the scratchpad, outside `<dir>`. It is read-only, covers every file on disk (ignored, untracked and built files too, since those run), and reports:
 - file inventory, binaries, files whose extension lies about their content, minified lines, symlinks
 - invisible, bidi, tag, variation-selector and filler Unicode, and ANSI escapes
-- install/load-time hooks, agent-consumed files, `` !`cmd` `` load-time commands and `allowed-tools` grants
+- install/load-time hooks, agent-consumed files, load-time commands (an exclamation mark directly before an inline-code command) and `allowed-tools` grants
 - sensitive-pattern hits, git history, files on disk that aren't in HEAD, and sensitive lines that exist only in history
 - data appended after the end of image files, and scripts in SVGs
 - archives inside the target (found by content, whatever their name), and files or history blobs too large to scan: none of them was read
@@ -65,7 +65,7 @@ Done when each such file is read, or listed in the report as unread with a reaso
 For each capability below, record where it occurs (`file:line`) and whether the docs declare it. An **undeclared capability** is a finding.
 
 - **Network:** any outbound call, URL, DNS, socket.
-- **Execution:** shell/exec/spawn, `eval`/`new Function`, dynamic import, downloading then running. Also what runs without being called: `` !`cmd` `` in a skill or command (runs when it loads), `allowed-tools` grants, hooks, Python `.pth` and `sitecustomize.py`, VS Code tasks that run on folder open, devcontainer commands, and variables that load code into another process (`NODE_OPTIONS`, `LD_PRELOAD`, `DYLD_*`, `PYTHONSTARTUP`, `BASH_ENV`) in an `env` block of settings, MCP or hook definitions.
+- **Execution:** shell/exec/spawn, `eval`/`new Function`, dynamic import, downloading then running. Also what runs without being called: an exclamation mark directly before an inline-code command in a skill or command (it runs when the skill loads), `allowed-tools` grants, hooks, Python `.pth` and `sitecustomize.py`, VS Code tasks that run on folder open, devcontainer commands, and variables that load code into another process (`NODE_OPTIONS`, `LD_PRELOAD`, `DYLD_*`, `PYTHONSTARTUP`, `BASH_ENV`) in an `env` block of settings, MCP or hook definitions.
 - **Reach:** files read or written outside the plugin's own scope, including through symlinks that point outside it; credential paths (`~/.ssh`, `~/.aws`, keychains, browser profiles, `.env`, tokens); environment variables.
 - **Persistence:** shell rc files, LaunchAgents, cron, systemd, writes to other tools' configs (`~/.claude/settings.json`, git hooks, editor settings).
 - **Obfuscation:** base64 or hex blobs, char-code strings, packed code, hidden Unicode (variation selectors can encode a whole payload), ANSI escapes, NUL bytes or UTF-16 in source, a file whose extension doesn't match its content, data after an image's end.

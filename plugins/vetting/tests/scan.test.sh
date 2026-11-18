@@ -403,6 +403,8 @@ SKILL="$(dirname "$SCAN")/SKILL.md"
 grep -qF 'openssl base64 -A' "$SKILL" && ok "SKILL.md encodes the hash on one line" || fail "SKILL.md: npm hash not encoded with openssl base64 -A"
 grep -qE '\| *base64\b' "$SKILL" && fail "SKILL.md pipes into base64, which wraps on Linux" || ok "SKILL.md avoids plain base64"
 grep -qF 'dist.shasum' "$SKILL" && ok "SKILL.md covers packages without integrity" || fail "SKILL.md: no dist.shasum fallback"
+# Claude Code runs an exclamation mark followed by a backtick span as a load-time command, even inside double backticks.
+grep -qF '!`' "$SKILL" && fail "SKILL.md has a bang-backtick, which runs when the skill loads" || ok "SKILL.md has no load-time command"
 
 # --- Clean: typographic quotes, arrows, an ellipsis and emoji, as real docs have.
 C="$WORK/clean"; repo "$C"
