@@ -6,17 +6,19 @@
 # - A fresh config (GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1): a filter driver the
 #   user has set up (git-lfs, say) can't be triggered by the target's .gitattributes, and no
 #   user fsmonitor, hook path or pager runs. This also drops credential helpers and insteadOf.
+#   GIT_ATTR_NOSYSTEM=1 skips the system gitattributes too.
 # - No hooks, fsck on transfer, LFS smudge skipped (the target's .lfsconfig names its server).
+# - ext:: never allowed (it runs a command), whatever GIT_ALLOW_PROTOCOL the caller has set.
 # - `--` before <url>, a <ref> starting with `-` refused, the checkout ref-only.
 set -u
 if [ $# -lt 2 ] || [ $# -gt 3 ]; then echo "usage: fetch-git.sh <url> <dest> [ref]" >&2; exit 2; fi
 url=$1 dest=$2 ref=${3:-}
 case $ref in -*) echo "refusing a ref that starts with '-': $ref" >&2; exit 2 ;; esac
-[ -e "$dest" ] && { echo "dest already exists: $dest" >&2; exit 2; }
+{ [ -e "$dest" ] || [ -L "$dest" ]; } && { echo "dest already exists: $dest" >&2; exit 2; }
 
-unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_EXEC_PATH
-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_LFS_SKIP_SMUDGE=1 GIT_TERMINAL_PROMPT=0
-g() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c transfer.fsckObjects=true "$@"; }
+unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_EXEC_PATH GIT_ALLOW_PROTOCOL
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1 GIT_LFS_SKIP_SMUDGE=1 GIT_TERMINAL_PROMPT=0
+g() { git -c protocol.ext.allow=never -c core.hooksPath=/dev/null -c core.fsmonitor=false -c transfer.fsckObjects=true "$@"; }
 
 g clone -q --no-checkout -- "$url" "$dest" || exit 1
 g -C "$dest" checkout -q --detach "${ref:-HEAD}" -- || exit 1

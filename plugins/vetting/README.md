@@ -31,7 +31,7 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 ## What it does
 
-1. **Downloads without running anything.** It clones with `fetch-git.sh`, which ignores your git config (so the target can't trigger a filter driver you set up, such as git-lfs) and disables hooks and LFS downloads, outside your working directory so the target's `CLAUDE.md` is never loaded as instructions. npm and PyPI packages are downloaded as archives, since `npm install`, `npx` and `pip download` can run the package's scripts, checked against the registry's hash, and unpacked with `unpack.py`, which refuses an archive holding absolute paths, `..`, links or devices. It vets the version you would install, and the linked source repo when there is one.
+1. **Downloads without running anything.** It clones with `fetch-git.sh`, which ignores your git config (so the target can't trigger a filter driver you set up, such as git-lfs) and disables hooks and LFS downloads, outside your working directory so the target's `CLAUDE.md` is never loaded as instructions. npm and PyPI packages are downloaded as archives, since `npm install`, `npx` and `pip download` can run the package's scripts, checked against the registry's hash, and unpacked with `unpack.py`, which checks every entry first and refuses the whole archive if any could land outside the dest dir or be anything but a plain file or directory (the full list is in its docstring). It vets the version you would install, and the linked source repo when there is one.
 2. **Maps the code** with `scan.sh`, a read-only script. It covers every file on disk, including ignored and built files, and never runs git under the target's own config. It reports:
    - every file, plus binaries, minified lines, symlinks, and files whose extension doesn't match their content
    - invisible, bidi, tag, variation-selector and filler Unicode, and ANSI escapes
@@ -102,7 +102,7 @@ bash plugins/vetting/tests/fetch.test.sh
 ```
 
 This one checks the fetch helpers, offline:
-- `unpack.py` refuses wheels, `.vsix` files and tarballs holding `../` (or `..\`) paths, absolute paths, a symlink that a later entry writes through, a hardlink or a FIFO, writes nothing for them and nothing outside the dest dir; benign ones unpack in full, exec bits kept
-- `fetch-git.sh` checks out a tag and the default branch of a repo whose `.gitattributes` names a filter driver defined in `~/.gitconfig`, the XDG config and `GIT_CONFIG_GLOBAL`, without running it (a control run shows the old command did), and refuses a ref starting with `-` and a URL that is really an option
+- `unpack.py` refuses hostile wheels, `.vsix` files and tarballs (path escapes, links, devices, FIFOs, name clashes, a tgz with a zip appended, too many bytes), writing nothing for them and nothing outside the dest dir, and leaves the dest empty when a read fails part-way; a link planted where it writes is not followed; benign ones unpack in full, exec bits kept
+- `fetch-git.sh` checks out a tag and the default branch of a repo whose `.gitattributes` names a filter driver defined in `~/.gitconfig`, the XDG config and `GIT_CONFIG_GLOBAL`, without running it (a control run shows the old command did); it refuses a ref starting with `-`, a dest that is a dangling symlink and an `ext::` URL, and passes the URL after `--`, so one that looks like an option (`--upload-pack=…`) is read as a path, not run
 
 `scan.test.sh` also checks that SKILL.md's npm hash command works with GNU `base64`, and that a clean repo triggers nothing: typographic characters, emoji ZWJ sequences, flags, Persian and Hindi joiners, CJK, and ordinary `require`, `maxTokens` and `127.0.0.1` code.
