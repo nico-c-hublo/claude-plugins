@@ -31,7 +31,7 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 ## What it does
 
-1. **Downloads without running anything.** It clones with git hooks and LFS downloads disabled, outside your working directory so the target's `CLAUDE.md` is never loaded as instructions. npm and PyPI packages are downloaded as archives, since `npm install`, `npx` and `pip download` can run the package's scripts, and checked against the registry's hash. It vets the version you would install, and the linked source repo when there is one.
+1. **Downloads without running anything.** It clones with `fetch-git.sh`, which ignores your git config (so the target can't trigger a filter driver you set up, such as git-lfs) and disables hooks and LFS downloads, outside your working directory so the target's `CLAUDE.md` is never loaded as instructions. npm and PyPI packages are downloaded as archives, since `npm install`, `npx` and `pip download` can run the package's scripts, checked against the registry's hash, and unpacked with `unpack.py`, which refuses an archive holding absolute paths, `..`, links or devices. It vets the version you would install, and the linked source repo when there is one.
 2. **Maps the code** with `scan.sh`, a read-only script. It covers every file on disk, including ignored and built files, and never runs git under the target's own config. It reports:
    - every file, plus binaries, minified lines, symlinks, and files whose extension doesn't match their content
    - invisible, bidi, tag, variation-selector and filler Unicode, and ANSI escapes
@@ -70,7 +70,7 @@ Each is used when present and skipped when not:
 - `uvx`, to run GuardDog: heuristics for malicious npm and PyPI packages.
 - `gh`: repo age and provenance.
 
-`scan.sh` itself needs bash, git, `file`, perl and python3. It is tested on macOS and Debian.
+`scan.sh` itself needs bash, git, `file`, perl and python3; `fetch-git.sh` needs bash and git, `unpack.py` python3. It is tested on macOS and Debian.
 
 ## Tests
 
@@ -97,4 +97,12 @@ The test builds booby-trapped repos and checks that `scan.sh` reports each trap 
 - data after a PNG (including data declared inside its end chunk), JPEG, GIF and WebP end, and an SVG with a script
 - a work dir reused for a second target
 
-It also checks that SKILL.md's npm hash command works with GNU `base64`, and that a clean repo triggers nothing: typographic characters, emoji ZWJ sequences, flags, Persian and Hindi joiners, CJK, and ordinary `require`, `maxTokens` and `127.0.0.1` code.
+```
+bash plugins/vetting/tests/fetch.test.sh
+```
+
+This one checks the fetch helpers, offline:
+- `unpack.py` refuses wheels, `.vsix` files and tarballs holding `../` (or `..\`) paths, absolute paths, a symlink that a later entry writes through, a hardlink or a FIFO, writes nothing for them and nothing outside the dest dir; benign ones unpack in full, exec bits kept
+- `fetch-git.sh` checks out a tag and the default branch of a repo whose `.gitattributes` names a filter driver defined in `~/.gitconfig`, the XDG config and `GIT_CONFIG_GLOBAL`, without running it (a control run shows the old command did), and refuses a ref starting with `-` and a URL that is really an option
+
+`scan.test.sh` also checks that SKILL.md's npm hash command works with GNU `base64`, and that a clean repo triggers nothing: typographic characters, emoji ZWJ sequences, flags, Persian and Hindi joiners, CJK, and ordinary `require`, `maxTokens` and `127.0.0.1` code.
